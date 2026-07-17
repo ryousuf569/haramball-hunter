@@ -48,8 +48,7 @@ def TTI(position, velocity, target_location):
     expected_reaction = t + reaction_time
     return expected_reaction
 
-def intercept_probability(T, j_pos, j_vel, r):
-    react_exp = TTI(j_pos, j_vel, r)
+def intercept_probability(T, j_pos, j_vel, r, react_exp):
     a = -(m.pi / m.sqrt(3))
     b = (T - react_exp) / intercept_uncertainty
     denom = 1 + m.exp(a * b)
