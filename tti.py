@@ -6,52 +6,69 @@ a_max = 7
 reaction_time = 0.54
 intercept_uncertainty = 0.45
 
-def derive_t(d_mag, v_parallel):
+# Vectorized functions
+
+def derive_t_vec(d_mag, v_parallel):
     t_1 = (v_max - v_parallel) / a_max
-    A = (v_parallel * t_1) 
+    A = (v_parallel * t_1)
     B = (0.5 * a_max * (t_1 * t_1))
     d_1 = A + B
 
-    if d_1 > d_mag:
-        coeff = [0.5 * a_max, v_parallel, -d_mag]
-        roots = np.roots(coeff)
-        real_positive_roots = roots[(np.isreal(roots)) & (roots > 0)]
-        t = real_positive_roots[0] if len(real_positive_roots) > 0 else None
-    if d_1 < d_mag:
-        t_2 = (d_mag - d_1)/v_max
-        t = t_1 + t_2
+    # The scalar code used np.roots(...) then picked the single real positive
+    # root. For this quadratic with a_max > 0 and d_mag > 0 the discriminant
+    # v_parallel^2 + 2*a_max*d_mag is strictly greater than v_parallel^2, so
+    # exactly one root is positive -- the '+' root below. That is precisely the
+    # root np.roots' filter selected, so the closed form is identical (and it
+    # vectorizes, unlike np.roots which is scalar-only).
+    disc = v_parallel * v_parallel + 2.0 * a_max * d_mag
+    t_quad = (-v_parallel + np.sqrt(disc)) / a_max
+    t_2 = (d_mag - d_1) / v_max
+    t_lin = t_1 + t_2
 
-    return t
+    # Mask selects the branch elementwise. The scalar code used two separate
+    # `if` statements (`> d_mag` and `< d_mag`) and left t undefined on the
+    # exact `d_1 == d_mag` tie (a latent bug that would raise there). Selecting
+    # on `d_1 > d_mag` routes ties to the linear branch, which cannot be hit by
+    # the toy scenario; it only makes the vectorized code not crash on a tie
+    # the scalar code never handled either.
+    return np.where(d_1 > d_mag, t_quad, t_lin)
 
-def TTI(position, velocity, target_location):
 
-    distance = target_location - position
-    D = np.linalg.norm(distance)
-    
-    if D == 0:
-        return 0
-    else:
-        u = distance/D
+def TTI_vec(positions, velocities, targets):
 
-    v_u_dot = np.dot(velocity, u)
-    u_mag_squared = np.dot(u, u)
+    # distance[c, p, :] = target_c - position_p -> (n_cells, n_players, 2)
+    distance = targets[:, None, :] - positions[None, :, :]
+    D = np.linalg.norm(distance, axis=-1) # (n_cells, n_players)
+
+    zero = (D == 0)
+    D_safe = np.where(zero, 1.0, D)
+    u = distance / D_safe[..., None] # (n_cells, n_players, 2)
+
+    v_u_dot = np.sum(velocities[None, :, :] * u, axis=-1)   # (n_cells, n_players)
+    u_mag_squared = np.sum(u * u, axis=-1)
     v_parallel = v_u_dot / np.sqrt(u_mag_squared)
 
-    if v_parallel >= 0: # player stationary or moving toward target
-        t = derive_t(d_mag=D, v_parallel=v_parallel)
-    elif v_parallel < 0: # player moving away from the target
-        t_brake = abs(v_parallel) / a_max
-        d_brake = (abs(v_parallel) * t_brake) - (0.5 * a_max * (t_brake * t_brake))
-        D_prime = D + d_brake
-        t = derive_t(d_mag=D_prime, v_parallel=0) + t_brake
+    # Case A (scalar: `if v_parallel >= 0`) stationary or moving toward target
+    t_caseA = derive_t_vec(D, v_parallel)
+
+    # Case B (scalar: `elif v_parallel < 0`) moving away
+    t_brake = np.abs(v_parallel) / a_max
+    d_brake = (np.abs(v_parallel) * t_brake) - (0.5 * a_max * (t_brake * t_brake))
+    D_prime = D + d_brake
+    t_caseB = derive_t_vec(D_prime, np.zeros_like(v_parallel)) + t_brake
+
+    # mask below picks Case A vs Case B
+    t = np.where(v_parallel >= 0, t_caseA, t_caseB)
 
     expected_reaction = t + reaction_time
-    return expected_reaction
+    # D == 0 short-circuits to 0 (before adding reaction_time), as in scalar TTI.
+    return np.where(zero, 0.0, expected_reaction)
 
-def intercept_probability(T, j_pos, j_vel, r, react_exp):
+
+def intercept_probability_vec(T, react_exp):
     a = -(m.pi / m.sqrt(3))
     b = (T - react_exp) / intercept_uncertainty
-    denom = 1 + m.exp(a * b)
+    denom = 1 + np.exp(a * b)
 
     return 1 / denom
 

@@ -1,6 +1,6 @@
 import numpy as np
 import math as m
-from tti import derive_t, TTI, intercept_probability
+from tti import TTI_vec, intercept_probability_vec
 
 attacker_control_rate = 4.30
 defender_control_rate_multiplier = 1.72
@@ -8,39 +8,37 @@ defender_control_rate = attacker_control_rate * defender_control_rate_multiplier
 integration_timestep = 0.05
 integration_horizon = 10
 
-player_dt = np.dtype([('position', 'f4', (2,)), ('velocity', 'f4', (2,)), ('team', 'U8'), ('tti', 'f4')])
+def PPCF_grid(targets, players):
+    # targets: (n_cells, 2). players: structured array as in pitch.py.
+    positions = np.asarray(players['position'], dtype=float)   # (n_players, 2)
+    velocities = np.asarray(players['velocity'], dtype=float)  # (n_players, 2)
 
-players = np.array([
-    ([5, -5], [2.0, -1.0], 'attacker', 0),
-    ([-10.0, 10.0], [-1.0, 1.0], 'defender', 0)
-], dtype=player_dt)
+    tti = TTI_vec(positions, velocities, targets)              # (n_cells, n_players)
 
-def PPCF(target, players):
+    # per-player control rate lambda, mirroring the scalar team branch
+    lam = np.where(players['team'] == 'attacker',
+                   attacker_control_rate, defender_control_rate)  # (n_players,)
 
-    for i in players:
-        pos = i[0]
-        vel = i[1]
-        i[3] = TTI(pos, vel, target)
+    n_cells = targets.shape[0]
+    n = len(players)
+    PPCF_array = np.zeros((n_cells, n))
+    PPCF_total = np.zeros(n_cells)
 
     t = 0
-    n = len(players)
-    PPCF_array = np.zeros(n)
-    PPCF_total = 0.0
+    while t < integration_horizon and PPCF_total.min() < 0.99:
+        snapshot = 1 - PPCF_total # (n_cells,)
 
-    while t < integration_horizon and PPCF_total < 0.99:
-        snapshot = 1 - PPCF_total 
+        f = intercept_probability_vec(t, tti) # (n_cells, n_players)
+        increments = snapshot[:, None] * f * lam[None, :] * integration_timestep
 
-        increments = np.zeros(n)
-        for j, p in enumerate(players):
-            lam = attacker_control_rate if p['team'] == 'attacker' else defender_control_rate
-            f = intercept_probability(t, p['position'], p['velocity'], target, p['tti'])
-            increments[j] = snapshot * f * lam * integration_timestep
+        # Per-cell early stop: cells already at/above 0.99 at the top of this
+        # iteration would have broken out of the scalar loop, so they receive
+        # no further increment.
+        active = (PPCF_total < 0.99)[:, None] # (n_cells, 1)
+        increments = np.where(active, increments, 0.0)
 
         PPCF_array += increments
-        PPCF_total = PPCF_array.sum()
+        PPCF_total = PPCF_array.sum(axis=1)
         t += integration_timestep
 
     return PPCF_array
-    
-target = [0, 0]
-print(PPCF(target=np.array(target), players=players))
