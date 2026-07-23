@@ -13,7 +13,7 @@ def PPCF_grid(targets, players):
     positions = np.asarray(players['position'], dtype=float)   # (n_players, 2)
     velocities = np.asarray(players['velocity'], dtype=float)  # (n_players, 2)
 
-    tti = TTI_vec(positions, velocities, targets)              # (n_cells, n_players)
+    tti = TTI_vec(positions, velocities, targets) # (n_cells, n_players)
 
     # per-player control rate lambda, mirroring the scalar team branch
     lam = np.where(players['team'] == 'attacker',

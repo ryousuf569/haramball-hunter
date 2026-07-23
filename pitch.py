@@ -1,8 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from ppcf import PPCF_grid
-
-player_dt = np.dtype([('position', 'f4', (2,)), ('velocity', 'f4', (2,)), ('team', 'U8'), ('tti', 'f4')])
+from schema import player_dt
 
 players = np.array([
     ([20.0, 30.0], [1.5, -0.5], 'attacker', 0),
