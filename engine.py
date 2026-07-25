@@ -6,12 +6,34 @@ A_MAX = 7.0
 DT = 0.1
 
 offset = np.array([43.0, 0.0])
+root_2 = np.sqrt(2)
+direction_lookup = np.array([
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+    [root_2 / 2, root_2 / 2],
+    [root_2 / 2, -root_2 / 2],
+    [-root_2 / 2, root_2 / 2],
+    [-root_2 / 2, -root_2 / 2],
+    [0, 0],
+])
+
+speed_lookup = np.array([0.3 * V_MAX, 0.6 * V_MAX, 1.0 * V_MAX])
 
 def global_to_local(pos):
     return pos - offset
 
 def local_to_global(pos):
     return pos + offset
+
+def action_decoding(direction_idx, speed_idx):
+
+    target_directions = direction_lookup[direction_idx]
+    target_speeds = speed_lookup[speed_idx]
+    target_velocities = target_directions * target_speeds[:, np.newaxis]
+    
+    return target_velocities
 
 def kinematics_integrator(players, target_velocities):
 
