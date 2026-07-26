@@ -5,6 +5,16 @@ V_MAX = 5.0
 A_MAX = 7.0
 DT = 0.1
 HOLD = 0
+BALL_SPEED = 15.0
+
+ball = {
+    'state': str,
+    'holder_id': int | None,
+    'position': list[int],
+    'target_id': int | None,
+    'flight_start': list[int],
+    'flight_target': list[int],
+}
 
 offset = np.array([43.0, 0.0])
 root_2 = np.sqrt(2)
@@ -21,6 +31,9 @@ direction_lookup = np.array([
 ])
 
 speed_lookup = np.array([0.3 * V_MAX, 0.6 * V_MAX, 1.0 * V_MAX])
+
+def get_position_by_id(players, player_id):
+    return players['position'][players['id'] == player_id][0]
 
 def global_to_local(pos):
     return pos - offset
@@ -54,6 +67,42 @@ def ball_action(ball_idx, holder_id, player_ids):
     else:
         return holder_id, False, None
 
+def ball_mechanics(ball, players, pass_decision):
+    holder_id, is_pass, target_id = pass_decision
+    ball = dict(ball)  # copy, don't mutate caller's dict
+
+    if ball['state'] == 'held':
+        if is_pass:
+            # holder just released it -- freeze start/target, switch to flight
+            start_pos = get_position_by_id(players, holder_id)
+            target_pos = get_position_by_id(players, target_id)
+
+            ball['state'] = 'in_flight'
+            ball['holder_id'] = None
+            ball['target_id'] = target_id
+            ball['flight_start'] = start_pos
+            ball['flight_target'] = target_pos
+            ball['position'] = start_pos
+        else:
+            # still held -- resync position to holder's current (post-kinematics) position
+            ball['position'] = get_position_by_id(players, holder_id)
+
+    elif ball['state'] == 'in_flight':
+        remaining_vector = ball['flight_target'] - ball['position']
+        remaining_distance = np.linalg.norm(remaining_vector)
+        step_distance = BALL_SPEED * DT
+
+        if remaining_distance <= step_distance:
+            # arrives this tick -- snap, don't overshoot
+            ball['position'] = ball['flight_target']
+            ball['state'] = 'held'
+            ball['holder_id'] = ball['target_id']
+            ball['target_id'] = None
+        else:
+            direction = remaining_vector / remaining_distance
+            ball['position'] = ball['position'] + direction * step_distance
+
+    return ball
 
 def kinematics_integrator(players, target_velocities):
 
