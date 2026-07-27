@@ -14,14 +14,29 @@ from matplotlib.patches import Arc, Circle, Rectangle
 # the real integrators/mechanics rather than reimplementing them here.
 from engine import (
     DT,
-    action_decoding,
     ball_action,
     ball_mechanics,
     kinematics_integrator,
-    speed_lookup,
-    direction_lookup,
 )
 from schema import player_dt
+
+# Defenders now run their learned/scripted low-block behaviour. This module
+# returns target velocities for the whole defender line directly (bypassing the
+# discrete direction/speed action decoding used for attackers), so we splice
+# its output into the roster-wide target-velocity array before integrating.
+from defenders import make_defender_state, compute_defender_targets
+
+# Attackers run a throwaway scripted baseline (a fixed formation + fixed-cadence
+# passing) purely so the sim looks coherent while the defender script is being
+# tested. Like the defenders, it returns continuous target velocities directly
+# (bypassing the discrete action_decoding path) plus the ball_idx array that
+# engine.ball_action expects. Replace wholesale when a real attacker exists.
+from baseline_attacker import (
+    compute_attacker_targets,
+    backline_offset as att_backline_offset,
+    midline_offset as att_midline_offset,
+    forward_offset as att_forward_offset,
+)
 
 # --- team labels -----------------------------------------------------------
 # players['team'] is a U8 string field per schema.py. Set these to match
@@ -233,10 +248,79 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # hand the new state to render_frame.
 
 
-def make_initial_world(n_att=8, n_def=10, seed=0):
+def _defender_formation_5_4_1(n_def=10, pitch_width=68.0):
+    """Starting defender positions in a resting low-block 5-4-1.
+
+    Row order matches defenders.py's line indexing so the scripted policy picks
+    up a coherent shape from tick 0: rows 0-4 are the backline, rows 5-8 the
+    midfield line, row 9 the lone forward. y-offsets mirror the offset arrays in
+    defenders.py (backline spans +/-20m, midfield +/-15m about the centerline).
+
+    Deep near the x=105 goal: backline ~x=100, midfield line ~x=82, forward
+    pushed up to ~x=60 (the block's max height per the spec).
+    """
+    cy = pitch_width / 2.0  # 34.0
+
+    back_x, mid_x, fwd_x = 100.0, 82.0, 60.0
+    back_dy = [-20, -10, 0, 10, 20]   # 5 defenders
+    mid_dy = [-15, -5, 5, 15]         # 4 midfielders
+
+    positions = [[back_x, cy + dy] for dy in back_dy]
+    positions += [[mid_x, cy + dy] for dy in mid_dy]
+    positions += [[fwd_x, cy]]        # lone forward, central
+
+    positions = np.array(positions, dtype="f4")
+
+    # Defensive: if the roster asks for a different defender count than the 10
+    # this 5-4-1 lays out, fall back to as many of these slots as fit.
+    if n_def != len(positions):
+        positions = positions[:n_def]
+    return positions
+
+
+def _attacker_formation_2_5_3(n_att=10, ref_x=64.0, pitch_width=68.0):
+    """Starting attacker positions in a 2-5-3, already in shape and pushed up
+    the field.
+
+    Uses baseline_attacker.py's own line offset arrays so the start shape is
+    identical to what the baseline steers toward -- players begin at rest in
+    formation instead of drifting in from random spots. The only difference
+    from the baseline's resting FORMATION_REF is a further-up-the-pitch x
+    reference (ref_x, default 64 vs the baseline's 52), so they kick off
+    advanced. Row order matches baseline_attacker.py: rows 0-1 backline, rows
+    2-6 midfield, rows 7-9 the front three.
+    """
+    ref = np.array([ref_x, pitch_width / 2.0])  # centered in y, advanced in x
+
+    positions = np.concatenate([
+        ref + att_backline_offset,   # 2 backline
+        ref + att_midline_offset,    # 5 midfield
+        ref + att_forward_offset,    # 3 forward
+    ]).astype("f4")
+
+    # Defensive: if the roster asks for a different attacker count than the 10
+    # this 2-5-3 lays out, fall back to as many of these slots as fit.
+    if n_att != len(positions):
+        positions = positions[:n_att]
+    return positions
+
+
+def make_initial_world(n_att=10, n_def=10, seed=0, start_holder=0):
     """Build a starting roster + ball matching schema.player_dt and the
     engine's ball dict shape. Attacker ids come first so `ball_action`'s
-    attacker-id array is a clean slice."""
+    attacker-id array is a clean slice.
+
+    n_att defaults to 10 to match baseline_attacker.py's 2-5-3 formation
+    (2 backline + 5 midfield + 3 forward = 10). n_def stays 10 for the
+    defenders' 5-4-1 low block.
+
+    start_holder picks which attacker begins with the ball -- change it to see
+    how the low block reacts to different starting situations. It's the ROW
+    INDEX into the 2-5-3 attacker layout (baseline_attacker.py's order):
+        0-1  backline (deep build-up), e.g. 0 = deep-left
+        2-6  midfield line, e.g. 4 = central midfielder
+        7-9  front three, e.g. 8 = central striker
+    (A negative or out-of-range value is clipped into the attacker rows.)"""
     rng = np.random.default_rng(seed)
 
     players = np.zeros(n_att + n_def, dtype=player_dt)
@@ -244,14 +328,18 @@ def make_initial_world(n_att=8, n_def=10, seed=0):
     players["team"][:n_att] = ATTACKER_LABEL
     players["team"][n_att:] = DEFENDER_LABEL
 
-    # Attackers spread across the middle third, defenders in a low block near
-    # the x=105 goal they defend.
-    players["position"][:n_att] = rng.uniform([20, 8], [65, 60], size=(n_att, 2))
-    players["position"][n_att:] = rng.uniform([72, 8], [100, 60], size=(n_def, 2))
+    # Attackers (10: a 2-5-3, matching baseline_attacker.py) start already in
+    # formation shape and pushed up the field (x ref ~64). Defenders sit in a
+    # resting low-block 5-4-1 near the x=105 goal they defend. Row layout
+    # matches defenders.py: rows 0-4 backline, rows 5-8 midfield, row 9 forward.
+    players["position"][:n_att] = _attacker_formation_2_5_3(n_att)
+    players["position"][n_att:] = _defender_formation_5_4_1(n_def)
     players["velocity"][:] = 0.0
 
     attacker_ids = players["id"][:n_att]
-    holder_id = int(attacker_ids[0])
+    # Pick the starting holder by attacker row index (clipped into range).
+    holder_row = int(np.clip(start_holder, 0, n_att - 1))
+    holder_id = int(attacker_ids[holder_row])
 
     ball = {
         "state": "held",
@@ -261,91 +349,71 @@ def make_initial_world(n_att=8, n_def=10, seed=0):
         "flight_start": np.zeros(2, dtype="f4"),
         "flight_target": np.zeros(2, dtype="f4"),
     }
-    return players, ball, attacker_ids, rng
+
+    # Persistent state for the scripted defenders (holds a short ball_x history
+    # deque used to lag the block's depth reference). Created once and threaded
+    # through every step().
+    defender_state = make_defender_state()
+    return players, ball, attacker_ids, rng, defender_state
 
 
-def choose_actions(players, ball, attacker_ids, rng, pass_prob=0.03):
-    """A stand-in policy (no trained agent yet):
+def step(players, ball, attacker_ids, defender_state, tick_count):
+    """Advance the world one DT tick using only engine.py physics.
 
-    * Every player gets a per-tick (direction_idx, speed_idx) into the engine's
-      lookup tables. Attackers drift goalward (+x), defenders converge on the
-      ball; both get a little noise so the sim looks alive.
-    * The current holder occasionally decides to pass to a random teammate,
-      encoded exactly the way `ball_action` expects (a per-attacker choice
-      array indexed by sorted teammate order).
-
-    Returns (direction_idx, speed_idx, ball_idx) -- all int arrays sized to the
-    full roster / attacker roster respectively.
+    Both teams now supply continuous target velocities directly (no discrete
+    action_decoding): attackers from the scripted baseline in
+    baseline_attacker.py, defenders from the scripted low-block policy in
+    defenders.py. Both are spliced into one roster-wide target array before a
+    single kinematics integration.
     """
-    n = len(players)
-    n_speeds = len(speed_lookup)
-
     att_mask = players["team"] == ATTACKER_LABEL
-    def_mask = ~att_mask
+    def_mask = players["team"] == DEFENDER_LABEL
 
-    direction_idx = np.zeros(n, dtype=int)
-    speed_idx = np.ones(n, dtype=int)  # default: medium speed
+    # Roster-wide target-velocity array, filled per team below. Rows are laid
+    # out attackers-first (rows :n_att) then defenders (rows n_att:), matching
+    # both policies' row ordering.
+    target_velocities = np.zeros((len(players), 2), dtype="f4")
 
-    # Attackers push toward +x (goal), with occasional diagonal variety.
-    # direction_lookup: 0=+x, 4/5 are the +x diagonals.
-    direction_idx[att_mask] = rng.choice([0, 4, 5], size=att_mask.sum())
+    # 1) attackers run the throwaway baseline -> target velocities + ball_idx.
+    #    tick_count drives the baseline's fixed passing cadence.
+    attacker_velocities, ball_idx = compute_attacker_targets(
+        players, ball, tick_count)
+    target_velocities[att_mask] = attacker_velocities
 
-    # Defenders steer toward the ball: pick the lookup direction whose unit
-    # vector best matches (ball - defender).
-    ball_pos = np.asarray(ball["position"], dtype="f4")
-    to_ball = ball_pos - players["position"][def_mask]
-    # cosine-ish match against each lookup direction (skip the last zero row)
-    dirs = direction_lookup[:-1]
-    norms = np.linalg.norm(to_ball, axis=1, keepdims=True)
-    unit_to_ball = np.divide(to_ball, norms, out=np.zeros_like(to_ball),
-                             where=norms > 1e-6)
-    scores = unit_to_ball @ dirs.T
-    direction_idx[def_mask] = np.argmax(scores, axis=1)
+    # 2) defenders run their learned script -> target velocities for the block.
+    #    compute_defender_targets returns velocities in defender-row order,
+    #    which matches how the roster is laid out (defenders occupy rows n_att:).
+    defender_velocities = compute_defender_targets(players, ball, defender_state)
+    target_velocities[def_mask] = defender_velocities
 
-    # A bit of speed variety across everyone.
-    speed_idx[:] = rng.integers(0, n_speeds, size=n)
-
-    # Ball action: default HOLD (0) for every attacker. If the ball is held by
-    # an attacker, that holder may choose to pass to a random teammate.
-    ball_idx = np.zeros(len(attacker_ids), dtype=int)
-    holder_id = ball.get("holder_id")
-    if (ball["state"] == "held" and holder_id is not None
-            and np.any(attacker_ids == holder_id) and rng.random() < pass_prob):
-        n_teammates = len(attacker_ids) - 1
-        if n_teammates >= 1:
-            # holder_choice in [1, n_teammates] indexes sorted teammate ids
-            choice = int(rng.integers(1, n_teammates + 1))
-            ball_idx[attacker_ids == holder_id] = choice
-
-    return direction_idx, speed_idx, ball_idx
-
-
-def step(players, ball, attacker_ids, rng):
-    """Advance the world one DT tick using only engine.py physics."""
-    direction_idx, speed_idx, ball_idx = choose_actions(
-        players, ball, attacker_ids, rng)
-
-    # 1) decode discrete actions -> target velocities, integrate kinematics
-    target_velocities = action_decoding(direction_idx, speed_idx)
+    # 3) integrate kinematics for everyone with the combined targets.
     players = kinematics_integrator(players, target_velocities)
 
-    # 2) resolve the ball: pass decision, then flight/hold mechanics
+    # 4) resolve the ball: pass decision, then flight/hold mechanics
     pass_decision = ball_action(ball_idx, ball.get("holder_id"), attacker_ids)
     ball = ball_mechanics(ball, players, pass_decision)
 
     return players, ball
 
 
-def run_simulation(n_att=8, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
-                   show_zones=False):
+def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
+                   show_zones=False, start_holder=0):
     """Open a matplotlib window and animate the engine in real time.
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
+
+    start_holder chooses which attacker kicks off with the ball (attacker row
+    index; see make_initial_world). Change it to watch the low block react to
+    different starting situations -- e.g. start_holder=0 (deep build-up) vs
+    8 (ball already at the central striker).
     """
     if interval_ms is None:
         interval_ms = int(DT * 1000)
 
-    players, ball, attacker_ids, rng = make_initial_world(n_att, n_def, seed)
+    # rng is only used inside make_initial_world (for starting positions); the
+    # step loop is now fully scripted, so we don't thread it through.
+    players, ball, attacker_ids, _rng, defender_state = make_initial_world(
+        n_att, n_def, seed, start_holder=start_holder)
 
     fig, ax = plt.subplots(figsize=(10.5, 6.8))
     fig.patch.set_facecolor(PITCH_COLOR)
@@ -354,9 +422,10 @@ def run_simulation(n_att=8, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
     world = {"players": players, "ball": ball, "tick": 0}
 
     def update(_frame):
-        world["players"], world["ball"] = step(
-            world["players"], world["ball"], attacker_ids, rng)
         world["tick"] += 1
+        world["players"], world["ball"] = step(
+            world["players"], world["ball"], attacker_ids, defender_state,
+            world["tick"])
         t = world["tick"] * DT
         state = world["ball"]["state"]
         render_frame(world["players"], world["ball"], ax=ax,
@@ -375,4 +444,4 @@ def run_simulation(n_att=8, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
 
 
 if __name__ == "__main__":
-    run_simulation()
+    run_simulation(start_holder=8)
