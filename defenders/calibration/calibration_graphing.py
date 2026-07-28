@@ -65,6 +65,14 @@ for match_id in match_ids:
         mid_y_sorted = np.sort(mid_y)
 
         att_x = np.array([p['location'][0] for p in attackers]) if attackers else np.array([])
+        att_y = np.array([p['location'][1] for p in attackers]) if attackers else np.array([])
+
+        if len(att_x) < 3:
+            continue
+
+        att_order = np.argsort(att_x)
+        att_line_sel = att_order[:4]
+        att_line_x = att_x[att_line_sel].mean()
 
         frame_rows.append({
             'match_id': match_id,
@@ -88,6 +96,11 @@ for match_id in match_ids:
             'back_gap_max': np.diff(back_y_sorted).max(),
             'mid_gap_min': np.diff(mid_y_sorted).min(),
             'highest_att_x': att_x.min() if len(att_x) else np.nan,
+            'n_att': len(att_x),
+            'att_line_x': att_line_x,
+            'att_centroid_x': att_x.mean(),
+            'att_centroid_y': att_y.mean(),
+            'att_width': att_y.max() - att_y.min(),
         })
 
         for slot, (px, py) in enumerate(zip(back_x[np.argsort(back_y)], np.sort(back_y))):
@@ -100,6 +113,12 @@ for match_id in match_ids:
                                 'slot': slot + 5, 'x': px, 'y': py,
                                 'ball_x': ball_x, 'ball_y': ball_y,
                                 'dx_from_line': px - mid_x.mean()})
+
+        for attacker_idx, (px, py) in enumerate(zip(att_x[np.argsort(att_y)], np.sort(att_y))):
+            player_rows.append({'event_id': eid, 'match_id': match_id, 'line': 'att',
+                                'slot': np.nan, 'attacker_idx': attacker_idx, 'x': px, 'y': py,
+                                'ball_x': ball_x, 'ball_y': ball_y,
+                                'dx_from_line': px - att_line_x})
 
 df = pd.DataFrame(frame_rows)
 players = pd.DataFrame(player_rows)
@@ -116,6 +135,34 @@ gb = np.polyfit(df['ball_y'], df['back_centroid_y'] - 34, 1)
 gm = np.polyfit(df['ball_y'] - 34, df['mid_centroid_y'] - 34, 1)
 print(f"back gain={np.polyfit(df['ball_y'] - 34, df['back_centroid_y'] - 34, 1)[0]:.3f}   mid gain={gm[0]:.3f}")
 print()
+print("--- lstsq: back_line_x ~ ball_x + att_line_x + 1 ---")
+A = np.column_stack([df['ball_x'], df['att_line_x'], np.ones(len(df))])
+b = df['back_line_x'].values
+coef, residuals, rank, sv = np.linalg.lstsq(A, b, rcond=None)
+pred = A @ coef
+ss_res = ((b - pred) ** 2).sum()
+ss_tot = ((b - b.mean()) ** 2).sum()
+r2 = 1 - ss_res / ss_tot
+rmse = np.sqrt(ss_res / len(b))
+print(f"back_line_x = {coef[0]:.4f}*ball_x + {coef[1]:.4f}*att_line_x + {coef[2]:.3f}")
+print(f"R2={r2:.4f}  RMSE={rmse:.3f}m  rank={rank}")
+
+ball_only = np.column_stack([df['ball_x'], np.ones(len(df))])
+c_bo = np.linalg.lstsq(ball_only, b, rcond=None)[0]
+r2_bo = 1 - (((b - ball_only @ c_bo) ** 2).sum()) / ss_tot
+print(f"ball-only R2={r2_bo:.4f}  ->  att_line_x adds {r2 - r2_bo:+.4f}")
+
+coef_df = pd.DataFrame([
+    {'model': 'ball+att', 'term': 'ball_x', 'coef': coef[0]},
+    {'model': 'ball+att', 'term': 'att_line_x', 'coef': coef[1]},
+    {'model': 'ball+att', 'term': 'intercept', 'coef': coef[2]},
+    {'model': 'ball+att', 'term': 'r2', 'coef': r2},
+    {'model': 'ball+att', 'term': 'rmse', 'coef': rmse},
+    {'model': 'ball_only', 'term': 'ball_x', 'coef': c_bo[0]},
+    {'model': 'ball_only', 'term': 'intercept', 'coef': c_bo[1]},
+    {'model': 'ball_only', 'term': 'r2', 'coef': r2_bo},
+])
+print()
 print("--- width / spacing (defenders.py assumes 40m back, gaps 8-12) ---")
 print(df[['back_width', 'mid_width', 'back_gap_min', 'back_gap_max', 'mid_gap_min']].describe().loc[['mean', 'std', '25%', '50%', '75%']])
 print()
@@ -125,23 +172,36 @@ print()
 print("--- per-slot depth stagger (rigid model predicts identical) ---")
 print(players.groupby('slot')['dx_from_line'].agg(['mean', 'std', 'count']))
 
+fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+
+axes[0].scatter(df['ball_x'], df['back_line_x'], s=4, alpha=0.2)
+axes[0].plot([0, 80], np.polyval(fit, [0, 80]), 'r-')
+axes[0].set_xlabel('ball_x')
+axes[0].set_ylabel('back_line_x')
+axes[0].set_title(f'Depth response to ball (R2={r2_bo:.3f})')
+
+axes[1].scatter(pred, b, s=4, alpha=0.2, color='darkgreen')
+lim = [min(pred.min(), b.min()), max(pred.max(), b.max())]
+axes[1].plot(lim, lim, 'r-')
+axes[1].set_xlabel('predicted back_line_x')
+axes[1].set_ylabel('actual back_line_x')
+axes[1].set_title(f'Depth response to ball + attacker positioning (R2={r2:.3f})')
+
+plt.tight_layout()
+plt.savefig('defenders/depth_response.png', dpi=120)
+plt.close(fig)
+
 fig, axes = plt.subplots(2, 3, figsize=(16, 9))
 
 axes[0, 0].hist(df['back_line_x'], bins=40, color='steelblue')
 axes[0, 0].set_title(f'Backline depth (n={len(df)})')
 axes[0, 0].set_xlabel('back_line_x')
 
-axes[0, 1].scatter(df['ball_x'], df['back_line_x'], s=4, alpha=0.2)
-axes[0, 1].plot([0, 80], np.polyval(fit, [0, 80]), 'r-')
-axes[0, 1].set_xlabel('ball_x')
-axes[0, 1].set_ylabel('back_line_x')
-axes[0, 1].set_title('Depth response to ball')
-
-axes[0, 2].scatter(df['ball_y'], df['back_centroid_y'], s=4, alpha=0.2)
-axes[0, 2].plot([0, 68], 34 + gb[0] * (np.array([0, 68]) - 34), 'r-')
-axes[0, 2].set_xlabel('ball_y')
-axes[0, 2].set_ylabel('back_centroid_y')
-axes[0, 2].set_title(f'Lateral shift (gain={gb[0]:.2f})')
+axes[0, 1].scatter(df['ball_y'], df['back_centroid_y'], s=4, alpha=0.2)
+axes[0, 1].plot([0, 68], 34 + gb[0] * (np.array([0, 68]) - 34), 'r-')
+axes[0, 1].set_xlabel('ball_y')
+axes[0, 1].set_ylabel('back_centroid_y')
+axes[0, 1].set_title(f'Lateral shift (gain={gb[0]:.2f})')
 
 axes[1, 0].hist(df['back_x_scatter'], bins=40, color='darkorange')
 axes[1, 0].set_title('Within-backline x scatter')
@@ -153,14 +213,27 @@ axes[1, 1].set_title('Backline width (red = current 40m)')
 axes[1, 1].set_xlabel('back_width')
 
 gaps = np.concatenate([df['back_gap_min'], df['back_gap_max']])
-axes[1, 2].hist(gaps, bins=40, color='purple')
-axes[1, 2].axvline(8, color='red', ls='--')
-axes[1, 2].axvline(12, color='red', ls='--')
-axes[1, 2].set_title('Backline gaps (red = snapback 8-12 band)')
-axes[1, 2].set_xlabel('gap (m)')
+axes[0, 2].hist(gaps, bins=40, color='purple')
+axes[0, 2].axvline(8, color='red', ls='--')
+axes[0, 2].axvline(12, color='red', ls='--')
+axes[0, 2].set_title('Backline gaps (red = snapback 8-12 band)')
+axes[0, 2].set_xlabel('gap (m)')
+
+axes[1, 2].hist(df['att_line_x'], bins=40, color='firebrick')
+axes[1, 2].set_title('Attacking line depth')
+axes[1, 2].set_xlabel('att_line_x')
 
 plt.tight_layout()
-plt.savefig('defenders/low_block_diagnostic.png', dpi=120)
+plt.savefig('defenders/shape_diagnostic.png', dpi=120)
+plt.close(fig)
 
 df.to_csv('defenders/low_block_frames.csv', index=False)
 players.to_csv('defenders/low_block_defenders.csv', index=False)
+coef_df.to_csv('defenders/depth_fit_coefficients.csv', index=False)
+
+summary = df[['back_line_x', 'mid_line_x', 'line_sep', 'back_centroid_y', 'mid_centroid_y',
+              'back_width', 'mid_width', 'back_x_scatter', 'mid_x_scatter',
+              'back_gap_min', 'back_gap_max', 'mid_gap_min',
+              'att_line_x', 'highest_att_x', 'att_width']].describe().T
+summary.to_csv('defenders/low_block_summary_stats.csv')
+players.groupby('slot')['dx_from_line'].agg(['mean', 'std', 'count']).to_csv('defenders/per_slot_stagger.csv')
