@@ -35,22 +35,51 @@ def attacker_positioning(ball_y, pitch_center, gain):
     return pos
 
 def apply_compactness_snapback(def_positions, target_velocities, v_max, lo=8.0, hi=12.0):
-    lines = [BACKLINE_INDICES, MIDFIELD_INDICES] 
+    lines = [BACKLINE_INDICES, MIDFIELD_INDICES]
+    speed = 0.5 * v_max
     for line_slice in lines:
         line_pos = def_positions[line_slice]
         order = np.argsort(line_pos[:, 1])  # sort by y within the line
         sorted_idx = np.arange(len(line_pos))[order]
+        line_centroid = line_pos.mean(axis=0)
+
+        # A player can sit in two violating pairs at once (too close to one
+        # neighbour, too far from the other). Accumulate every correction and
+        # clip once at the end, so which pair "wins" isn't decided by loop order.
+        corrections = np.zeros_like(line_pos)
+
         for k in range(len(sorted_idx) - 1):
             i, j = sorted_idx[k], sorted_idx[k + 1]
             gap = abs(line_pos[j, 1] - line_pos[i, 1])
-            if gap < lo or gap > hi:
-                line_centroid = line_pos.mean(axis=0)
+
+            if gap > hi:
+                # too spread out: pull both back toward the line centroid
                 for idx in (i, j):
                     to_centroid = line_centroid - line_pos[idx]
                     d = np.linalg.norm(to_centroid)
                     if d > 1e-6:
-                        global_idx = line_slice.start + idx
-                        target_velocities[global_idx] = (to_centroid / d) * (0.5 * v_max)
+                        corrections[idx] += (to_centroid / d) * speed
+
+            elif gap < lo:
+                i_to_j = line_pos[j] - line_pos[i]
+                d = np.linalg.norm(i_to_j)
+                if d > 1e-6:
+                    axis = i_to_j / d
+                else:
+                    # players are stacked: no axis to separate along, so fall
+                    # back to +y by sorted order to break the tie deterministically
+                    axis = np.array([0.0, 1.0])
+                corrections[i] -= axis * speed
+                corrections[j] += axis * speed
+
+        # clip to the same 0.5 * v_max magnitude, then override only the
+        # players this pass actually had something to say about
+        mag = np.linalg.norm(corrections, axis=1, keepdims=True)
+        scale = np.divide(speed, mag, out=np.zeros_like(mag), where=mag > speed)
+        corrections = np.where(mag > speed, corrections * scale, corrections)
+
+        active = np.flatnonzero(mag > 1e-6) + line_slice.start
+        target_velocities[active] = corrections[mag.ravel() > 1e-6]
     return target_velocities
 
 def apply_pressure_trigger(players, ball, def_positions, target_velocities, v_max,
