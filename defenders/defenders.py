@@ -5,25 +5,39 @@ BACKLINE_INDICES = slice(0, 5)
 MIDFIELD_INDICES = slice(5, 9)
 FORWARD_INDEX = slice(9, 10)
 V_MAX = 5.0
+HARAM_DEPTH_OFFSET = 15.0
 
-backline_offset = np.array([[-2.0, -20], [1.1, -10], [1.6, 0], [0.9, 10], [-1.6, 20]])
-midline_offset = np.array([[0, -15], [1.0, -5], [1.1, 5], [0, 15]])
+PITCH_X = 105.0
+LINE_SEP = 10
+
+# Pulled from the regression set for clipping 5% and 95% quantile
+# These are in the calibration frame (defending x=0), so mirror inputs before clipping
+ATT_LINE_MIN = 16.09
+ATT_LINE_MAX = 42.25
+BALL_X_MIN= 13.26
+BALL_X_MAX = 57.48
+
+backline_offset = np.array([[-1.77, -20], [0.93, -10], [1.42, 0], [0.80, 10], [-1.38, 20]])
+midline_offset = np.array([[-0.47, -15], [0.18, -5], [0.44, 5], [-0.20, 15]])
 
 def make_defender_state():
     return {
-        "ball_x_history": deque(maxlen=5)
+        "ball_x_history": deque(maxlen=5),
+        "attacker_line_history": deque(maxlen=5),
     }
 
 def y_centroid(ball_y, pitch_center, gain):
     return pitch_center + gain * (ball_y - pitch_center)
 
-def calculate_depth_ref(defender_state, ball_x):
+def calculate_depth_ref(defender_state, ball_x, attacker_line_x):
 
     defender_state["ball_x_history"].append(ball_x)
+    defender_state["attacker_line_history"].append(attacker_line_x)
     oldest_ball_x = defender_state["ball_x_history"][0]
+    oldest_attacker_line = defender_state["attacker_line_history"][0]
 
-    mid_line_x = max(oldest_ball_x, 70)
-    back_line_x = mid_line_x + 17.8
+    back_line_x = PITCH_X - (16.070 + (0.8144 * oldest_attacker_line) - (0.1067 * oldest_ball_x)) + HARAM_DEPTH_OFFSET
+    mid_line_x = back_line_x - LINE_SEP
 
     return mid_line_x, back_line_x
 
@@ -34,7 +48,7 @@ def attacker_positioning(ball_y, pitch_center, gain):
 
     return pos
 
-def apply_compactness_snapback(def_positions, target_velocities, v_max, lo=8.0, hi=12.0):
+def apply_compactness_snapback(def_positions, target_velocities, v_max, lo=2.5, hi=16.0):
     lines = [BACKLINE_INDICES, MIDFIELD_INDICES]
     speed = 0.5 * v_max
     for line_slice in lines:
@@ -78,8 +92,13 @@ def apply_compactness_snapback(def_positions, target_velocities, v_max, lo=8.0, 
         scale = np.divide(speed, mag, out=np.zeros_like(mag), where=mag > speed)
         corrections = np.where(mag > speed, corrections * scale, corrections)
 
-        active = np.flatnonzero(mag > 1e-6) + line_slice.start
-        target_velocities[active] = corrections[mag.ravel() > 1e-6]
+        # Blend the spacing correction into the existing target-seeking velocity
+        # instead of replacing it, so a player in a spacing violation still makes
+        # progress toward their slot instead of freezing to fix the gap.
+        blended = target_velocities[line_slice] + corrections
+        bmag = np.linalg.norm(blended, axis=1, keepdims=True)
+        bscale = np.divide(v_max, bmag, out=np.ones_like(bmag), where=bmag > v_max)
+        target_velocities[line_slice] = blended * np.minimum(bscale, 1.0)
     return target_velocities
 
 def apply_pressure_trigger(players, ball, def_positions, target_velocities, v_max,
@@ -118,9 +137,20 @@ def compute_defender_targets(players, ball, defender_state):
     defender_mask = players["team"] == "defender"
     defender_positions = players["position"][defender_mask]
 
-    mid_line_x, back_line_x = calculate_depth_ref(defender_state, ball["position"][0])
-    mid_dy = y_centroid(ball["position"][1], pitch_center=34, gain=0.29)
-    back_dy = y_centroid(ball["position"][1], pitch_center=34, gain=0.41)
+    attacker_mask = players["team"] == "attacker"
+    attacker_positions = players["position"][attacker_mask]
+
+    attacker_x = attacker_positions[:, 0]
+    distances = np.abs(attacker_x - PITCH_X)
+    closest_indices = np.argsort(distances)[:4]
+    attacker_line = np.mean(attacker_x[closest_indices])
+
+    attacker_line = np.clip(PITCH_X - attacker_line, ATT_LINE_MIN, ATT_LINE_MAX)
+    ball_x_clipped = np.clip(PITCH_X - ball["position"][0], BALL_X_MIN, BALL_X_MAX)
+
+    mid_line_x, back_line_x = calculate_depth_ref(defender_state, ball_x_clipped, attacker_line)
+    mid_dy = y_centroid(ball["position"][1], pitch_center=34, gain=0.31)
+    back_dy = y_centroid(ball["position"][1], pitch_center=34, gain=0.19)
 
     back_centroid = np.array([back_line_x, back_dy])
     mid_centroid = np.array([mid_line_x, mid_dy])

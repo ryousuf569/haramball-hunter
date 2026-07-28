@@ -1,9 +1,9 @@
 model,term,coef
-ball+att,ball_x,-0.10667815898144456
-ball+att,att_line_x,0.8143564858877315
-ball+att,intercept,18.366131900473043
+ball+att,ball_x,-0.10667815898144326
+ball+att,att_line_x,0.8143564858877301
+ball+att,intercept,16.07036541291392
 ball+att,r2,0.6662821983259727
-ball+att,rmse,4.462295580226039
-ball_only,ball_x,0.20367883826957303
-ball_only,intercept,33.793781579774716
-ball_only,r2,0.1572328174344777
+ball+att,rmse,3.904508632697784
+ball_only,ball_x,0.20367883826957284
+ball_only,intercept,29.5695588823029
+ball_only,r2,0.1572328174344778

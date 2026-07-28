@@ -65,14 +65,14 @@ BALL_LEAN = 0.12
 #   backline: 2, midfield: 5, forward: 3  ->  10 attackers total.
 N_ATT = 10
 BACKLINE_INDICES = slice(0, 2)
-MIDFIELD_INDICES = slice(2, 7)
-FORWARD_INDICES = slice(7, 10)
+MIDFIELD_INDICES = slice(2, 6)
+FORWARD_INDICES = slice(6, 10)
 
 # y spans the full 68m width the same way defenders.py's arrays do; x offsets
 # stagger the lines back-to-front around the shared reference point.
 backline_offset = np.array([[-18, -12], [-18, 12]])
-midline_offset = np.array([[0, -24], [0, -12], [0, 0], [0, 12], [0, 24]])
-forward_offset = np.array([[20, -16], [25, 0], [20, 16]])
+midline_offset = np.array([[0, -24], [0, -12], [0, 0], [0, 12]])
+forward_offset = np.array([[20, -20], [25, -8], [25, 8], [20, 20]])
 
 # Shared formation reference point (a plain fixed centroid around the
 # mid-to-attacking-third). No ball tracking / basculation lag -- this is
