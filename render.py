@@ -5,6 +5,8 @@ Coordinate system matches engine.py: global pitch frame, origin bottom-left,
 x = 105.
 """
 
+import time
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -17,21 +19,26 @@ from engine import (
     ball_action,
     ball_mechanics,
     kinematics_integrator,
+    local_to_global,
 )
 from schema import player_dt
+
+# Pitch control. PPCF_grid is fully vectorized over (cells x players), so one
+# call per tick covers the whole grid.
+from spearman_models.ppcf import PPCF_grid
 
 # Defenders now run their learned/scripted low-block behaviour. This module
 # returns target velocities for the whole defender line directly (bypassing the
 # discrete direction/speed action decoding used for attackers), so we splice
 # its output into the roster-wide target-velocity array before integrating.
-from defenders import make_defender_state, compute_defender_targets
+from defenders.defenders import make_defender_state, compute_defender_targets
 
 # Attackers run a throwaway scripted baseline (a fixed formation + fixed-cadence
 # passing) purely so the sim looks coherent while the defender script is being
 # tested. Like the defenders, it returns continuous target velocities directly
 # (bypassing the discrete action_decoding path) plus the ball_idx array that
 # engine.ball_action expects. Replace wholesale when a real attacker exists.
-from baseline_attacker import (
+from attackers.baseline_attacker import (
     compute_attacker_targets,
     backline_offset as att_backline_offset,
     midline_offset as att_midline_offset,
@@ -146,7 +153,7 @@ def _draw_team(ax, positions, velocities, ids, color, show_ids, show_velocity):
 
 def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
                   show_zones=False, pitch_length=105.0, pitch_width=68.0,
-                  clear=True, title=None):
+                  clear=True, title=None, pc_att=None):
     """
     Draw one frame of engine state.
 
@@ -178,6 +185,10 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
         clear/redraw cycle yourself in an animation loop.
     title : str or None
         Optional title (e.g. tick number) drawn above the pitch.
+    pc_att : ndarray (PC_NX, PC_NY) or None
+        Attacker pitch-control field from compute_attacker_ppcf, drawn as a
+        heatmap under the players over the grid's global-frame extent. None
+        skips the overlay.
 
     Returns
     -------
@@ -194,6 +205,13 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
     _draw_pitch(ax, pitch_length, pitch_width)
     if show_zones:
         _draw_reward_zones(ax, pitch_width)
+
+    # Attacker pitch control, under everything else. .T because the field is
+    # indexed (x, y) while imshow reads (row, col) = (y, x).
+    if pc_att is not None:
+        ax.imshow(pc_att.T, origin="lower", extent=PC_EXTENT, cmap="Reds",
+                  vmin=0.0, vmax=1.0, alpha=0.55, zorder=1,
+                  interpolation="bilinear")
 
     att_mask = players["team"] == ATTACKER_LABEL
     def_mask = players["team"] == DEFENDER_LABEL
@@ -305,6 +323,53 @@ def _attacker_formation_2_5_3(n_att=10, ref_x=64.0, pitch_width=68.0):
     return positions
 
 
+# --- pitch-control grid ----------------------------------------------------
+# Only the attacking half-plus-a-bit matters for a low block, so we evaluate
+# PPCF on the same 31 x 34 cell grid pitch.py uses (62m x 68m at 2m cells) and
+# push it into the global frame with engine.local_to_global. That's 1054 cells
+# instead of the ~1800 a full-pitch grid would need, and the cells we drop are
+# behind the ball in the attackers' own build-up third where control is
+# uncontested anyway.
+PC_NX, PC_NY = 31, 34
+PC_CELL_SIZE = 2.0
+
+
+def make_ppcf_grid():
+    """Build the fixed (n_cells, 2) global-frame target array for PPCF_grid.
+
+    Cell centres are laid out row-major over (i, j) -- i indexes local x, j
+    indexes local y -- so a returned (n_cells,) PPCF field reshapes straight to
+    (PC_NX, PC_NY) with `.reshape(PC_NX, PC_NY)`.
+    """
+    i = np.arange(PC_NX)
+    j = np.arange(PC_NY)
+    ii, jj = np.meshgrid((i + 0.5) * PC_CELL_SIZE, (j + 0.5) * PC_CELL_SIZE,
+                         indexing="ij")
+    grid_local = np.stack([ii, jj], axis=-1).reshape(-1, 2)  # (1054, 2)
+    return local_to_global(grid_local)
+
+
+# Global-frame extent of the grid, for imshow/pcolormesh overlays.
+_pc_corners = local_to_global(np.array([[0.0, 0.0],
+                                        [PC_NX * PC_CELL_SIZE,
+                                         PC_NY * PC_CELL_SIZE]]))
+PC_EXTENT = (_pc_corners[0, 0], _pc_corners[1, 0],
+             _pc_corners[0, 1], _pc_corners[1, 1])
+
+
+def compute_attacker_ppcf(players, ppcf_grid):
+    """Attacker pitch control over the grid, as a (PC_NX, PC_NY) field.
+
+    PPCF_grid returns per-player control for every cell in one vectorized call;
+    we sum only the attacker columns. Defenders still enter the computation --
+    they're what the attackers are competing against -- we just don't keep
+    their share of the field.
+    """
+    result = PPCF_grid(ppcf_grid, players)          # (n_cells, n_players)
+    is_att = players["team"] == ATTACKER_LABEL
+    return result[:, is_att].sum(axis=1).reshape(PC_NX, PC_NY)
+
+
 def make_initial_world(n_att=10, n_def=10, seed=0, start_holder=0):
     """Build a starting roster + ball matching schema.player_dt and the
     engine's ball dict shape. Attacker ids come first so `ball_action`'s
@@ -357,7 +422,8 @@ def make_initial_world(n_att=10, n_def=10, seed=0, start_holder=0):
     return players, ball, attacker_ids, rng, defender_state
 
 
-def step(players, ball, attacker_ids, defender_state, tick_count):
+def step(players, ball, attacker_ids, defender_state, tick_count,
+         ppcf_grid=None):
     """Advance the world one DT tick using only engine.py physics.
 
     Both teams now supply continuous target velocities directly (no discrete
@@ -365,6 +431,10 @@ def step(players, ball, attacker_ids, defender_state, tick_count):
     baseline_attacker.py, defenders from the scripted low-block policy in
     defenders.py. Both are spliced into one roster-wide target array before a
     single kinematics integration.
+
+    If ppcf_grid is given (as built by make_ppcf_grid), attacker pitch control
+    is evaluated on that grid after the state advances and returned as a third
+    value; otherwise the third value is None.
     """
     att_mask = players["team"] == ATTACKER_LABEL
     def_mask = players["team"] == DEFENDER_LABEL
@@ -393,11 +463,16 @@ def step(players, ball, attacker_ids, defender_state, tick_count):
     pass_decision = ball_action(ball_idx, ball.get("holder_id"), attacker_ids)
     ball = ball_mechanics(ball, players, pass_decision)
 
-    return players, ball
+    # 5) attacker pitch control on the post-integration positions/velocities.
+    pc_att = None
+    if ppcf_grid is not None:
+        pc_att = compute_attacker_ppcf(players, ppcf_grid)
+
+    return players, ball, pc_att
 
 
 def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
-                   show_zones=False, start_holder=0):
+                   show_zones=False, start_holder=0, show_ppcf=True):
     """Open a matplotlib window and animate the engine in real time.
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
@@ -406,6 +481,17 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
     index; see make_initial_world). Change it to watch the low block react to
     different starting situations -- e.g. start_holder=0 (deep build-up) vs
     8 (ball already at the central striker).
+
+    show_ppcf computes attacker pitch control every tick on the reduced grid and
+    draws it as a heatmap. Set False to skip the PPCF integration entirely if
+    the animation can't keep up with real time.
+
+    Timing note: measured here, step+render is ~130ms/tick with PPCF on vs
+    ~68ms off, against DT=100ms -- so with the heatmap the animation runs at
+    roughly 0.75x real time. PPCF is ~54ms of that, nearly all of it the 200
+    integration steps (integration_horizon / integration_timestep) in
+    ppcf.PPCF_grid. If real-time playback matters more than the overlay, either
+    pass show_ppcf=False or coarsen that integration.
     """
     if interval_ms is None:
         interval_ms = int(DT * 1000)
@@ -418,19 +504,51 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
     fig, ax = plt.subplots(figsize=(10.5, 6.8))
     fig.patch.set_facecolor(PITCH_COLOR)
 
-    # mutable state carried across FuncAnimation frames
-    world = {"players": players, "ball": ball, "tick": 0}
+    # Cell centres are fixed for the whole run, so build the grid once and reuse
+    # the same (n_cells, 2) array on every tick.
+    ppcf_grid = make_ppcf_grid() if show_ppcf else None
+
+    # mutable state carried across FuncAnimation frames. step_ms/render_ms
+    # accumulate the per-tick cost split so the running means below aren't
+    # dominated by whichever tick happened to be slow.
+    world = {"players": players, "ball": ball, "tick": 0,
+             "step_ms": 0.0, "render_ms": 0.0}
+
+    budget_ms = DT * 1000.0
 
     def update(_frame):
         world["tick"] += 1
-        world["players"], world["ball"] = step(
+
+        t_step0 = time.perf_counter()
+        world["players"], world["ball"], pc_att = step(
             world["players"], world["ball"], attacker_ids, defender_state,
-            world["tick"])
+            world["tick"], ppcf_grid=ppcf_grid)
+        step_ms = (time.perf_counter() - t_step0) * 1000.0
+
         t = world["tick"] * DT
         state = world["ball"]["state"]
+
+        t_render0 = time.perf_counter()
         render_frame(world["players"], world["ball"], ax=ax,
-                     show_zones=show_zones,
+                     show_zones=show_zones, pc_att=pc_att,
                      title=f"tick {world['tick']}  |  t = {t:5.1f}s  |  ball: {state}")
+        render_ms = (time.perf_counter() - t_render0) * 1000.0
+
+        # Note: render_ms covers building the artists, not the canvas blit that
+        # matplotlib does after update() returns, so total_ms understates true
+        # wall-clock per frame somewhat.
+        total_ms = step_ms + render_ms
+        world["step_ms"] += step_ms
+        world["render_ms"] += render_ms
+        n = world["tick"]
+        mean_ms = (world["step_ms"] + world["render_ms"]) / n
+
+        # Flag ticks that blow the real-time budget -- with PPCF on this is the
+        # common case, so it's a marker rather than a warning.
+        over = "  OVER" if total_ms > budget_ms else ""
+        print(f"tick {n:5d}  step {step_ms:6.1f}ms  render {render_ms:6.1f}ms  "
+              f"total {total_ms:6.1f}ms  (mean {mean_ms:6.1f}ms / "
+              f"budget {budget_ms:.0f}ms){over}")
         return []
 
     # cache_frame_data=False -> don't buffer every frame (state is live/mutating)
@@ -444,4 +562,4 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
 
 
 if __name__ == "__main__":
-    run_simulation(start_holder=4)
+    run_simulation(start_holder=2)

@@ -1,11 +1,11 @@
 import numpy as np
 import math as m
-from tti import TTI_vec, intercept_probability_vec
+from spearman_models.tti import TTI_vec, intercept_probability_vec
 
 attacker_control_rate = 4.30
 defender_control_rate_multiplier = 1.72
 defender_control_rate = attacker_control_rate * defender_control_rate_multiplier
-integration_timestep = 0.05
+integration_timestep = 0.08
 integration_horizon = 10
 
 def PPCF_grid(targets, players):
@@ -40,5 +40,4 @@ def PPCF_grid(targets, players):
         PPCF_array += increments
         PPCF_total = PPCF_array.sum(axis=1)
         t += integration_timestep
-
     return PPCF_array
