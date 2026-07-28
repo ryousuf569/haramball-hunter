@@ -562,4 +562,4 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
 
 
 if __name__ == "__main__":
-    run_simulation(start_holder=2)
+    run_simulation(start_holder=1)

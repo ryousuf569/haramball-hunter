@@ -6,8 +6,8 @@ MIDFIELD_INDICES = slice(5, 9)
 FORWARD_INDEX = slice(9, 10)
 V_MAX = 5.0
 
-backline_offset = np.array([[0, -20], [0, -10], [0, 0], [0, 10], [0, 20]])
-midline_offset = np.array([[0, -15], [0, -5], [0, 5], [0, 15]])
+backline_offset = np.array([[-2.0, -20], [1.1, -10], [1.6, 0], [0.9, 10], [-1.6, 20]])
+midline_offset = np.array([[0, -15], [1.0, -5], [1.1, 5], [0, 15]])
 
 def make_defender_state():
     return {
@@ -23,7 +23,7 @@ def calculate_depth_ref(defender_state, ball_x):
     oldest_ball_x = defender_state["ball_x_history"][0]
 
     mid_line_x = max(oldest_ball_x, 70)
-    back_line_x = mid_line_x + 10
+    back_line_x = mid_line_x + 17.8
 
     return mid_line_x, back_line_x
 
@@ -119,10 +119,11 @@ def compute_defender_targets(players, ball, defender_state):
     defender_positions = players["position"][defender_mask]
 
     mid_line_x, back_line_x = calculate_depth_ref(defender_state, ball["position"][0])
-    dy = y_centroid(ball["position"][1], pitch_center=34, gain=0.2)
+    mid_dy = y_centroid(ball["position"][1], pitch_center=34, gain=0.29)
+    back_dy = y_centroid(ball["position"][1], pitch_center=34, gain=0.41)
 
-    back_centroid = np.array([back_line_x, dy])
-    mid_centroid = np.array([mid_line_x, dy])
+    back_centroid = np.array([back_line_x, back_dy])
+    mid_centroid = np.array([mid_line_x, mid_dy])
 
     targets = np.zeros_like(defender_positions)
     targets[BACKLINE_INDICES] = back_centroid + backline_offset

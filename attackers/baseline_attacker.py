@@ -72,7 +72,7 @@ FORWARD_INDICES = slice(7, 10)
 # stagger the lines back-to-front around the shared reference point.
 backline_offset = np.array([[-18, -12], [-18, 12]])
 midline_offset = np.array([[0, -24], [0, -12], [0, 0], [0, 12], [0, 24]])
-forward_offset = np.array([[18, -16], [18, 0], [18, 16]])
+forward_offset = np.array([[20, -16], [25, 0], [20, 16]])
 
 # Shared formation reference point (a plain fixed centroid around the
 # mid-to-attacking-third). No ball tracking / basculation lag -- this is
