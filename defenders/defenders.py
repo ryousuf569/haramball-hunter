@@ -1,10 +1,12 @@
 import numpy as np
+import math as m
 from collections import deque
 
 BACKLINE_INDICES = slice(0, 5)
 MIDFIELD_INDICES = slice(5, 9)
 FORWARD_INDEX = slice(9, 10)
 V_MAX = 5.0
+A_MAX = 7.0
 HARAM_DEPTH_OFFSET = 15.0
 
 PITCH_X = 105.0
@@ -102,7 +104,8 @@ def apply_compactness_snapback(def_positions, target_velocities, v_max, lo=2.5, 
     return target_velocities
 
 def apply_pressure_trigger(players, ball, def_positions, target_velocities, v_max,
-                            box_x_min=88.5, box_y=(13.84, 54.16), trigger_dist=15.0, support_dist=5.0):
+                            box_x_min=88.5, box_y=(13.84, 54.16), trigger_dist=15.0, support_dist=5.0,
+                            cover_y_sep=8.0):
     holder_id = ball.get("holder_id")
     att_mask = players["team"] == "attacker"
     if holder_id is None or not np.any(players["id"][att_mask] == holder_id):
@@ -124,12 +127,32 @@ def apply_pressure_trigger(players, ball, def_positions, target_velocities, v_ma
         return target_velocities
 
     dists_to_holder = np.linalg.norm(def_positions - holder_pos, axis=1)
-    nearest_two = np.argsort(dists_to_holder)[:2]
-    for idx in nearest_two:
-        to_holder = holder_pos - def_positions[idx]
-        d = np.linalg.norm(to_holder)
-        if d > 1e-6:
-            target_velocities[idx] = (to_holder / d) * v_max
+
+    # Presser comes from midfield (they sit in front of the block), coverer from the
+    # backline. Picking the global nearest two always drew both from the backline --
+    # it sits ~10m closer to a deep holder -- which vacated the middle of the block.
+    presser = MIDFIELD_INDICES.start + np.argmin(dists_to_holder[MIDFIELD_INDICES])
+
+    back_d = dists_to_holder[BACKLINE_INDICES].copy()
+    y_sep = np.abs(def_positions[BACKLINE_INDICES, 1] - def_positions[presser, 1])
+    eligible = y_sep >= cover_y_sep
+    if np.any(eligible):
+        back_d[~eligible] = np.inf
+    coverer = BACKLINE_INDICES.start + np.argmin(back_d)
+
+    to_holder = holder_pos - def_positions[presser]
+    d = np.linalg.norm(to_holder)
+    if d > 1e-6:
+        target_velocities[presser] = (to_holder / d) * v_max
+
+    # The coverer shifts to a point between the holder and their own slot rather than
+    # charging the ball, so the block keeps its shape behind the press.
+    cover_point = 0.5 * (holder_pos + def_positions[coverer])
+    to_cover = cover_point - def_positions[coverer]
+    d = np.linalg.norm(to_cover)
+    if d > 1e-6:
+        target_velocities[coverer] = (to_cover / d) * (0.6 * v_max)
+
     return target_velocities
 
 def compute_defender_targets(players, ball, defender_state):
@@ -163,7 +186,16 @@ def compute_defender_targets(players, ball, defender_state):
     to_target = targets - defender_positions
     dist = np.linalg.norm(to_target, axis=1, keepdims=True)
     unit = np.divide(to_target, dist, out=np.zeros_like(to_target), where=dist > 1e-6)
-    target_velocities = unit * V_MAX
+
+    # speed calculation: constraint that allows the defenders not to overshoot in their targets
+    # before defenders would go a constant speed even if the target was 0.1m away, causing an overshoot
+    # in position
+
+    speed = np.sqrt(2 * A_MAX * dist)
+    speed = np.minimum(speed, V_MAX)
+    speed[dist < 0.4] = 0
+
+    target_velocities = unit * speed
 
     target_velocities = apply_compactness_snapback(defender_positions, target_velocities, V_MAX)
     target_velocities = apply_pressure_trigger(players, ball, defender_positions, target_velocities, V_MAX)
