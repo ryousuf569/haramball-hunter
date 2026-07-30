@@ -6,6 +6,7 @@ x = 105.
 """
 
 import time
+import sys
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -34,9 +35,16 @@ from spearman_models.ppcf import PPCF_grid
 from defenders.defenders import make_defender_state, compute_defender_targets
 
 # Ground duels: a defender inside tackling range of the attacker holding the ball
-# can win it, resolved per tick off the RoboCup reach envelope. Held ball only --
-# interceptions of passes in flight are a separate model.
-from defenders.turnover import ground_duel, apply_turnover
+# can win it, resolved per tick off the RoboCup reach envelope. Held ball only.
+# intercept_pass covers the other half -- a defender cutting out a pass while the
+# ball is in flight -- so the two are mutually exclusive on ball state.
+from defenders.turnover import (
+    ground_duel,
+    intercept_pass,
+    check_offside,
+    nearest_defender_to,
+    apply_turnover,
+)
 
 # Attackers run a throwaway scripted baseline (a fixed formation + fixed-cadence
 # passing) purely so the sim looks coherent while the defender script is being
@@ -362,15 +370,20 @@ PC_EXTENT = (_pc_corners[0, 0], _pc_corners[1, 0],
              _pc_corners[0, 1], _pc_corners[1, 1])
 
 
-def compute_attacker_ppcf(players, ppcf_grid):
+def compute_attacker_ppcf(players, ppcf_grid, ball_pos):
     """Attacker pitch control over the grid, as a (PC_NX, PC_NY) field.
 
     PPCF_grid returns per-player control for every cell in one vectorized call;
     we sum only the attacker columns. Defenders still enter the computation --
     they're what the attackers are competing against -- we just don't keep
     their share of the field.
+
+    ball_pos is passed through so PPCF_grid also caches each player's TTI to the
+    ball in players['i_p'], which is what defenders.turnover.intercept_pass reads.
+    That cache is why this runs every tick regardless of whether the heatmap is
+    drawn -- see run_simulation's show_ppcf note.
     """
-    result = PPCF_grid(ppcf_grid, players)          # (n_cells, n_players)
+    result = PPCF_grid(ppcf_grid, players, ball_pos)  # (n_cells, n_players)
     is_att = players["team"] == ATTACKER_LABEL
     return result[:, is_att].sum(axis=1).reshape(PC_NX, PC_NY)
 
@@ -428,7 +441,7 @@ def make_initial_world(n_att=10, n_def=10, seed=0, start_holder=0):
 
 
 def step(players, ball, attacker_ids, defender_state, tick_count,
-         ppcf_grid=None):
+         ppcf_grid=None, exit_on_turnover=True):
     """Advance the world one DT tick using only engine.py physics.
 
     Both teams now supply continuous target velocities directly (no discrete
@@ -437,14 +450,23 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
     defenders.py. Both are spliced into one roster-wide target array before a
     single kinematics integration.
 
-    Once the ball has been resolved for the tick, a ground duel is attempted: if
-    a defender is inside tackling range of the attacker holding it, possession
-    can flip. The roll uses defender_state["rng"], so a given seed replays
-    identically.
+    Once the ball has been resolved for the tick, two turnover checks run. A
+    ground duel: if a defender is inside tackling range of the attacker holding
+    it, possession can flip -- the roll uses defender_state["rng"], so a given
+    seed replays identically. Or an interception: if the ball is in flight and a
+    defender is inside kicking distance with a high enough control probability,
+    it cuts the pass out. Held and in-flight are exclusive, so at most one fires.
 
     If ppcf_grid is given (as built by make_ppcf_grid), attacker pitch control
     is evaluated on that grid after the state advances and returned as a third
-    value; otherwise the third value is None.
+    value; otherwise the third value is None. Note that this call also populates
+    players['i_p'], which intercept_pass depends on -- so passing ppcf_grid=None
+    disables interception as a side effect.
+
+    exit_on_turnover sys.exit()s the moment possession flips, which is how the
+    interactive sim marks the end of an episode (the engine has no restart, so a
+    defender who wins the ball just carries it forever). Batch callers that need
+    to run many episodes in one process -- the calibration harness -- pass False.
     """
     att_mask = players["team"] == ATTACKER_LABEL
     def_mask = players["team"] == DEFENDER_LABEL
@@ -469,22 +491,58 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
     # 3) integrate kinematics for everyone with the combined targets.
     players = kinematics_integrator(players, target_velocities)
 
-    # 4) resolve the ball: pass decision, then flight/hold mechanics
+    # 4) resolve the ball: pass decision, then flight/hold mechanics. Remember
+    #    where the ball started the tick so intercept_pass can test the segment it
+    #    swept rather than just where it ended up.
+    prev_ball_pos = np.asarray(ball["position"], dtype=float).copy()
     pass_decision = ball_action(ball_idx, ball.get("holder_id"), attacker_ids)
+
+    # 4a) offside, checked once at release (as RoboCup does) on the positions the
+    #     pass was played from. Must come before ball_mechanics, which overwrites
+    #     ball['position'] and flips the state to in_flight. An offside pass never
+    #     leaves the holder's feet: the nearest defender to the intended receiver
+    #     gets it, and the flight is skipped entirely.
+    _holder_id, is_pass, target_id = pass_decision
+    if is_pass and check_offside(players, target_id):
+        target_pos = players["position"][players["id"] == target_id][0]
+        winner = nearest_defender_to(players, target_pos)
+        ball = apply_turnover(ball, winner)
+        print(f"    TURNOVER (offside) tick {tick_count}: pass to {target_id} flagged, "
+              f"defender {winner} gets it")
+        if exit_on_turnover:
+            sys.exit()
+        pc_att = None
+        if ppcf_grid is not None:
+            pc_att = compute_attacker_ppcf(players, ppcf_grid, ball["position"])
+        return players, ball, pc_att
+
     ball = ball_mechanics(ball, players, pass_decision)
 
-    # 5) ground duel. Runs after both the integration and the ball resolution so
-    #    it sees the positions and ball state the tick actually ended on -- a
-    #    defender who closes into range this tick can win it this tick. Returns
-    #    None on the vast majority of ticks (ball in flight, or nobody in reach).
+    # 5) attacker pitch control on the post-integration positions/velocities.
+    #    Runs before the turnover checks because it also caches each player's TTI
+    #    to the ball in players['i_p'], which intercept_pass reads below.
+    pc_att = None
+    if ppcf_grid is not None:
+        pc_att = compute_attacker_ppcf(players, ppcf_grid, ball["position"])
+
+    # 6) turnovers. Both run after the integration and the ball resolution so they
+    #    see the positions and ball state the tick actually ended on -- a defender
+    #    who closes into range this tick can win it this tick. The two are mutually
+    #    exclusive on ball state (held vs in_flight), so at most one can fire.
     winner = ground_duel(players, ball, defender_state["rng"], None, dt=DT)
     if winner is not None:
         ball = apply_turnover(ball, winner)
-
-    # 6) attacker pitch control on the post-integration positions/velocities.
-    pc_att = None
-    if ppcf_grid is not None:
-        pc_att = compute_attacker_ppcf(players, ppcf_grid)
+        print(f"    TURNOVER (duel) tick {tick_count}: defender {winner} won the ball")
+        if exit_on_turnover:
+            sys.exit()
+    else:
+        winner = intercept_pass(players, ball, defender_state["rng"],
+                                prev_ball_pos, dt=DT)
+        if winner is not None:
+            ball = apply_turnover(ball, winner)
+            print(f"    TURNOVER (intercept) tick {tick_count}: defender {winner} cut out the pass")
+            if exit_on_turnover:
+                sys.exit()
 
     return players, ball, pc_att
 
@@ -500,16 +558,17 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
     different starting situations -- e.g. start_holder=0 (deep build-up) vs
     8 (ball already at the central striker).
 
-    show_ppcf computes attacker pitch control every tick on the reduced grid and
-    draws it as a heatmap. Set False to skip the PPCF integration entirely if
-    the animation can't keep up with real time.
+    show_ppcf controls whether the pitch-control heatmap is DRAWN. The field is
+    computed every tick either way, because the same call caches each player's
+    TTI to the ball in players['i_p'] and intercept_pass needs it -- skipping it
+    would silently disable pass interceptions rather than just hiding an overlay.
 
-    Timing note: measured here, step+render is ~130ms/tick with PPCF on vs
-    ~68ms off, against DT=100ms -- so with the heatmap the animation runs at
-    roughly 0.75x real time. PPCF is ~54ms of that, nearly all of it the 200
-    integration steps (integration_horizon / integration_timestep) in
-    ppcf.PPCF_grid. If real-time playback matters more than the overlay, either
-    pass show_ppcf=False or coarsen that integration.
+    Timing note: measured here, step+render is ~130ms/tick with the PPCF overlay
+    on vs ~68ms off, against DT=100ms -- so the animation runs at roughly 0.75x
+    real time. PPCF is ~54ms of that, nearly all of it the 200 integration steps
+    (integration_horizon / integration_timestep) in ppcf.PPCF_grid. Since the
+    field is now always computed, show_ppcf=False only saves the draw, not that
+    54ms. If real-time playback matters, coarsen the integration instead.
     """
     if interval_ms is None:
         interval_ms = int(DT * 1000)
@@ -523,8 +582,9 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
     fig.patch.set_facecolor(PITCH_COLOR)
 
     # Cell centres are fixed for the whole run, so build the grid once and reuse
-    # the same (n_cells, 2) array on every tick.
-    ppcf_grid = make_ppcf_grid() if show_ppcf else None
+    # the same (n_cells, 2) array on every tick. Always built: the PPCF call is
+    # what caches players['i_p'] for intercept_pass, so it is no longer optional.
+    ppcf_grid = make_ppcf_grid()
 
     # mutable state carried across FuncAnimation frames. step_ms/render_ms
     # accumulate the per-tick cost split so the running means below aren't
@@ -547,8 +607,11 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
         state = world["ball"]["state"]
 
         t_render0 = time.perf_counter()
+        # pc_att is computed every tick (intercept_pass needs the cache it builds),
+        # so show_ppcf gates only whether it reaches the heatmap.
         render_frame(world["players"], world["ball"], ax=ax,
-                     show_zones=show_zones, pc_att=pc_att,
+                     show_zones=show_zones,
+                     pc_att=pc_att if show_ppcf else None,
                      title=f"tick {world['tick']}  |  t = {t:5.1f}s  |  ball: {state}")
         render_ms = (time.perf_counter() - t_render0) * 1000.0
 
@@ -580,4 +643,4 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
 
 
 if __name__ == "__main__":
-    run_simulation(start_holder=9)
+    run_simulation(start_holder=1)

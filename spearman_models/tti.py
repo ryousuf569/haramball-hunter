@@ -46,7 +46,10 @@ def TTI_vec(positions, velocities, targets):
 
     v_u_dot = np.sum(velocities[None, :, :] * u, axis=-1)   # (n_cells, n_players)
     u_mag_squared = np.sum(u * u, axis=-1)
-    v_parallel = v_u_dot / np.sqrt(u_mag_squared)
+    # u is the zero vector wherever D == 0, so we're guarding this divide the same way as
+    # the one above
+    u_mag = np.sqrt(u_mag_squared)
+    v_parallel = np.divide(v_u_dot, u_mag, out=np.zeros_like(v_u_dot), where=u_mag > 0)
 
     # Case A (scalar: `if v_parallel >= 0`) stationary or moving toward target
     t_caseA = derive_t_vec(D, v_parallel)

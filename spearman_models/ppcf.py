@@ -8,12 +8,19 @@ defender_control_rate = attacker_control_rate * defender_control_rate_multiplier
 integration_timestep = 0.08
 integration_horizon = 10
 
-def PPCF_grid(targets, players):
+def PPCF_grid(targets, players, ball_pos=None):
     # targets: (n_cells, 2). players: structured array as in pitch.py.
     positions = np.asarray(players['position'], dtype=float)   # (n_players, 2)
     velocities = np.asarray(players['velocity'], dtype=float)  # (n_players, 2)
 
-    tti = TTI_vec(positions, velocities, targets) # (n_cells, n_players)
+    if ball_pos is not None:
+        ball_pos = np.asarray(ball_pos, dtype=float).reshape(1, 2)
+        all_targets = np.vstack([targets, ball_pos])       # (n_cells + 1, 2)
+        tti_all = TTI_vec(positions, velocities, all_targets)
+        players['i_p'] = tti_all[-1]                       # exact TTI to ball
+        tti = tti_all[:-1]                                 # (n_cells, n_players)
+    else:
+        tti = TTI_vec(positions, velocities, targets) # (n_cells, n_players)
 
     # per-player control rate lambda, mirroring the scalar team branch
     lam = np.where(players['team'] == 'attacker',

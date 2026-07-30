@@ -1,5 +1,7 @@
 import numpy as np
 
+from spearman_models.tti import intercept_probability_vec
+
 # RoboCup 2D turnover models, scaled to haramball-hunter
 # RoboCup defaults: tackle_dist=2.0, tackle_width=1.25, tackle_exponent=6,
 # tackle_back_dist=0. Its units are a coarser sim; the transferable parts are
@@ -14,6 +16,11 @@ LAM_MAX      = 2.1    # hazard rate (1/s) for a perfect defender: -ln(1-0.65)/0.
 ADV_FLOOR    = 0.5    # lambda multiplier at worst closing speed; 1.0 at best
 V_MAX        = 5.0    # mirrors engine.V_MAX; kept local so defenders/ never imports engine
 EPS          = 1e-6
+
+# RoboCup has no interception model to copy
+KICKABLE_AREA   = 1.085  # RoboCup player_size + ball_size + kickable_margin = 0.3 + 0.085 + 0.7
+INTERCEPT_P_MIN = 0.90   # control probability that counts as a won interception. CALIBRATED
+BALL_SPEED      = 15.0   # mirrors engine.BALL_SPEED, kept local for the same reason as V_MAX
 
 def ground_duel(players, ball, rng, holder_idx, dt=0.1):
 
@@ -80,8 +87,57 @@ def ground_duel(players, ball, rng, holder_idx, dt=0.1):
         return int(players["id"][dmask][cand])
     return None
 
+def intercept_pass(players, ball, rng, prev_pos, dt=0.1):
+    if ball["state"] != "in_flight":
+        return None
+
+    dmask = players["team"] == "defender"
+    dpos = players["position"][dmask]
+
+    # Distance to the segment the ball SWEPT this tick, not just to where it landed
+    a = np.asarray(prev_pos, dtype=float)
+    ab = np.asarray(ball["position"], dtype=float) - a
+    L2 = ab @ ab
+    if L2 > EPS:
+        # clamp to [0, 1] so this stays on the ground actually covered this tick
+        t = np.clip(((dpos - a) @ ab) / L2, 0.0, 1.0)
+        closest = a + t[:, None] * ab
+    else:
+        closest = a  # ball didn't move: segment is a point
+
+    delta = dpos - closest
+    sq = np.einsum("ij,ij->i", delta, delta)
+    near = sq <= KICKABLE_AREA * KICKABLE_AREA
+    if not near.any():
+        return None
+
+    # T is how long the pass still has to run
+    to_target = ball["flight_target"] - ball["position"]
+    T = np.sqrt(to_target @ to_target) / BALL_SPEED
+
+    react_exp = players["i_p"][dmask][near]
+    p = intercept_probability_vec(T, react_exp)
+
+    best = np.argmax(p)
+    if p[best] > INTERCEPT_P_MIN:
+        return int(players["id"][dmask][near][best])
+    return None
+
+def check_offside(players, target_id):
+    # RoboCup marks offside on the kick event, not continuously,
+    # so in render.py this check happens right after ball_action
+    dmask = players["team"] == "defender"
+    line = players["position"][dmask][:, 0].max()
+
+    target_x = players["position"][players["id"] == target_id][0][0]
+    return bool(target_x > line)   # strict, as rcssserver
+
+def nearest_defender_to(players, position):
+    dmask = players["team"] == "defender"
+    delta = players["position"][dmask] - position
+    return int(players["id"][dmask][np.argmin(np.einsum("ij,ij->i", delta, delta))])
+
 def apply_turnover(ball, defender_id):
-    """Hand the ball to `defender_id`, clearing any in-flight pass."""
     ball = dict(ball)
     ball["state"] = "held"
     ball["holder_id"] = defender_id

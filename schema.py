@@ -4,4 +4,4 @@ player_dt = np.dtype([('id', 'int16'),
                       ('position', 'f4', (2,)), 
                       ('velocity', 'f4', (2,)), 
                       ('team', 'U8'), 
-                      ('tti', 'f4')])
+                      ('i_p', 'f4')])
