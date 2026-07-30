@@ -71,12 +71,18 @@ FORWARD_INDICES = slice(6, 10)
 # y spans the full 68m width the same way defenders.py's arrays do; x offsets
 # stagger the lines back-to-front around the shared reference point.
 backline_offset = np.array([[-18, -12], [-18, 12]])
-midline_offset = np.array([[0, -24], [0, -12], [0, 0], [0, 12]])
-forward_offset = np.array([[20, -20], [25, -8], [25, 8], [20, 20]])
+midline_offset = np.array([[0, -24], [0, -12], [0, 12], [0, 24]])
+forward_offset = np.array([[20, -24], [25, -12], [25, 12], [20, 24]])
 
 # Shared formation reference point (a plain fixed centroid around the
 # mid-to-attacking-third). No ball tracking / basculation lag -- this is
 # deliberately much simpler than the defender's depth reference.
+#
+# Kept at 52: the front four sit at x=72-77 from here, advanced but still in front
+# of the block rather than on top of the goal line. Pushing this to 78 did get the
+# holder inside the press trigger, but it parked the whole forward line at x=98-103
+# -- permanently offside and circulating the ball across the six-yard box, which is
+# not a picture the low block should be tuned against.
 FORMATION_REF = np.array([52.0, 34.0])
 
 

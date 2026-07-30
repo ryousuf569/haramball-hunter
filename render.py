@@ -33,6 +33,11 @@ from spearman_models.ppcf import PPCF_grid
 # its output into the roster-wide target-velocity array before integrating.
 from defenders.defenders import make_defender_state, compute_defender_targets
 
+# Ground duels: a defender inside tackling range of the attacker holding the ball
+# can win it, resolved per tick off the RoboCup reach envelope. Held ball only --
+# interceptions of passes in flight are a separate model.
+from defenders.turnover import ground_duel, apply_turnover
+
 # Attackers run a throwaway scripted baseline (a fixed formation + fixed-cadence
 # passing) purely so the sim looks coherent while the defender script is being
 # tested. Like the defenders, it returns continuous target velocities directly
@@ -432,6 +437,11 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
     defenders.py. Both are spliced into one roster-wide target array before a
     single kinematics integration.
 
+    Once the ball has been resolved for the tick, a ground duel is attempted: if
+    a defender is inside tackling range of the attacker holding it, possession
+    can flip. The roll uses defender_state["rng"], so a given seed replays
+    identically.
+
     If ppcf_grid is given (as built by make_ppcf_grid), attacker pitch control
     is evaluated on that grid after the state advances and returned as a third
     value; otherwise the third value is None.
@@ -463,7 +473,15 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
     pass_decision = ball_action(ball_idx, ball.get("holder_id"), attacker_ids)
     ball = ball_mechanics(ball, players, pass_decision)
 
-    # 5) attacker pitch control on the post-integration positions/velocities.
+    # 5) ground duel. Runs after both the integration and the ball resolution so
+    #    it sees the positions and ball state the tick actually ended on -- a
+    #    defender who closes into range this tick can win it this tick. Returns
+    #    None on the vast majority of ticks (ball in flight, or nobody in reach).
+    winner = ground_duel(players, ball, defender_state["rng"], None, dt=DT)
+    if winner is not None:
+        ball = apply_turnover(ball, winner)
+
+    # 6) attacker pitch control on the post-integration positions/velocities.
     pc_att = None
     if ppcf_grid is not None:
         pc_att = compute_attacker_ppcf(players, ppcf_grid)
