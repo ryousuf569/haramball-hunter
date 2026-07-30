@@ -1,6 +1,6 @@
 import numpy as np
 import math as m
-from spearman_models.tti import TTI_vec, intercept_probability_vec
+from physics.tti import TTI_vec, intercept_probability_vec
 
 attacker_control_rate = 4.30
 defender_control_rate_multiplier = 1.72

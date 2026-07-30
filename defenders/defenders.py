@@ -26,11 +26,11 @@ PRESS_LATCH_TICKS = 25
 backline_offset = np.array([[-1.77, -20], [0.93, -10], [1.42, 0], [0.80, 10], [-1.38, 20]])
 midline_offset = np.array([[-0.47, -15], [0.18, -5], [0.44, 5], [-0.20, 15]])
 
-def make_defender_state():
+def make_defender_state(seed=SEED):
     return {
         "ball_x_history": deque(maxlen=5),
         "attacker_line_history": deque(maxlen=5),
-        "rng": np.random.default_rng(SEED), # to keep episodes reproducibles
+        "rng": np.random.default_rng(seed), # to keep episodes reproducibles
         # presser is a defender-array row index; holder_id is who the press is committed to
         "press_latch": {"presser": None, "ticks_left": 0, "holder_id": None},
     }
@@ -140,20 +140,20 @@ def apply_pressure_trigger(players, ball, def_positions, target_velocities, v_ma
         if not support_present:
             return target_velocities
 
-        dists_to_holder = np.linalg.norm(def_positions - holder_pos, axis=1)
+        dists_to_ball = np.linalg.norm(def_positions - ball["position"], axis=1)
 
-        # Coverer first from the backline, so both roles can't be drawn from the same line
-        coverer = BACKLINE_INDICES.start + np.argmin(dists_to_holder[BACKLINE_INDICES])
+        # Presser is simply whoever is closest to the ball, backline or midfield
+        presser = int(np.argmin(dists_to_ball))
 
-        press_d = dists_to_holder.copy()
-        press_d[coverer] = np.inf  # the coverer stays home
-        # keep the presser off the coverer's toes, same spacing rule as before
-        y_sep = np.abs(def_positions[:, 1] - def_positions[coverer, 1])
+        # Supporter is the next closest, kept off the presser's toes by the same spacing rule
+        cover_d = dists_to_ball.copy()
+        cover_d[presser] = np.inf
+        y_sep = np.abs(def_positions[:, 1] - def_positions[presser, 1])
         eligible = y_sep >= cover_y_sep
-        eligible[coverer] = False
+        eligible[presser] = False
         if np.any(eligible):
-            press_d[~eligible] = np.inf
-        presser = np.argmin(press_d)
+            cover_d[~eligible] = np.inf
+        coverer = int(np.argmin(cover_d))
 
         # commit this presser for the next PRESS_LATCH_TICKS ticks
         latch["presser"] = presser

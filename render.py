@@ -15,7 +15,7 @@ from matplotlib.patches import Arc, Circle, Rectangle
 
 # Engine physics -- render.py is the only file allowed to change, so we import
 # the real integrators/mechanics rather than reimplementing them here.
-from engine import (
+from physics.engine import (
     DT,
     ball_action,
     ball_mechanics,
@@ -26,7 +26,7 @@ from schema import player_dt
 
 # Pitch control. PPCF_grid is fully vectorized over (cells x players), so one
 # call per tick covers the whole grid.
-from spearman_models.ppcf import PPCF_grid
+from physics.ppcf import PPCF_grid
 
 # Defenders now run their learned/scripted low-block behaviour. This module
 # returns target velocities for the whole defender line directly (bypassing the
@@ -435,13 +435,14 @@ def make_initial_world(n_att=10, n_def=10, seed=0, start_holder=0):
 
     # Persistent state for the scripted defenders (holds a short ball_x history
     # deque used to lag the block's depth reference). Created once and threaded
-    # through every step().
-    defender_state = make_defender_state()
+    # through every step(). The seed flows into the turnover RNG, so distinct
+    # seeds give distinct duel/interception rolls rather than identical replays.
+    defender_state = make_defender_state(seed=seed)
     return players, ball, attacker_ids, rng, defender_state
 
 
 def step(players, ball, attacker_ids, defender_state, tick_count,
-         ppcf_grid=None, exit_on_turnover=True):
+         ppcf_grid=None, exit_on_turnover=False):
     """Advance the world one DT tick using only engine.py physics.
 
     Both teams now supply continuous target velocities directly (no discrete
@@ -643,4 +644,4 @@ def run_simulation(n_att=10, n_def=10, seed=0, n_ticks=2000, interval_ms=None,
 
 
 if __name__ == "__main__":
-    run_simulation(start_holder=1)
+    run_simulation(start_holder=4)

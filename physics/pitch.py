@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from spearman_models.ppcf import PPCF_grid
+from physics.ppcf import PPCF_grid
 from schema import player_dt
 
 players = np.array([

@@ -1,6 +1,6 @@
 import numpy as np
 
-from spearman_models.tti import intercept_probability_vec
+from physics.tti import intercept_probability_vec
 
 # RoboCup 2D turnover models, scaled to haramball-hunter
 # RoboCup defaults: tackle_dist=2.0, tackle_width=1.25, tackle_exponent=6,
@@ -19,8 +19,9 @@ EPS          = 1e-6
 
 # RoboCup has no interception model to copy
 KICKABLE_AREA   = 1.085  # RoboCup player_size + ball_size + kickable_margin = 0.3 + 0.085 + 0.7
-INTERCEPT_P_MIN = 0.90   # control probability that counts as a won interception. CALIBRATED
+INTERCEPT_P_MIN = 0.80   # control probability that counts as a won interception. CALIBRATED
 BALL_SPEED      = 15.0   # mirrors engine.BALL_SPEED, kept local for the same reason as V_MAX
+LOB_DIST        = 25.0   # passes longer than this would be lofted in real play
 
 def ground_duel(players, ball, rng, holder_idx, dt=0.1):
 
@@ -89,6 +90,10 @@ def ground_duel(players, ball, rng, holder_idx, dt=0.1):
 
 def intercept_pass(players, ball, rng, prev_pos, dt=0.1):
     if ball["state"] != "in_flight":
+        return None
+
+    lob = ball["flight_target"] - ball["flight_start"]
+    if np.sqrt(lob @ lob) > LOB_DIST:
         return None
 
     dmask = players["team"] == "defender"
