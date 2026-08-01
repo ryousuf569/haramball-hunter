@@ -1,4 +1,18 @@
+# Required to run the sim. Versions are the ones this was developed against on
+# Python 3.13.
 numpy==2.2.6
 pandas==2.3.3
 matplotlib==3.10.7
 statsbombpy==1.21.0
+
+# Optional at runtime: env/thread_limits.py pins its thread count if torch
+# imports and skips it otherwise, so the sim and the benchmark both run without
+# it. Latest release resolvable for Python 3.13 / win-amd64; not yet installed
+# in this venv, so unlike the pins above it is not a developed-against version.
+# The win-amd64 wheel is ~0.12GB: the nvidia-*-cu13 CUDA deps and triton are
+# marked platform_system == "Linux" and are not pulled here.
+torch==2.13.0
+
+# Optional: tests/test_ppcf_golden.py runs standalone (python tests/...) without
+# pytest, so this is only needed to run it as a pytest suite.
+# pytest==9.1.1

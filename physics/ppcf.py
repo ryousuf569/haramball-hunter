@@ -31,20 +31,23 @@ def PPCF_grid(targets, players, ball_pos=None):
     PPCF_array = np.zeros((n_cells, n))
     PPCF_total = np.zeros(n_cells)
 
+    # Per-cell early stop. A cell at/above 0.99 would have broken out of the
+    # scalar loop, so it takes no further increment
+    # Previously this was a full-grid computation with the inactive rows
+    # multiplied out to zero by np.where
+    active = np.ones(n_cells, dtype=bool)
+
     t = 0
-    while t < integration_horizon and PPCF_total.min() < 0.99:
-        snapshot = 1 - PPCF_total # (n_cells,)
+    while t < integration_horizon and active.any():
+        tti_a = tti[active] # (n_active, n_players)
+        snapshot_a = 1 - PPCF_total[active] # (n_active,)
 
-        f = intercept_probability_vec(t, tti) # (n_cells, n_players)
-        increments = snapshot[:, None] * f * lam[None, :] * integration_timestep
+        f = intercept_probability_vec(t, tti_a) # (n_active, n_players)
+        increments = snapshot_a[:, None] * f * lam[None, :] * integration_timestep
 
-        # Per-cell early stop: cells already at/above 0.99 at the top of this
-        # iteration would have broken out of the scalar loop, so they receive
-        # no further increment.
-        active = (PPCF_total < 0.99)[:, None] # (n_cells, 1)
-        increments = np.where(active, increments, 0.0)
+        PPCF_array[active] += increments
+        PPCF_total[active] = PPCF_array[active].sum(axis=1)
 
-        PPCF_array += increments
-        PPCF_total = PPCF_array.sum(axis=1)
+        active &= (PPCF_total < 0.99)
         t += integration_timestep
     return PPCF_array
