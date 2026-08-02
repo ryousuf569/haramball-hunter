@@ -17,12 +17,8 @@ from defenders.turnover import (
     nearest_defender_to,
     apply_turnover,
 )
-from attackers.baseline_attacker import (
-    compute_attacker_targets,
-    backline_offset as att_backline_offset,
-    midline_offset as att_midline_offset,
-    forward_offset as att_forward_offset,
-)
+from attackers.baseline_attacker import compute_attacker_targets
+from attackers.calibrate_attacker_formation import sample_attacker_formation
 ATTACKER_LABEL = "attacker"
 DEFENDER_LABEL = "defender"
 
@@ -47,20 +43,21 @@ def _defender_formation_5_4_1(n_def=10, pitch_width=68.0):
     return positions
 
 
-def _attacker_formation_2_5_3(n_att=10, ref_x=64.0, pitch_width=68.0):
-    ref = np.array([ref_x, pitch_width / 2.0])  # centered in y, advanced in x
+def _attacker_formation_2_5_3(rng, n_att=10):
+    """Draw a 2-5-3 attacker shape from the StatsBomb-calibrated model.
 
-    positions = np.concatenate([
-        ref + att_backline_offset,   # 2 backline
-        ref + att_midline_offset,    # 5 midfield
-        ref + att_forward_offset,    # 3 forward
-    ]).astype("f4")
+    This used to be a fixed offset table around a fixed reference point, so
+    every episode opened on the identical picture and an agent could memorise
+    it rather than learn anything. Now the centroid depth, the lateral position,
+    how stretched the shape is and each player's slot offset are all sampled
+    from real low-block freeze frames -- see
+    attackers/calibrate_attacker_formation.py for the fit.
 
-    # Defensive: if the roster asks for a different attacker count than the 10
-    # this 2-5-3 lays out, fall back to as many of these slots as fit.
-    if n_att != len(positions):
-        positions = positions[:n_att]
-    return positions
+    Rows come back deepest-first (2 backline, 5 midfield, 3 forward), the same
+    back-to-front ordering the old table used, so baseline_attacker's line
+    slices still line up with the roster rows.
+    """
+    return sample_attacker_formation(rng, n_att=n_att).astype("f4")
 
 
 # pitch-control grid
@@ -91,7 +88,7 @@ def compute_attacker_ppcf(players, ppcf_grid, ball_pos):
     return result[:, is_att].sum(axis=1).reshape(PC_NX, PC_NY)
 
 
-def make_initial_world(n_att=10, n_def=10, seed=0, start_holder=0):
+def make_initial_world(n_att=10, n_def=10, seed=11, start_holder=0):
     rng = np.random.default_rng(seed)
 
     players = np.zeros(n_att + n_def, dtype=player_dt)
@@ -99,11 +96,12 @@ def make_initial_world(n_att=10, n_def=10, seed=0, start_holder=0):
     players["team"][:n_att] = ATTACKER_LABEL
     players["team"][n_att:] = DEFENDER_LABEL
 
-    # Attackers (10: a 2-5-3, matching baseline_attacker.py) start already in
-    # formation shape and pushed up the field (x ref ~64). Defenders sit in a
-    # resting low-block 5-4-1 near the x=105 goal they defend. Row layout
-    # matches defenders.py: rows 0-4 backline, rows 5-8 midfield, row 9 forward.
-    players["position"][:n_att] = _attacker_formation_2_5_3(n_att)
+    # Attackers (10: a 2-5-3) start in a shape sampled from real low-block
+    # freeze frames, so `seed` now actually changes the initial state instead of
+    # replaying one hand-placed formation. Defenders sit in a resting low-block
+    # 5-4-1 near the x=105 goal they defend. Row layout matches defenders.py:
+    # rows 0-4 backline, rows 5-8 midfield, row 9 forward.
+    players["position"][:n_att] = _attacker_formation_2_5_3(rng, n_att)
     players["position"][n_att:] = _defender_formation_5_4_1(n_def)
     players["velocity"][:] = 0.0
 
