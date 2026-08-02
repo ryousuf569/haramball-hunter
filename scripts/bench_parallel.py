@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from env.thread_limits import limit_threads  # noqa: E402
+from environment.thread_limits import limit_threads  # noqa: E402
 
 limit_threads()
 
@@ -31,7 +31,7 @@ def _worker(worker_id, seed, barrier, out_q, warmup_s, timed_s):
     limit_threads()
 
     import numpy as np
-    from render import make_initial_world, make_ppcf_grid, step
+    from environment.lowblock_env import make_initial_world, make_ppcf_grid, step
 
     rng = np.random.default_rng(seed)
     grid = make_ppcf_grid()

@@ -12,7 +12,7 @@ from schema import player_dt  # noqa: E402
 
 
 def build_scenarios():
-    from render import make_initial_world, make_ppcf_grid, step
+    from environment.lowblock_env import make_initial_world, make_ppcf_grid, step
 
     scenarios = {}
     targets = make_ppcf_grid()  # production grid: 31 x 34 cells @ 2m = 1054

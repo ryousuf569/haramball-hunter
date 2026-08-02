@@ -9,8 +9,8 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import defenders.turnover as turnover
-import render
-from render import make_initial_world, make_ppcf_grid, step
+import environment.lowblock_env as lowblock_env
+from environment.lowblock_env import make_initial_world, make_ppcf_grid, step
 from physics.engine import DT, ball_action
 from attackers.baseline_attacker import compute_attacker_targets
 from physics.tti import intercept_probability_vec
@@ -82,9 +82,9 @@ def _intercept_probe(players, ball, rng, prev_pos, dt=0.1):
         _ep["intercept_win"] += 1
     return w
 
-# step() resolved these names at import time, so patch render's globals
-render.ground_duel = _duel_probe
-render.intercept_pass = _intercept_probe
+# step() resolved these names at import time, so patch the env module's globals
+lowblock_env.ground_duel = _duel_probe
+lowblock_env.intercept_pass = _intercept_probe
 
 def run_episode(seed, start_holder, max_ticks):
     players, ball, attacker_ids, _rng, dstate = make_initial_world(
