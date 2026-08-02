@@ -19,44 +19,18 @@ from defenders.turnover import (
 )
 from attackers.baseline_attacker import compute_attacker_targets
 from attackers.calibrate_attacker_formation import sample_attacker_formation
+from defenders.calibrate_defender_formation import sample_defender_formation
 ATTACKER_LABEL = "attacker"
 DEFENDER_LABEL = "defender"
 
 
-def _defender_formation_5_4_1(n_def=10, pitch_width=68.0):
-    cy = pitch_width / 2.0  # 34.0
-
-    back_x, mid_x, fwd_x = 100.0, 82.0, 60.0
-    back_dy = [-20, -10, 0, 10, 20]   # 5 defenders
-    mid_dy = [-15, -5, 5, 15]         # 4 midfielders
-
-    positions = [[back_x, cy + dy] for dy in back_dy]
-    positions += [[mid_x, cy + dy] for dy in mid_dy]
-    positions += [[fwd_x, cy]]        # lone forward, central
-
-    positions = np.array(positions, dtype="f4")
-
-    # Defensive: if the roster asks for a different defender count than the 10
-    # this 5-4-1 lays out, fall back to as many of these slots as fit.
-    if n_def != len(positions):
-        positions = positions[:n_def]
-    return positions
+# Rows 0-4 backline, 5-8 midfield, 9 forward, sampled from real low-block frames
+def _defender_formation_5_4_1(rng, n_def=10):
+    return sample_defender_formation(rng, n_def=n_def).astype("f4")
 
 
+# Rows deepest-first (2 backline, 5 midfield, 3 forward), sampled the same way
 def _attacker_formation_2_5_3(rng, n_att=10):
-    """Draw a 2-5-3 attacker shape from the StatsBomb-calibrated model.
-
-    This used to be a fixed offset table around a fixed reference point, so
-    every episode opened on the identical picture and an agent could memorise
-    it rather than learn anything. Now the centroid depth, the lateral position,
-    how stretched the shape is and each player's slot offset are all sampled
-    from real low-block freeze frames -- see
-    attackers/calibrate_attacker_formation.py for the fit.
-
-    Rows come back deepest-first (2 backline, 5 midfield, 3 forward), the same
-    back-to-front ordering the old table used, so baseline_attacker's line
-    slices still line up with the roster rows.
-    """
     return sample_attacker_formation(rng, n_att=n_att).astype("f4")
 
 
@@ -102,7 +76,7 @@ def make_initial_world(n_att=10, n_def=10, seed=11, start_holder=0):
     # 5-4-1 near the x=105 goal they defend. Row layout matches defenders.py:
     # rows 0-4 backline, rows 5-8 midfield, row 9 forward.
     players["position"][:n_att] = _attacker_formation_2_5_3(rng, n_att)
-    players["position"][n_att:] = _defender_formation_5_4_1(n_def)
+    players["position"][n_att:] = _defender_formation_5_4_1(rng, n_def)
     players["velocity"][:] = 0.0
 
     attacker_ids = players["id"][:n_att]
