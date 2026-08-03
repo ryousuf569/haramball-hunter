@@ -104,8 +104,8 @@ def run_episode(seed, start_holder, max_ticks):
         if is_pass:
             n_passes += 1
 
-        players, ball, _pc = step(players, ball, attacker_ids, dstate, tick,
-                                  ppcf_grid=ppcf_grid, exit_on_turnover=False)
+        players, ball, _pc, _out = step(players, ball, attacker_ids, dstate, tick,
+                                        ppcf_grid=ppcf_grid, exit_on_turnover=False)
 
         if ball["state"] == "in_flight":
             flight_ticks += 1

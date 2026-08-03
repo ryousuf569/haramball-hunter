@@ -281,13 +281,16 @@ def run_simulation(n_att=10, n_def=11, seed=23235454, n_ticks=2500, interval_ms=
         world["tick"] += 1
 
         t_step0 = time.perf_counter()
-        world["players"], world["ball"], pc_att = step(
+        world["players"], world["ball"], pc_att, outcome = step(
             world["players"], world["ball"], attacker_ids, defender_state,
             world["tick"], ppcf_grid=ppcf_grid)
         step_ms = (time.perf_counter() - t_step0) * 1000.0
 
         t = world["tick"] * DT
         state = world["ball"]["state"]
+        # The animation keeps rolling past a terminal tick; the label is just so
+        # you can see where the episode would have ended.
+        ended = f"  |  {outcome.upper()}" if outcome is not None else ""
 
         t_render0 = time.perf_counter()
         # pc_att is computed every tick (intercept_pass needs the cache it builds),
@@ -295,7 +298,7 @@ def run_simulation(n_att=10, n_def=11, seed=23235454, n_ticks=2500, interval_ms=
         render_frame(world["players"], world["ball"], ax=ax,
                      show_zones=show_zones,
                      pc_att=pc_att if show_ppcf else None,
-                     title=f"tick {world['tick']}  |  t = {t:5.1f}s  |  ball: {state}")
+                     title=f"tick {world['tick']}  |  t = {t:5.1f}s  |  ball: {state}{ended}")
         render_ms = (time.perf_counter() - t_render0) * 1000.0
 
         # Note: render_ms covers building the artists, not the canvas blit that

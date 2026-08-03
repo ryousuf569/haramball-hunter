@@ -37,7 +37,7 @@ def build_scenarios():
 
     # mid-episode: players spread and moving, the longest loop seen (93 iterations)
     for tick in range(40):
-        players, ball, _ = step(players, ball, attacker_ids, dstate, tick,
+        players, ball, _, _ = step(players, ball, attacker_ids, dstate, tick,
                                 ppcf_grid=targets)
     scenarios["tick40"] = {
         "players": players.copy(),

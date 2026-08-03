@@ -21,11 +21,18 @@ from defenders.turnover import (
     nearest_defender_to,
     apply_turnover,
 )
+from environment.grid import PC_NX, PC_NY, PC_CELL_SIZE
+from environment.termination import check_shot_opening
 from attackers.baseline_attacker import compute_attacker_targets
 from attackers.calibrate_attacker_formation import sample_attacker_formation
 from defenders.calibrate_defender_formation import sample_defender_formation
 ATTACKER_LABEL = "attacker"
 DEFENDER_LABEL = "defender"
+
+# Episode outcomes, step()'s 4th return. None means the episode is still live:
+# the defenders have neither conceded the shot nor won the ball back yet.
+SUCCESS = "success"   # attackers worked a shot opening
+FAILURE = "failure"   # defenders forced a turnover
 
 PITCH_CENTER_Y = 34.0
 
@@ -46,11 +53,9 @@ def _attacker_formation_2_5_3(rng, n_att=10):
     return sample_attacker_formation(rng, n_att=n_att).astype("f4")
 
 
-# pitch-control grid
-PC_NX, PC_NY = 31, 34
-PC_CELL_SIZE = 2.0
-
-
+# pitch-control grid. PC_NX/PC_NY/PC_CELL_SIZE are imported from environment.grid
+# so termination.py can bin a position onto these cells without importing this
+# module back; they stay re-exported here for the callers that already read them.
 def make_ppcf_grid():
     i = np.arange(PC_NX)
     j = np.arange(PC_NY)
@@ -164,7 +169,7 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
         pc_att = None
         if ppcf_grid is not None:
             pc_att = compute_attacker_ppcf(players, ppcf_grid, ball["position"])
-        return players, ball, pc_att
+        return players, ball, pc_att, FAILURE
 
     ball = ball_mechanics(ball, players, pass_decision)
 
@@ -194,4 +199,17 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
             if exit_on_turnover:
                 sys.exit()
 
-    return players, ball, pc_att
+    # 7) terminate. A turnover -- from either check above, or from the offside
+    #    branch that already returned -- ends the episode in failure. Otherwise
+    #    an attacker on the ball, in space, with a real chance ends it in
+    #    success. The shot test reads the pitch-control surface, so a run
+    #    without a ppcf_grid can only ever end on a turnover.
+    outcome = None
+    if winner is not None:
+        outcome = FAILURE
+    elif pc_att is not None and check_shot_opening(players, ball, pc_att):
+        outcome = SUCCESS
+        print(f"    SHOT OPENING tick {tick_count}: attacker {ball['holder_id']} "
+              f"is clear to shoot")
+
+    return players, ball, pc_att, outcome
