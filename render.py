@@ -230,8 +230,8 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # state to render_frame.
 
 
-def run_simulation(n_att=10, n_def=10, seed=42, n_ticks=2500, interval_ms=None,
-                   show_zones=False, start_holder=0, show_ppcf=True):
+def run_simulation(n_att=10, n_def=10, seed=23235454, n_ticks=2500, interval_ms=None,
+                   show_zones=False, start_holder=1, show_ppcf=True):
     """Open a matplotlib window and animate the engine in real time.
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
