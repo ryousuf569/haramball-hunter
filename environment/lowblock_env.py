@@ -9,7 +9,11 @@ from physics.engine import (
 )
 from schema import player_dt
 from physics.ppcf import PPCF_grid
-from defenders.defenders import make_defender_state, compute_defender_targets
+from defenders.defenders import (
+    make_defender_state,
+    compute_defender_targets,
+    gk_positioning,
+)
 from defenders.turnover import (
     ground_duel,
     intercept_pass,
@@ -23,10 +27,18 @@ from defenders.calibrate_defender_formation import sample_defender_formation
 ATTACKER_LABEL = "attacker"
 DEFENDER_LABEL = "defender"
 
+PITCH_CENTER_Y = 34.0
 
-# Rows 0-4 backline, 5-8 midfield, 9 forward, sampled from real low-block frames
-def _defender_formation_5_4_1(rng, n_def=10):
-    return sample_defender_formation(rng, n_def=n_def).astype("f4")
+
+# Row 0 keeper, 1-5 backline, 6-9 midfield, 10 forward: the row layout
+# compute_defender_targets indexes with GK_INDEX/BACKLINE_INDICES/etc. The 10
+# outfielders are sampled from real low-block frames; those frames never
+# labelled a keeper, so row 0 just starts on the resting target the policy
+# would hold it at for a centred ball, rather than on a made-up sampled slot.
+def _defender_formation_gk_5_4_1(rng, n_def=11):
+    outfield = sample_defender_formation(rng, n_def=n_def - 1)
+    gk = gk_positioning(PITCH_CENTER_Y, PITCH_CENTER_Y, 0.0001)
+    return np.vstack([gk, outfield]).astype("f4")
 
 
 # Rows deepest-first (2 backline, 5 midfield, 3 forward), sampled the same way
@@ -62,7 +74,7 @@ def compute_attacker_ppcf(players, ppcf_grid, ball_pos):
     return result[:, is_att].sum(axis=1).reshape(PC_NX, PC_NY)
 
 
-def make_initial_world(n_att=10, n_def=10, seed=11, start_holder=0):
+def make_initial_world(n_att=10, n_def=11, seed=11, start_holder=0):
     rng = np.random.default_rng(seed)
 
     players = np.zeros(n_att + n_def, dtype=player_dt)
@@ -72,11 +84,12 @@ def make_initial_world(n_att=10, n_def=10, seed=11, start_holder=0):
 
     # Attackers (10: a 2-5-3) start in a shape sampled from real low-block
     # freeze frames, so `seed` now actually changes the initial state instead of
-    # replaying one hand-placed formation. Defenders sit in a resting low-block
-    # 5-4-1 near the x=105 goal they defend. Row layout matches defenders.py:
-    # rows 0-4 backline, rows 5-8 midfield, row 9 forward.
+    # replaying one hand-placed formation. Defenders are 11: a keeper on its
+    # line plus a resting low-block 5-4-1 near the x=105 goal they defend. Row
+    # layout matches defenders.py: row 0 keeper, rows 1-5 backline, rows 6-9
+    # midfield, row 10 forward.
     players["position"][:n_att] = _attacker_formation_2_5_3(rng, n_att)
-    players["position"][n_att:] = _defender_formation_5_4_1(rng, n_def)
+    players["position"][n_att:] = _defender_formation_gk_5_4_1(rng, n_def)
     players["velocity"][:] = 0.0
 
     attacker_ids = players["id"][:n_att]
@@ -136,9 +149,11 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
     #     pass was played from. Must come before ball_mechanics, which overwrites
     #     ball['position'] and flips the state to in_flight. An offside pass never
     #     leaves the holder's feet: the nearest defender to the intended receiver
-    #     gets it, and the flight is skipped entirely.
-    _holder_id, is_pass, target_id = pass_decision
-    if is_pass and check_offside(players, target_id):
+    #     gets it, and the flight is skipped entirely. The holder is passed in
+    #     because the ball's release point is their feet, and ball['position'] is
+    #     still a tick stale until ball_mechanics resyncs it below.
+    holder_id, is_pass, target_id = pass_decision
+    if is_pass and check_offside(players, holder_id, target_id):
         target_pos = players["position"][players["id"] == target_id][0]
         winner = nearest_defender_to(players, target_pos)
         ball = apply_turnover(ball, winner)

@@ -23,6 +23,10 @@ INTERCEPT_P_MIN = 0.80   # control probability that counts as a won interception
 BALL_SPEED      = 15.0   # mirrors engine.BALL_SPEED, kept local for the same reason as V_MAX
 LOB_DIST        = 25.0   # passes longer than this would be lofted in real play
 
+# Offside. Attackers attack x=105, so their own half is x < 52.5 and no pass
+# received there can be offside. Kept local for the same reason as V_MAX.
+HALFWAY_X       = 52.5
+
 def ground_duel(players, ball, rng, holder_idx, dt=0.1):
 
     if ball["state"] != "held": 
@@ -128,14 +132,31 @@ def intercept_pass(players, ball, rng, prev_pos, dt=0.1):
         return int(players["id"][dmask][near][best])
     return None
 
-def check_offside(players, target_id):
-    # RoboCup marks offside on the kick event, not continuously,
-    # so in render.py this check happens right after ball_action
-    dmask = players["team"] == "defender"
-    line = players["position"][dmask][:, 0].max()
+def check_offside(players, holder_id, target_id):
+    # RoboCup marks offside on the kick event, not continuously, so the env runs
+    # this right after ball_action and before ball_mechanics
+    if target_id is None or holder_id is None or target_id == holder_id:
+        return False
 
     target_x = players["position"][players["id"] == target_id][0][0]
-    return bool(target_x > line)   # strict, as rcssserver
+
+    # attackers attack x=105, so "ahead" always means larger x
+    if target_x <= HALFWAY_X:
+        return False
+
+    # The pass leaves the holder's feet, which is exactly where ball_mechanics
+    # sets flight_start, so read it off the holder rather than ball['position']
+    ball_x = players["position"][players["id"] == holder_id][0][0]
+    if target_x <= ball_x:
+        return False
+
+    def_x = players["position"][players["team"] == "defender"][:, 0]
+    if def_x.size < 2:
+        return False
+
+    # last outfield defender
+    line = np.partition(def_x, -2)[-2]
+    return bool(target_x > line)
 
 def nearest_defender_to(players, position):
     dmask = players["team"] == "defender"

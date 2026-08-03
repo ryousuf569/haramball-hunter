@@ -24,7 +24,7 @@ WARMUP_SECONDS = 15.0
 TIMED_SECONDS = 180.0
 EPISODE_TICKS = 300  # reset cadence, so workers don't sit in a post-turnover state
 N_ATT = 10
-N_DEF = 10
+N_DEF = 11  # 10 outfield + keeper
 
 
 def _worker(worker_id, seed, barrier, out_q, warmup_s, timed_s):

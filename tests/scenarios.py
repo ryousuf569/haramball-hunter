@@ -17,9 +17,11 @@ def build_scenarios():
     scenarios = {}
     targets = make_ppcf_grid()  # production grid: 31 x 34 cells @ 2m = 1054
 
-    # kick-off: everyone at rest, so all 20 players hit TTI's v_parallel == 0 branch
+    # kick-off: everyone at rest, so all 21 players hit TTI's v_parallel == 0 branch.
+    # NOTE: the defenders gained a keeper (n_def 10 -> 11) after golden_ppcf.npz was
+    # written, so regenerating would change tick0/tick40 by roster, not by physics.
     players, ball, attacker_ids, rng, dstate = make_initial_world(
-        n_att=10, n_def=10, seed=0)
+        n_att=10, n_def=11, seed=0)
     scenarios["tick0"] = {
         "players": players.copy(),
         "targets": targets,

@@ -2,9 +2,10 @@ import numpy as np
 import math as m
 from collections import deque
 
-BACKLINE_INDICES = slice(0, 5)
-MIDFIELD_INDICES = slice(5, 9)
-FORWARD_INDEX = slice(9, 10)
+GK_INDEX = slice(0, 1)
+BACKLINE_INDICES = slice(1, 6)
+MIDFIELD_INDICES = slice(6, 10)
+FORWARD_INDEX = slice(10, 11)
 V_MAX = 5.0
 A_MAX = 7.0
 HARAM_DEPTH_OFFSET = 15.0
@@ -54,6 +55,13 @@ def attacker_positioning(ball_y, pitch_center, gain):
 
     y = y_centroid(ball_y, pitch_center, gain=0.4)
     pos = np.array([[52, y]])
+
+    return pos
+
+def gk_positioning(ball_y, pitch_center, gain):
+
+    y = y_centroid(ball_y, pitch_center, gain=0.0001)
+    pos = np.array([[104, y]])
 
     return pos
 
@@ -142,6 +150,9 @@ def apply_pressure_trigger(players, ball, def_positions, target_velocities, v_ma
 
         dists_to_ball = np.linalg.norm(def_positions - ball["position"], axis=1)
 
+        # The keeper holds its line; it never presses or covers, so drop it out of both argmins
+        dists_to_ball[GK_INDEX] = np.inf
+
         # Presser is simply whoever is closest to the ball, backline or midfield
         presser = int(np.argmin(dists_to_ball))
 
@@ -199,6 +210,7 @@ def compute_defender_targets(players, ball, defender_state):
     mid_centroid = np.array([mid_line_x, mid_dy])
 
     targets = np.zeros_like(defender_positions)
+    targets[GK_INDEX] = gk_positioning(ball["position"][1], 34, 0.0001)
     targets[BACKLINE_INDICES] = back_centroid + backline_offset
     targets[MIDFIELD_INDICES] = mid_centroid + midline_offset
     targets[FORWARD_INDEX] = attacker_positioning(ball["position"][1], 34, 0.7)
