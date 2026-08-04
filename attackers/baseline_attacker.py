@@ -11,6 +11,11 @@ a back pass when the front is marked, and mixes in occasional riskier / long
 balls. Do not read deep tactical intent into any of this -- if you need a real
 attacker, replace this file wholesale.
 
+The attackers are the learners, so training does not use this module at all:
+LowBlockEnv with scripted_attackers=False feeds the policy's target velocities
+and pass choice straight to the physics and never calls into here. It stays
+only as a defender test harness and a scripted reference arm.
+
 Matches defenders.py's calling convention: the main entry point returns a
 continuous (n_att, 2) target-velocity array directly (bypassing engine.py's
 action_decoding/direction_lookup/speed_lookup), plus the ball_idx array that

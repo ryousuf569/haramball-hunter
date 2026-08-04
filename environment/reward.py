@@ -85,9 +85,13 @@ def zone_value(pc_att, mask, normalization):
     raise ValueError(f"unknown normalization {normalization!r}")
 
 
-def phi(players, ppcf_result, f3_mask, hs_mask, cfg):
+def attacker_control(players, ppcf_result):
     is_att = np.asarray(players["team"]) == ATTACKER_LABEL
-    pc_att = np.asarray(ppcf_result)[:, is_att].sum(axis=1)
+    return np.asarray(ppcf_result)[:, is_att].sum(axis=1)
+
+
+def phi_from_pc_att(pc_att, f3_mask, hs_mask, cfg):
+    pc_att = np.asarray(pc_att, dtype=float).reshape(-1)
 
     pc_f3 = zone_value(pc_att, f3_mask, cfg.normalization)
     pc_hs = zone_value(pc_att, hs_mask, cfg.normalization)
@@ -95,6 +99,11 @@ def phi(players, ppcf_result, f3_mask, hs_mask, cfg):
     # HS is a SUBSET of F3, so corridor cells carry effective weight alpha+beta.
     phi_s = cfg.alpha * pc_f3 + cfg.beta * pc_hs
     return phi_s, {"pc_f3": pc_f3, "pc_hs": pc_hs, "phi": phi_s}
+
+
+def phi(players, ppcf_result, f3_mask, hs_mask, cfg):
+    return phi_from_pc_att(attacker_control(players, ppcf_result),
+                           f3_mask, hs_mask, cfg)
 
 
 # just a simple cache update
@@ -127,20 +136,25 @@ def terminal_reward(outcome, cfg):
     return cfg.terminal_bonus if outcome == SUCCESS else 0.0
 
 
-def reset_potential(players, ppcf_result, f3_mask, hs_mask, pcf_state, cfg):
+def reset_potential_from_pc_att(pc_att, f3_mask, hs_mask, pcf_state, cfg):
     """Seed the cache with Phi(s0) at episode start. Skipping this costs the
     first transition's shaping and breaks the telescoping identity."""
     pcf_state["prev_pcf"].clear()
-    phi_0, parts = phi(players, ppcf_result, f3_mask, hs_mask, cfg)
+    phi_0, parts = phi_from_pc_att(pc_att, f3_mask, hs_mask, cfg)
     push_phi(pcf_state, phi_0)
     return phi_0, parts
 
 
-def step_reward(players, ppcf_result, f3_mask, hs_mask, pcf_state, cfg, outcome=None):
+def reset_potential(players, ppcf_result, f3_mask, hs_mask, pcf_state, cfg):
+    return reset_potential_from_pc_att(attacker_control(players, ppcf_result),
+                                       f3_mask, hs_mask, pcf_state, cfg)
+
+
+def step_reward_from_pc_att(pc_att, f3_mask, hs_mask, pcf_state, cfg, outcome=None):
     history = pcf_state["prev_pcf"]
     phi_prev = history[-1] if history else None
 
-    phi_s, parts = phi(players, ppcf_result, f3_mask, hs_mask, cfg)
+    phi_s, parts = phi_from_pc_att(pc_att, f3_mask, hs_mask, cfg)
     push_phi(pcf_state, phi_s)
 
     terminal = is_terminal(outcome)
@@ -160,3 +174,7 @@ def step_reward(players, ppcf_result, f3_mask, hs_mask, pcf_state, cfg, outcome=
         "outcome": outcome,
     }
     return reward, components
+
+
+def step_reward(players, ppcf_result, f3_mask, hs_mask, pcf_state, cfg, outcome=None):
+    return step_reward_from_pc_att(attacker_control(players, ppcf_result), f3_mask, hs_mask, pcf_state, cfg, outcome=outcome)
