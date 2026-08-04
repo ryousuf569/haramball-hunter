@@ -230,7 +230,7 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # state to render_frame.
 
 
-def run_simulation(n_att=10, n_def=11, seed=23235454, n_ticks=2500, interval_ms=None,
+def run_simulation(n_att=10, n_def=11, seed=54, n_ticks=2500, interval_ms=None,
                    show_zones=False, start_holder=1, show_ppcf=True):
     """Open a matplotlib window and animate the engine in real time.
 
@@ -329,4 +329,4 @@ def run_simulation(n_att=10, n_def=11, seed=23235454, n_ticks=2500, interval_ms=
 
 
 if __name__ == "__main__":
-    run_simulation(start_holder=4)
+    run_simulation(start_holder=10)

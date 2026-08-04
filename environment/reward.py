@@ -1,0 +1,162 @@
+import numpy as np
+from collections import deque
+from dataclasses import dataclass
+from environment.grid import PC_CELL_SIZE
+
+CELL_AREA = PC_CELL_SIZE ** 2
+ATTACKER_LABEL = "attacker"
+FINAL_THIRD_X = 70.0
+HALF_SPACE_CENTERS = (20.5, 47.5)
+HALF_SPACE_HALF_WIDTH = 6.5
+HALF_SPACE_MAX_X = None
+
+# Episode outcome labels. Duplicated from lowblock_env rather than imported
+SUCCESS = "success"
+FAILURE = "failure"
+TIMEOUT = "timeout"
+TERMINAL_OUTCOMES = (SUCCESS, FAILURE, TIMEOUT)
+
+NORMALIZATIONS = ("mean", "area")
+
+
+@dataclass(frozen=True)
+class RewardConfig:
+    alpha: float = 1.0 # weight on final-third control
+    beta: float = 1.0 # extra weight on the half-space corridors
+    gamma: float = 0.99 # must match the learner's discount
+    terminal_bonus: float = 5.0 # B, paid on SUCCESS only
+    normalization: str = "mean" # see zone_value: "mean" is O(1), "area" is m^2
+    use_gamma: bool = True # flag 1: gamma in the shaping term
+    zero_terminal_potential: bool = True # flag 2: Phi(terminal) := 0
+
+    def __post_init__(self):
+        if self.normalization not in NORMALIZATIONS:
+            raise ValueError(
+                f"normalization={self.normalization!r} not in {NORMALIZATIONS}")
+
+
+def make_pcf_state():
+    return {
+        "prev_pcf": deque(maxlen=2),
+    }
+
+
+def build_zone_masks(ppcf_grid):
+    """Call ONCE at env construction"""
+    grid = np.asarray(ppcf_grid, dtype=float)
+    rx, ry = grid[:, 0], grid[:, 1]
+
+    f3 = rx > FINAL_THIRD_X
+
+    in_corridor = np.zeros_like(f3)
+    for cy in HALF_SPACE_CENTERS:
+        in_corridor |= np.abs(ry - cy) < HALF_SPACE_HALF_WIDTH
+    if HALF_SPACE_MAX_X is not None:
+        in_corridor &= rx <= HALF_SPACE_MAX_X
+
+    hs = f3 & in_corridor
+
+    if not f3.any() or not hs.any():
+        raise ValueError(
+            f"Empty zone mask (f3={f3.sum()}, hs={hs.sum()}). "
+            "Grid is probably in local coords -- apply local_to_global first."
+        )
+    return f3, hs
+
+
+def zone_mean(pc_att, mask):
+    # per-cell mean == (sum PC * cell_area) / zone_area with cell_area cancelled.
+    # Bounded in [0, 1] and resolution-independent by construction.
+    return float(pc_att[mask].mean())
+
+
+def zone_area(pc_att, mask):
+    # Riemann sum: square metres of attacker-controlled space in the zone.
+    # Also resolution-independent, but O(1000) -- with this mode the living cost
+    # below dwarfs terminal_bonus unless B is rescaled to match.
+    return float(pc_att[mask].sum()) * CELL_AREA
+
+
+def zone_value(pc_att, mask, normalization):
+    if normalization == "mean":
+        return zone_mean(pc_att, mask)
+    if normalization == "area":
+        return zone_area(pc_att, mask)
+    raise ValueError(f"unknown normalization {normalization!r}")
+
+
+def phi(players, ppcf_result, f3_mask, hs_mask, cfg):
+    is_att = np.asarray(players["team"]) == ATTACKER_LABEL
+    pc_att = np.asarray(ppcf_result)[:, is_att].sum(axis=1)
+
+    pc_f3 = zone_value(pc_att, f3_mask, cfg.normalization)
+    pc_hs = zone_value(pc_att, hs_mask, cfg.normalization)
+
+    # HS is a SUBSET of F3, so corridor cells carry effective weight alpha+beta.
+    phi_s = cfg.alpha * pc_f3 + cfg.beta * pc_hs
+    return phi_s, {"pc_f3": pc_f3, "pc_hs": pc_hs, "phi": phi_s}
+
+
+# just a simple cache update
+def push_phi(pcf_state, phi_s):
+    pcf_state["prev_pcf"].append(phi_s)
+
+
+def delta(pcf_state, cfg, terminal=False):
+    # F = gamma * Phi(s') - Phi(s), with Phi(terminal) forced to 0 so the
+    # discounted sum over an episode telescopes to exactly -Phi(s0) for ANY policy
+    history = pcf_state["prev_pcf"]
+
+    if len(history) < 2:
+        return 0.0
+
+    phi_prev, phi_curr = history[0], history[1]
+
+    arriving = 0.0 if (terminal and cfg.zero_terminal_potential) else phi_curr
+    g = cfg.gamma if cfg.use_gamma else 1.0
+
+    return g * arriving - phi_prev
+
+
+def is_terminal(outcome):
+    return outcome in TERMINAL_OUTCOMES
+
+
+def terminal_reward(outcome, cfg):
+    # B on success, 0 on turnover and timeout
+    return cfg.terminal_bonus if outcome == SUCCESS else 0.0
+
+
+def reset_potential(players, ppcf_result, f3_mask, hs_mask, pcf_state, cfg):
+    """Seed the cache with Phi(s0) at episode start. Skipping this costs the
+    first transition's shaping and breaks the telescoping identity."""
+    pcf_state["prev_pcf"].clear()
+    phi_0, parts = phi(players, ppcf_result, f3_mask, hs_mask, cfg)
+    push_phi(pcf_state, phi_0)
+    return phi_0, parts
+
+
+def step_reward(players, ppcf_result, f3_mask, hs_mask, pcf_state, cfg, outcome=None):
+    history = pcf_state["prev_pcf"]
+    phi_prev = history[-1] if history else None
+
+    phi_s, parts = phi(players, ppcf_result, f3_mask, hs_mask, cfg)
+    push_phi(pcf_state, phi_s)
+
+    terminal = is_terminal(outcome)
+    shaping = delta(pcf_state, cfg, terminal=terminal)
+    bonus = terminal_reward(outcome, cfg)
+    reward = shaping + bonus
+
+    components = {
+        "reward": reward,
+        "shaping": shaping,
+        "terminal_bonus": bonus,
+        "phi_prev": phi_prev,
+        "phi_next": 0.0 if (terminal and cfg.zero_terminal_potential) else phi_s,
+        "pc_f3": parts["pc_f3"],
+        "pc_hs": parts["pc_hs"],
+        "terminal": terminal,
+        "outcome": outcome,
+    }
+    return reward, components
