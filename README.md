@@ -77,14 +77,51 @@ that same array rather than paying for a second `PPCF_grid` call, which at
 
 **The attackers are the learners.** The low block is scripted and stays that
 way: it is the fixed opponent being learned against, and `compute_defender_targets`
-has no policy seam. The action is therefore a `Dict` -- `"velocity"`, an
-`(n_att, 2)` array of target velocities handed straight to the kinematics
-integrator, and `"pass"`, a `Discrete(n_att)` where 0 holds and `k` passes to
-the `k`-th sorted teammate id. With `scripted_attackers=False` (how training
-runs) `attackers/baseline_attacker.py` is bypassed entirely and the attackers
-move straight off the physics with no hand-tuned model in the loop; that module
-is a test harness for the defenders, not a policy. `scripted_attackers=True`,
-the default, keeps it for benchmarking and as a scripted reference arm.
+has no policy seam. All ten attackers share one set of weights, so the whole
+interface is per-agent and batched on a leading `n_att` axis: the action is a
+`MultiDiscrete` of shape `(n_att, 3)` -- `(direction, speed, ball)` per attacker,
+where the first two index `physics/engine.py`'s lookup tables and the third is
+0 for HOLD or `k` for a pass to the `k`-th sorted teammate id. With
+`scripted_attackers=False` (how training runs) `attackers/baseline_attacker.py`
+is bypassed entirely and the attackers move straight off the physics with no
+hand-tuned model in the loop; that module is a test harness for the defenders,
+not a policy, and the env only imports it lazily, on the `scripted_attackers=True`
+path, so deleting it does not make the env unimportable.
+
+### What the actor sees, what the critic sees
+
+`obs()` returns `(n_att, 92)` float32. Row `i` is attacker `i`'s view: its own
+position and velocity, then the shared world -- all 21 players in fixed roster
+order, ball position, an in-flight flag, and remaining time. The ego prefix is
+the only thing distinguishing the rows, and it is what lets one network act as
+ten agents.
+
+`info["state"]` is the critic's 99-dim global vector: the same 21 players and
+ball, a holder one-hot over the attackers, the reward's two zone-control values
+(free -- they are already computed for the shaping), and remaining time. Both
+`reset()` and `step()` return it, along with `info["action_mask"]`, because a
+rollout needs `V(s_0)` and a legal first action before it has taken a step.
+
+The action mask is `(n_att, BALL_ACTIONS)` bool over the ball head only;
+direction and speed are always fully legal. The holder's row is fully legal, and
+every other row is masked down to index 0, HOLD, which is the no-op there
+anyway. Exactly one legal action rather than none is deliberate: an all-False
+row sends a masked softmax to NaN, whereas a one-hot row normalises to
+probability 1 and so contributes log-prob 0 and entropy 0 with no special-casing
+in the learner.
+
+Remaining time is `(max_ticks - tick) / max_ticks`, and it is in both vectors on
+purpose. Because timeout is a *terminal* here rather than a truncation, the same
+board position is worth very different amounts at tick 10 and at tick 299;
+without the clock the two are the same input, the env stops being Markov in the
+observation, and the value function is fitting an average over a hidden
+variable (Pardo et al., *Time Limits in Reinforcement Learning*, 2018). It looks
+redundant. It is not.
+
+Positions and velocities go through `norm_pos` and `norm_vel` -- the unit box,
+not pitch metres -- and `obs()` and `global_state()` both call those same two
+helpers. If they ever diverge the critic fits different units to the same world,
+and it presents as a value loss that plateaus for no visible reason.
 
 All three outcomes report `terminated=True`, timeout included, and `truncated`
 is always `False`. `reward.py` counts `TIMEOUT` in `TERMINAL_OUTCOMES` and zeroes
@@ -99,36 +136,43 @@ one process per env. Benchmark both with:
 python scripts/bench_vector.py --envs 1 2 4 6 --both
 ```
 
-On a 12-logical-CPU machine, 250 timed calls per config, BLAS pinned to one
-thread:
+On a 12-logical-CPU machine, 400 timed calls per config, BLAS pinned to one
+thread, `scripted_attackers=False` so the timing covers the whole path a
+training step actually pays for -- decode the `(n_att, 3)` action, integrate,
+PPCF, reward, then build the per-agent obs, the global state and the action mask:
 
 | mode  | n_envs | ms/call | ms/step | env-steps/sec |
 |-------|--------|---------|---------|---------------|
-| sync  | 1      |  25.5   |  25.5   |   39.3        |
-| sync  | 2      |  57.6   |  28.8   |   34.7        |
-| sync  | 4      | 127.3   |  31.8   |   31.4        |
-| sync  | 6      | 169.9   |  28.3   |   35.3        |
-| async | 1      |  25.8   |  25.8   |   38.7        |
-| async | 2      |  28.8   |  14.4   |   69.5        |
-| async | 4      |  40.9   |  10.2   |   97.7        |
-| async | 6      |  58.4   |   9.7   |  102.7        |
+| sync  | 1      |  20.7   |  20.7   |   48.2        |
+| sync  | 2      |  40.5   |  20.3   |   49.3        |
+| sync  | 4      |  80.6   |  20.1   |   49.7        |
+| sync  | 6      | 122.7   |  20.4   |   48.9        |
+| async | 1      |  21.7   |  21.7   |   46.2        |
+| async | 2      |  25.0   |  12.5   |   80.1        |
+| async | 4      |  44.1   |  11.0   |   90.7        |
+| async | 6      |  45.6   |   7.6   |  131.6        |
+
+These supersede an earlier set measured before the reward, the global state and
+the mask were wired in. Counter-intuitively the numbers went **up**, not down:
+those three cost very little -- the reward reuses the pitch-control surface
+`step()` already builds, and the state reuses the two zone values the reward
+already computed -- while the scripted `compute_attacker_targets` they replaced
+was itself doing real work every tick. Async at 6 workers went 102.7 ->
+~132 env-steps/sec, confirmed across two runs (131.6, 134.1). Schedule long
+campaigns against this figure, not the old one.
 
 `SyncVectorEnv` steps its envs in a serial loop, so `ms/call` grows roughly
-linearly with `n_envs` while throughput stays flat at ~31-39 env-steps/sec no
+linearly with `n_envs` while throughput stays flat at ~48-50 env-steps/sec no
 matter how many envs you add. That is the design, not a defect, and it is the
 whole reason "6 workers" has to mean Async if the point is collection.
 
 Sync's per-env `ms/step` is essentially flat -- the vector wrapper itself costs
-little. Do not read much into the wobble across the sync rows: repeated runs put
-`n_envs=1` anywhere in 25.3-29.5 ms and `n_envs=6` anywhere in 27.8-34.8 ms, so
-the spread between configs is within run-to-run noise on this machine. Compare
-modes, not adjacent sync rows.
+little. Do not read much into the wobble across the async rows either: a repeat
+run put `n_envs=4` at 8.7 ms/step (115.1 steps/sec) against the 11.0 above,
+while `n_envs=6` reproduced to within 2%. Compare modes, not adjacent rows.
 
-`AsyncVectorEnv` at 6 workers is ~2.6x the per-env speed and ~2.6x the
-throughput. It is already flattening by 4 envs (10.2 -> 9.7 ms/step going
-4 -> 6), so the sim saturates this machine's physical cores at roughly 4-6
-workers and more processes would buy little. Use Sync for debugging and
-determinism, Async to collect.
+`AsyncVectorEnv` at 6 workers is ~2.9x the per-env speed and ~2.8x the
+throughput. Use Sync for debugging and determinism, Async to collect.
 
 Note that `scripts/bench_parallel.py` measures a different thing: sustained
 throughput of N independent worker processes over minutes. `bench_vector.py`

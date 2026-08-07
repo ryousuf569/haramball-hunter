@@ -52,8 +52,12 @@ def _stats(times_ms, n_envs):
 
 
 def bench(n_envs, asynchronous, warmup, timed, max_ticks, seed=0):
+    # scripted_attackers=False is what training runs, and it is also the only
+    # honest thing to time now: the step does the full policy path -- decode the
+    # (n_att, 3) action, integrate, PPCF, reward, then build the per-agent obs,
+    # the global state and the action mask.
     venv = make_vector_env(n_envs=n_envs, asynchronous=asynchronous,
-                           max_ticks=max_ticks)
+                           max_ticks=max_ticks, scripted_attackers=False)
     try:
         # Time an explicit reset separately: it samples both formations and pays
         # one extra PPCF call per env to seed Phi(s0).
@@ -61,8 +65,9 @@ def bench(n_envs, asynchronous, warmup, timed, max_ticks, seed=0):
         venv.reset(seed=seed)
         reset_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Scripted attackers ignore the action, but the vector API still wants
-        # one. Sampled once, not per call, so the sampler isn't in the timing.
+        # Sampled once, not per call, so the sampler isn't in the timing. The
+        # ball head is left unmasked here: the env decodes only the holder's row
+        # regardless, so an illegal entry costs nothing and changes no timing.
         action = venv.action_space.sample()
 
         for _ in range(warmup):
