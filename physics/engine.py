@@ -5,7 +5,19 @@ V_MAX = 5.0
 A_MAX = 7.0
 DT = 0.1
 HOLD = 0
-BALL_SPEED = 15.0
+
+# Pass speed scales with pass length. Fitted to 793 Metrica passes in
+# physics/validation/pass_speed_calibration.py; see that script for the fit, the
+# held-out check and the caveat about per-pass scatter.
+PASS_SPEED_A = 4.5292
+PASS_SPEED_B = 0.3537
+PASS_SPEED_MAX = 14.93   # median speed of real passes over 25m; the fit is capped here
+BALL_SPEED = PASS_SPEED_MAX   # scalar upper bound, for callers that need one
+
+
+def pass_speed(length):
+    length = np.maximum(np.asarray(length, dtype=float), 1e-6)
+    return np.minimum(PASS_SPEED_A * length ** PASS_SPEED_B, PASS_SPEED_MAX)
 
 ball = {
     'state': str,
@@ -90,7 +102,11 @@ def ball_mechanics(ball, players, pass_decision):
     elif ball['state'] == 'in_flight':
         remaining_vector = ball['flight_target'] - ball['position']
         remaining_distance = np.linalg.norm(remaining_vector)
-        step_distance = BALL_SPEED * DT
+        # Speed is a property of the pass, not of the tick, so it comes off the
+        # frozen start/target rather than off how far the ball has left to run --
+        # otherwise the ball would decelerate as it approached the receiver.
+        pass_length = np.linalg.norm(ball['flight_target'] - ball['flight_start'])
+        step_distance = float(pass_speed(pass_length)) * DT
 
         if remaining_distance <= step_distance:
             # arrives this tick -- snap, don't overshoot

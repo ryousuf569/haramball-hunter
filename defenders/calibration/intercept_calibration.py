@@ -69,11 +69,11 @@ def _intercept_probe(players, ball, rng, prev_pos, dt=0.1):
                 closest = a
             delta = dpos - closest
             sq = np.einsum("ij,ij->i", delta, delta)
-            near = sq <= turnover.KICKABLE_AREA * turnover.KICKABLE_AREA
+            near = sq <= turnover.INTERCEPT_REACH * turnover.INTERCEPT_REACH
             if near.any():
                 _ep["in_range_ticks"] += 1
                 to_target = ball["flight_target"] - ball["position"]
-                T = np.sqrt(to_target @ to_target) / turnover.BALL_SPEED
+                T = np.sqrt(to_target @ to_target) / turnover.pass_speed(np.linalg.norm(ball["flight_target"] - ball["flight_start"]))
                 p = intercept_probability_vec(T, players["i_p"][dmask][near])
                 _ep["p_samples"].append(float(np.max(p)))
 
@@ -174,8 +174,8 @@ def main():
         ("episodes_per_threshold", len(SEEDS) * len(START_HOLDERS)),
         ("max_ticks", MAX_TICKS),
         ("dt_s", DT),
-        ("kickable_area_m", turnover.KICKABLE_AREA),
-        ("ball_speed_m_s", turnover.BALL_SPEED),
+        ("intercept_reach_m", turnover.INTERCEPT_REACH),
+        ("pass_speed_max_m_s", turnover.PASS_SPEED_MAX),
         ("lam_max_duel", turnover.LAM_MAX),
     ]
     for thr in THRESHOLDS:

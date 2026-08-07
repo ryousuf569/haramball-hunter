@@ -1,0 +1,33 @@
+source,parameter,value,meaning
+statsbomb,n_frames,2032.0,low-block freeze frames
+statsbomb,block_depth_q05_sim,59.2,"back line x, q05 -- the low-block depth band"
+statsbomb,block_depth_median_sim,67.1,"back line x, median"
+statsbomb,line_sep_median_m,15.34,back line to midfield line
+statsbomb,press_band_front_m,-20.0,band starts this many m in FRONT of the back line (negative)
+statsbomb,press_band_behind_m,5.0,band ends this many m GOAL-SIDE of the back line
+statsbomb,press_band_front_vs_mid_m,-4.7,"same front edge, measured off the midfield line"
+statsbomb,commit_rate_in_band,0.6989,"fraction with a defender inside NEAR_R, ball in band"
+statsbomb,commit_rate_out_of_band,0.2084,"same, ball outside the band"
+statsbomb,frac_frames_in_band,0.5655,how much of a low-block possession the band covers
+statsbomb,commit_rate_absolute_x_above_70,0.3191,what a plain absolute x>70 gate would select
+statsbomb,commit_rate_absolute_x_below_70,0.6291,and what it would reject -- note it is the wrong way round
+statsbomb,d1_median_in_band,3.19,"nearest block defender to ball, in band (m)"
+statsbomb,d1_median_out_of_band,8.97,"same, out of band (m)"
+statsbomb,n_near_mean_in_band,0.949,"mean defenders within NEAR_R, in band"
+statsbomb,frac_zero_near_in_band,0.3011,in-band frames with NOBODY inside NEAR_R
+statsbomb,frac_one_near_in_band,0.4874,in-band frames with exactly one
+statsbomb,frac_two_or_more_near_in_band,0.2115,in-band frames with 2+
+statsbomb,presser_share_back_in_band,0.7224,"nearest defender is a back-line player, in band"
+statsbomb,presser_share_mid_in_band,0.2776,"nearest defender is a midfielder, in band"
+statsbomb,back_gap_max_holding_m,13.27,"largest back-line y-gap, in band, nobody committed"
+statsbomb,back_gap_max_committed_m,13.3,"largest back-line y-gap, in band, someone committed"
+metrica,n_frames,34308.0,low-block-depth tracking frames
+metrica,d1_median_in_band,4.19,cross-check against the StatsBomb figure above (m)
+metrica,n_spells,476.0,one-defender commitments containing a real engagement
+metrica,spell_median_s,0.78,length of one defender's commitment
+metrica,spell_p90_s,2.44,p90 of the same
+metrica,spell_p95_s,3.04,p95 of the same
+metrica,press_path_median_m,2.44,ground covered by the presser during one commitment
+metrica,press_path_p90_m,9.14,p90 of the same
+metrica,press_path_p95_m,13.29,p95 of the same
+metrica,press_net_median_m,2.33,straight-line displacement over one commitment

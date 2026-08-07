@@ -1,0 +1,45 @@
+name: tests
+
+on: push
+
+# A newer push to the same branch makes an in-flight run obsolete.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # pyproject sets requires-python = ">=3.13"
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        # torch goes in first, pinned to the CPU index, which is a ~200MB
+        # download against several GB for the CUDA build pip would otherwise
+        # pick off PyPI. 2.13.0+cpu satisfies the ==2.13.0 in requirements.txt,
+        # so the second command leaves it alone. Doing it in two steps rather
+        # than with --extra-index-url keeps the choice of build explicit instead
+        # of leaning on pip preferring the higher local version across indexes.
+        #
+        # Nothing under tests/ imports torch today; the suite needs only numpy
+        # and gymnasium. Installing the full declared set anyway means a test
+        # that starts importing torch, pandas or matplotlib fails on its own
+        # merits rather than on a missing package, and that a bad pin in
+        # requirements.txt is caught here rather than on someone's machine.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.13.0
+          pip install -r requirements.txt
+
+      - name: Run tests
+        # testpaths = ["tests"] comes from pyproject, so this is the whole suite.
+        run: pytest -q

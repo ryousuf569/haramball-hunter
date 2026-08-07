@@ -21,8 +21,14 @@ BALL_X_MAX = 57.48
 
 SEED = 42
 
-# Press commit window: 2.5s covers the ~2.2s a presser needs to close its median 11m
-PRESS_LATCH_TICKS = 25
+# Press policy. Every number here is measured in calibration/press_calibration.py;
+# see calibration/README.md section 10 for the study.
+# Band is signed metres vs the back line, positive = goal-side. Inside it a real
+# low block has a defender within 5m of the ball 70% of the time; outside, 21%.
+PRESS_BAND_FRONT = -20.0 # 4.7m in front of the midfield line
+PRESS_BAND_BEHIND = 5.0 # past this the ball is through; it is the keeper's
+PRESS_MAX_EXCURSION = 10.0 # leash off own slot; real press path p90 is 9.1m
+PRESS_LATCH_TICKS = 25 # 2.5s; real commitment p90 is 2.44s
 
 backline_offset = np.array([[-1.77, -20], [0.93, -10], [1.42, 0], [0.80, 10], [-1.38, 20]])
 midline_offset = np.array([[-0.47, -15], [0.18, -5], [0.44, 5], [-0.20, 15]])
@@ -31,9 +37,11 @@ def make_defender_state(seed=SEED):
     return {
         "ball_x_history": deque(maxlen=5),
         "attacker_line_history": deque(maxlen=5),
-        "rng": np.random.default_rng(seed), # to keep episodes reproducibles
-        # presser is a defender-array row index; holder_id is who the press is committed to
-        "press_latch": {"presser": None, "ticks_left": 0, "holder_id": None},
+        "rng": np.random.default_rng(seed),
+        # presser/coverer are defender-array row indices; target_key is the
+        # attacker id the press is committed to (see press_target)
+        "press_latch": {"presser": None, "coverer": None, "ticks_left": 0,
+                        "target_key": None},
     }
 
 def y_centroid(ball_y, pitch_center, gain):
@@ -112,73 +120,104 @@ def apply_compactness_snapback(def_positions, target_velocities, v_max, lo=2.5, 
         target_velocities[line_slice] = blended * np.minimum(bscale, 1.0)
     return target_velocities
 
-def apply_pressure_trigger(players, ball, def_positions, target_velocities, v_max,
-                            defender_state, box_x_min=88.5, box_y=(13.84, 54.16),
-                            trigger_dist=30.0, support_dist=14.0, cover_y_sep=8.0):
-    # support_dist=14: the 2-5-3 never spaces players under ~5.7m, so 5m never fired
+def press_target(players, ball):
+    att_ids = players["id"][players["team"] == "attacker"]
+
+    if ball["state"] == "in_flight":
+        target_id = ball.get("target_id")
+        if target_id is None or not np.any(att_ids == target_id):
+            return None, None
+        # flight_target is frozen at release and is where ball_mechanics snaps
+        # the ball on arrival, so it is the true reception point.
+        return np.asarray(ball["flight_target"], dtype=float), target_id
+
     holder_id = ball.get("holder_id")
+    if holder_id is None or not np.any(att_ids == holder_id):
+        return None, None
+    return players["position"][players["id"] == holder_id][0], holder_id
+
+
+def in_press_band(target_pos, back_line_x):
+    rel_back = float(target_pos[0]) - float(back_line_x)
+    return PRESS_BAND_FRONT <= rel_back <= PRESS_BAND_BEHIND
+
+
+def apply_pressure_trigger(players, ball, def_positions, def_slots, target_velocities,
+                           v_max, defender_state, back_line_x,
+                           support_dist=14.0, cover_y_sep=8.0):
+    # support_dist=14: the 2-5-3 never spaces players under ~5.7m, so 5m never fired
     att_mask = players["team"] == "attacker"
     latch = defender_state["press_latch"]
 
-    # Drop the latch when the ball moves on, or the presser charges a stale position
-    if latch["ticks_left"] > 0 and latch["holder_id"] != holder_id:
+    # Every geometry test below reads the destination, not ball['position'] --
+    # mid-flight the ball is somewhere neither team is standing.
+    target_pos, target_key = press_target(players, ball)
+
+    # Drop the latch when the ball moves on to a different attacker, or the
+    # presser charges a stale position
+    if latch["ticks_left"] > 0 and latch["target_key"] != target_key:
         latch["ticks_left"] = 0
 
-    if holder_id is None or not np.any(players["id"][att_mask] == holder_id):
-        return target_velocities  # no attacker holds the ball right now
+    if target_pos is None:
+        return target_velocities  # loose ball, or a defender has it
 
-    holder_pos = players["position"][players["id"] == holder_id][0]
+    if not in_press_band(target_pos, back_line_x):
+        latch["ticks_left"] = 0     # ball has left the band; whoever was out comes back
+        return target_velocities
 
     if latch["ticks_left"] > 0:
-        # Committed press: the latch fixes who presses, not where they run
+        presser = latch["presser"]
+        # Break the commitment early if the ball has dragged the presser off
+        if np.linalg.norm(def_positions[presser] - def_slots[presser]) > PRESS_MAX_EXCURSION:
+            latch["ticks_left"] = 0
+
+    if latch["ticks_left"] > 0:
+        # Committed press: the latch fixes who presses and covers
         latch["ticks_left"] -= 1
         presser = latch["presser"]
-        coverer = None
+        coverer = latch["coverer"]
     else:
-        # x-distance to the box's near edge, clipped at 0 once inside
-        dist_to_box = max(0.0, box_x_min - holder_pos[0])
-
-        if dist_to_box > trigger_dist:
-            return target_velocities
-
-        teammate_positions = players["position"][att_mask & (players["id"] != holder_id)]
+        teammate_positions = players["position"][att_mask & (players["id"] != target_key)]
         if len(teammate_positions) == 0:
             return target_velocities
-        support_present = np.any(np.linalg.norm(teammate_positions - holder_pos, axis=1) < support_dist)
+        support_present = np.any(np.linalg.norm(teammate_positions - target_pos, axis=1) < support_dist)
         if not support_present:
             return target_velocities
 
-        dists_to_ball = np.linalg.norm(def_positions - ball["position"], axis=1)
+        # Selection is by SLOT distance, not body distance
+        slot_d = np.linalg.norm(def_slots - target_pos, axis=1)
 
         # The keeper holds its line; it never presses or covers, so drop it out of both argmins
-        dists_to_ball[GK_INDEX] = np.inf
+        slot_d[GK_INDEX] = np.inf
 
-        # Presser is simply whoever is closest to the ball, backline or midfield
-        presser = int(np.argmin(dists_to_ball))
+        presser = int(np.argmin(slot_d))
+        if slot_d[presser] > PRESS_MAX_EXCURSION:
+            return target_velocities    # nobody's zone: the block holds shape
 
         # Supporter is the next closest, kept off the presser's toes by the same spacing rule
-        cover_d = dists_to_ball.copy()
+        cover_d = slot_d.copy()
         cover_d[presser] = np.inf
-        y_sep = np.abs(def_positions[:, 1] - def_positions[presser, 1])
+        y_sep = np.abs(def_slots[:, 1] - def_slots[presser, 1])
         eligible = y_sep >= cover_y_sep
         eligible[presser] = False
         if np.any(eligible):
             cover_d[~eligible] = np.inf
         coverer = int(np.argmin(cover_d))
 
-        # commit this presser for the next PRESS_LATCH_TICKS ticks
+        # commit this pair for the next PRESS_LATCH_TICKS ticks
         latch["presser"] = presser
+        latch["coverer"] = coverer
         latch["ticks_left"] = PRESS_LATCH_TICKS
-        latch["holder_id"] = holder_id
+        latch["target_key"] = target_key
 
-    to_holder = holder_pos - def_positions[presser]
-    d = np.linalg.norm(to_holder)
+    to_target = target_pos - def_positions[presser]
+    d = np.linalg.norm(to_target)
     if d > 1e-6:
-        target_velocities[presser] = (to_holder / d) * v_max
+        target_velocities[presser] = (to_target / d) * v_max
 
-    # Coverer shifts halfway to the holder instead of charging, keeping shape behind the press
+    # Coverer shifts halfway to the ball instead of charging, keeping shape behind the press
     if coverer is not None:
-        cover_point = 0.5 * (holder_pos + def_positions[coverer])
+        cover_point = 0.5 * (target_pos + def_positions[coverer])
         to_cover = cover_point - def_positions[coverer]
         d = np.linalg.norm(to_cover)
         if d > 1e-6:
@@ -225,10 +264,9 @@ def compute_defender_targets(players, ball, defender_state):
     speed[dist < 0.4] = 0
 
     target_velocities = unit * speed
-
-    # Press must come last: it overwrites, so spacing would otherwise drag the presser off the ball
     target_velocities = apply_compactness_snapback(defender_positions, target_velocities, V_MAX)
-    target_velocities = apply_pressure_trigger(players, ball, defender_positions, target_velocities, V_MAX,
-                                               defender_state)
+    target_velocities = apply_pressure_trigger(players, ball, defender_positions, targets,
+                                               target_velocities, V_MAX, defender_state,
+                                               back_line_x)
 
     return target_velocities

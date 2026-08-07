@@ -303,6 +303,20 @@ fires, sitting below the achievable ceiling, and it is also the only setting tha
 splits outcomes between interceptions and duels rather than letting one dominate.
 It is set in `turnover.py` as `INTERCEPT_P_MIN = 0.80`.
 
+**Superseded in part.** This sweep was run with the geometric gate at RoboCup's
+kickable area, 1.085m, and with the pre-section-10 press. Both have since changed:
+the gate is now `INTERCEPT_REACH = 2.5`, a closing distance rather than a reaching
+one, and the press of section 10 puts defenders much nearer the passing lanes.
+Spot-measured over 40 episodes against the 500k checkpoint, a defender is now
+geometrically in range on 30.3% of flight ticks rather than 11.7%, and the number
+of ticks clearing 0.80 roughly doubles. The achievable-p ceiling that motivated the
+choice of 0.80 has moved with it — the maximum observed is now 0.992, not 0.858 —
+so 0.80 is no longer near the ceiling and is no longer the highest threshold that
+fires. **The sweep should be re-run before `INTERCEPT_P_MIN` is trusted again.**
+End to end the effect is currently small (4 interceptions to 5 over those 40
+episodes) because duels and offsides dominate the turnover mix, but that is a
+statement about one checkpoint, not about the parameter.
+
 ---
 
 ## 9. Formation sampler
@@ -359,6 +373,119 @@ width. Figures go to `defender_shape_fit.png`, `defender_slot_scatter.png` and
 
 ---
 
+## 10. Press policy
+
+**How.** `press_calibration.py`, using two sources that are not interchangeable.
+
+The **geometry** comes from the 2032 StatsBomb low-block freeze frames of section
+1 — the right population by construction, since they are already filtered to
+settled low blocks. For each frame it computes the distance from the ball to the
+nearest non-keeper block defender (`d1`), how many are within 5m (`n_near`), which
+line that nearest defender belongs to, and the largest y-gap in the back line.
+
+The **dynamics** — how long one commitment lasts, and how much ground the presser
+covers during it — cannot be measured from freeze frames at all, because a freeze
+frame is one instant. Those come from Metrica's `Sample_Game_1` tracking (25fps,
+`physics/validation/data/`), restricted to frames whose block depth falls inside
+the band the StatsBomb low blocks occupy (back line at sim x >= 59.2, the
+StatsBomb q05). **A full match is mostly not a low block**, and unfiltered this
+source measures mid-block and counter-pressing instead, which behave differently.
+The two sources overlap on `d1`, and the third panel of `press_commitment.png`
+plots both profiles so the subset can be checked before its durations are trusted.
+Treat everything from Metrica as order-of-magnitude: one match, not eight.
+
+**Why.** The press in `defenders.py` sent whoever was closest to the ball at it,
+at full speed, from anywhere on the pitch. Against a learned attacker that
+recycles the ball every tick, that produced one midfielder ping-ponging across
+the block and a hole where they had been standing. The question was what a real
+low block does instead.
+
+**Results.**
+
+*Absolute ball x is the wrong variable, and it inverts.* Profiling engagement
+against absolute ball x says low blocks press **less** the closer the ball gets to
+their own box, which is backwards. The reason is a selection effect: the frames
+with the ball deepest are overwhelmingly balls that have already been played
+**through** the block — median 19m goal-side of the back line once the ball is past
+x=90 — so of course nobody is near it. The right conditioning variable is the
+ball's position **relative to the block's own lines**, which `defenders.py` already
+computes every tick. The third panel of `press_engagement.png` shows the trap.
+
+*There is a press band.* Measured against the back line and signed so positive is
+goal-side, commitment is the norm from **-20m to +5m** (the front edge is 4.7m in
+front of the midfield line, given the measured 15.34m line separation):
+
+| ball vs back line | frames | nearest defender | committed | defenders within 5m |
+| --- | --- | --- | --- | --- |
+| -20 to -15m | 73 | 1.86m | 75% | 1.01 |
+| -15 to -10m | 149 | 2.01m | 79% | 1.08 |
+| -10 to -5m | 236 | 2.30m | 80% | 1.08 |
+| -5 to 0m | 304 | 3.33m | 71% | 1.00 |
+| 0 to +5m | 387 | 4.29m | 58% | 0.77 |
+| +5 to +10m | 285 | 5.88m | 39% | 0.41 |
+| +10 to +20m | 400 | 9.75m | 14% | 0.14 |
+| +20 to +40m | 96 | 16.07m | 1% | 0.01 |
+
+Inside the band a defender is within 5m of the ball on 70% of frames and the
+nearest one is 3.19m away; outside it, 21% and 8.97m. The band covers 57% of
+low-block possession frames.
+
+*Exactly one defender commits.* Inside the band, 49% of frames have exactly one
+defender within 5m, 30% have none and 21% have two or more, for a mean of 0.95.
+Committing the whole time, or committing two, is not what real blocks do.
+
+*It costs no shape.* The largest y-gap in the back line is 13.27m when nobody is
+committed and 13.30m when someone is — statistically identical. A real press does
+not open the block up, which is precisely the failure mode being fixed.
+
+*The press comes from the line the ball is in.* Inside the band the nearest
+defender is a back-line player on 72% of frames and a midfielder on 28%, and which
+one it is tracks the ball across the band (`press_shape.png`).
+
+*Commitments are short and local.* From Metrica: one defender stays committed for
+0.78s at the median and 2.44s at p90, covering 2.44m of ground at the median and
+9.14m at p90, with a median net displacement of 2.33m. A press is a step out of
+the line, not a chase.
+
+**What went into `defenders.py`.**
+
+| constant | value | from |
+| --- | --- | --- |
+| `PRESS_BAND_FRONT` | -20.0 | band front edge, table above |
+| `PRESS_BAND_BEHIND` | 5.0 | band back edge |
+| `PRESS_MAX_EXCURSION` | 10.0 | press path p90, 9.14m |
+| `PRESS_LATCH_TICKS` | 25 (2.5s) | commitment p90, 2.44s |
+
+Two structural changes went with them. The presser is chosen by the distance from
+each defender's **slot** to the ball rather than from its body, so responsibility
+belongs to whoever owns the space rather than to whoever the last press left
+nearest — that is what makes the press hand off as the ball moves instead of
+towing one player around. And the excursion leash breaks the latch when a presser
+is dragged more than 10m from its slot, so a carrier cannot hold a defender out of
+shape for the full commit window.
+
+**Validation.** Re-measuring the sim with the same statistics, over 40 episodes
+against the 500k checkpoint:
+
+| statistic | sim | real |
+| --- | --- | --- |
+| commit rate, ball in band | 0.77 | 0.70 |
+| commit rate, ball out of band | 0.06 | 0.21 |
+| nearest defender to ball, in band | 3.04m | 3.19m |
+| mean defenders within 5m, in band | 1.01 | 0.95 |
+| — exactly one | 0.53 | 0.49 |
+| — two or more | 0.24 | 0.21 |
+| back-line gap, nobody committed | 10.20m | 13.27m |
+| back-line gap, someone committed | 10.24m | 13.30m |
+| presser excursion from slot, p90 | 9.47m | 9.14m (path) |
+
+The block is tighter than the real one in absolute terms (10.2m vs 13.3m back-line
+gap), which is the formation sampler of section 9, not the press. What matters
+here is that the gap is unchanged between committed and holding, exactly as in the
+real data: the press no longer costs shape.
+
+---
+
 ## Open gaps
 
 Places where `defenders.py` does not currently match what was fitted. None of these
@@ -395,6 +522,7 @@ Scripts:
 | `calibration_graphing.py` | Pulls StatsBomb frames and runs sections 1, 2, 4, 5, 6. Needs API access. |
 | `validate_depth_fit.py` | Held-out validation of the depth fit, section 3. Runs offline. |
 | `intercept_calibration.py` | Interception threshold sweep, section 8. Runs the sim. |
+| `press_calibration.py` | Press policy, section 10. Offline: reads the committed low-block CSVs and the Metrica tracking data. |
 | `../calibrate_defender_formation.py` | Formation sampler, section 9. Fits when run as main, and is imported by the environment for sampling. |
 
 Data:
@@ -414,6 +542,9 @@ Data:
 | `duel_calibration_summary.csv` | Duel engagement rates and the fitted lambda. |
 | `intercept_calibration_runs.csv` | One row per episode of the threshold sweep. |
 | `intercept_calibration_summary.csv` | Per-threshold outcome mix and the achievable-p ceiling. |
+| `press_frames.csv` | One row per low-block freeze frame with the press geometry, section 10. |
+| `press_spells.csv` | One row per single-defender commitment measured off Metrica tracking. |
+| `press_policy_params.csv` | Every number in section 10, tagged by source. |
 
 Figures:
 
@@ -425,6 +556,10 @@ Figures:
 | `defender_shape_fit.png` | Block depth, gap to the attacking line, spread correlation and lateral position. |
 | `defender_slot_scatter.png` | Per-slot standardised offsets, real frames against fitted mean and sd. |
 | `defender_samples.png` | Six sampled 5-4-1 blocks. |
+| `press_engagement.png` | Engagement distance and the press band, plus why absolute ball x is the wrong axis. |
+| `press_commitment.png` | How many defenders commit, and the StatsBomb/Metrica cross-check. |
+| `press_shape.png` | Which line supplies the presser, and what the back line pays for it. |
+| `press_duration.png` | Commitment length and ground covered, from Metrica tracking. |
 
 ---
 
@@ -435,7 +570,8 @@ python defenders/calibration/calibration_graphing.py     # needs StatsBomb API a
 python defenders/calibration/validate_depth_fit.py       # offline, reads committed CSVs
 python defenders/calibration/intercept_calibration.py    # runs the sim, slow
 python defenders/calibrate_defender_formation.py         # offline, reads committed CSVs
+python defenders/calibration/press_calibration.py        # offline, reads committed CSVs + Metrica
 ```
 
-Only `calibration_graphing.py` needs network access. The other three read CSVs that
+Only `calibration_graphing.py` needs network access. The other four read CSVs that
 are already committed, or run the sim directly.

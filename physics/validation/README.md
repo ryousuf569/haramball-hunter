@@ -1,4 +1,15 @@
-# PPCF validation against Laurie Shaw's implementation
+# Physics validation and calibration
+
+Two studies live here, both against Metrica's public tracking data.
+
+1. **PPCF validation** — checks `physics/ppcf.py` against an independent
+   implementation of the same model. Everything from here to *Caveats*.
+2. **Pass speed calibration** — fits `engine.pass_speed` to real pass flight
+   times. Last section.
+
+---
+
+## PPCF validation against Laurie Shaw's implementation
 
 `physics/ppcf.py` is a from-scratch pitch control model. This folder checks it
 against an independent implementation of the same model — Laurie Shaw's
@@ -11,6 +22,7 @@ against an independent implementation of the same model — Laurie Shaw's
 python physics/validation/ppcf_validation.py --download   # first time only, ~66 MB
 python physics/validation/ppcf_validation.py              # 20 frames, ~2 min
 python physics/validation/ppcf_validation.py --frames 40
+python physics/validation/pass_speed_calibration.py       # offline, seconds
 ```
 
 ## Files
@@ -20,7 +32,8 @@ python physics/validation/ppcf_validation.py --frames 40
 | `Metrica_PitchControl.py` | Shaw's model, **verbatim**. What we validate against. |
 | `Metrica_IO.py` | Shaw's data loader, verbatim. |
 | `Metrica_Velocities.py` | Shaw's velocity estimator, verbatim. Kept for reference — not imported, see caveats. |
-| `ppcf_validation.py` | The experiment. |
+| `ppcf_validation.py` | The PPCF experiment. |
+| `pass_speed_calibration.py` | The pass-speed fit. |
 | `data/` | Metrica's public sample data, downloaded on demand. |
 | `results/` | CSVs and figures. |
 
@@ -134,3 +147,86 @@ differently.
   veto shortcut disabled and a 0.08 s timestep, a few cells do not reach 0.99
   total probability inside the 10 s horizon. It is his own diagnostic, it affects
   a handful of cells out of 32,000, and our model stops at the same horizon.
+
+
+---
+
+## Pass speed calibration
+
+`physics/engine.py` moved every pass at a flat `BALL_SPEED = 15.0` m/s. That is
+about right for a 30m ball and roughly twice too fast for a 7m one, and the error
+was not cosmetic.
+
+**Why it mattered.** At 15 m/s a 7m pass is airborne for 0.46s, which is less than
+the 0.54s `reaction_time` in `physics/tti.py`. The ball lands before any defender
+has finished reacting to it, so `turnover.intercept_pass` can never fire on it
+however well positioned the defence is. A learned attacker that recycles the ball
+in short hops was therefore immune to interception **by construction rather than
+by skill** — which is exactly the behaviour that prompted this study. Diagnostics
+over 30 episodes against the 500k checkpoint: on the 988 flight ticks where a
+defender *was* geometrically in range, the median pass was 6.9m with 0.23s of
+flight left, against a defender time-to-intercept of 1.10s.
+
+**Method.** Metrica logs Start Frame and End Frame for every pass at 25fps, so
+flight time is directly measurable and speed does not have to be assumed. 793
+passes after filtering. Fitted by least squares in log space, which is the right
+error model for a multiplicative relationship:
+
+```
+speed = 4.5292 * length ** 0.3537,  capped at 14.93 m/s
+```
+
+The cap is the median speed of real passes over 25m. Without it the power law
+keeps climbing past the point where real passers stop hitting the ball harder.
+Fitted on period 1 and scored on period 2 — splitting by period rather than at
+random, because passes inside one possession are near-duplicates.
+
+**Results.**
+
+| pass length | n | real speed | real flight | fitted speed |
+|---|---|---|---|---|
+| 0–5m | 20 | 6.74 m/s | 0.56s | 6.26 |
+| 5–8m | 68 | 8.63 | 0.80 | 8.78 |
+| 8–12m | 212 | 10.13 | 1.00 | 10.23 |
+| 12–18m | 223 | 12.57 | 1.20 | 11.80 |
+| 18–25m | 141 | 13.24 | 1.60 | 13.41 |
+| 25–40m | 101 | 14.81 | 2.00 | 14.93 |
+| 40m+ | 28 | 16.11 | 2.86 | 14.93 (capped) |
+
+Passes airborne for less than the reaction time: **4.2% in reality, 11.4% under
+the old flat speed, 1.3% under the fit**. In the 5–8m bin the old constant put
+*100%* of passes inside the reaction window against a real 16%.
+
+![pass speed fit](results/pass_speed_fit.png)
+
+**Read the fit as a conditional median, not a per-pass prediction.** Held-out
+per-pass skill against a constant-speed baseline is only **0.10** — speed at a
+fixed length varies enormously and this model does not try to explain that
+variance. Two reasons it is largely irreducible: a pass can be driven or rolled
+over the same distance by choice, and Metrica's End Frame is when the receiver
+*touches* the ball rather than when it arrives, so a receiver moving onto a pass
+adds slack that reads as a slower ball. What the sim consumes is E[speed | length],
+and on that the fit scores a trend RMSE of **0.57 m/s** against the binned medians,
+versus **4.52 m/s** for the flat 15.
+
+**Where it is used.** `engine.pass_speed` sets the per-tick step in
+`ball_mechanics`, and `turnover.pass_speed` mirrors it so the defence's estimate
+of remaining flight time matches the ball's actual flight time. The two sets of
+constants must stay equal; `tests/test_pass_speed.py` asserts it, along with the
+curve matching the measured medians and short passes outliving the reaction time.
+Speed is derived from the frozen `flight_start`/`flight_target` rather than stored
+on the ball, so a hand-built ball dict cannot fall out of step.
+
+**Effect in the sim**, 40 episodes against the 500k checkpoint: interceptions rose
+from 5 to 10, ground duels fell from 12 to 4 (the ball spends longer in the air
+and less time at anyone's feet), and attacker successes fell from 9 to 5.
+
+| File | Contents |
+|---|---|
+| `results/pass_speed_fit.png` | Speed and flight time against length, plus the reaction-time consequence |
+| `results/pass_speed_by_length.csv` | Binned real medians against the fitted curve |
+| `results/pass_speed_params.csv` | Fitted constants, held-out scores, reaction-time fractions |
+
+**Caveat.** One match, 793 passes, one competition. The trend is strong and
+physically unsurprising, but the constants are not claimed to three significant
+figures for other leagues or eras.

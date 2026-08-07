@@ -1,0 +1,15 @@
+parameter,value,meaning
+n_passes,793.0,Metrica passes after filters
+PASS_SPEED_A,4.5292,speed = A * length**B
+PASS_SPEED_B,0.3537,power-law exponent
+PASS_SPEED_MAX,14.93,"cap, m/s -- median speed of passes over 25m"
+rmse_in_sample,4.191,m/s
+rmse_holdout,4.902,"fitted on period 1, scored on period 2"
+rmse_holdout_baseline,5.157,predicting the training median speed
+rmse_holdout_flat15,5.192,predicting the old flat 15.0 m/s
+skill_vs_baseline,0.0964,"1 - (rmse/baseline)^2, per pass -- low by design, see docstring"
+trend_rmse_fitted,0.572,"fit vs binned median speed, m/s -- the quantity the sim consumes"
+trend_rmse_flat15,4.517,old flat speed vs the same binned medians
+frac_under_reaction_real,0.0416,real passes airborne < reaction_time (0.54s)
+frac_under_reaction_flat15,0.1135,same passes at the old flat speed
+frac_under_reaction_fitted,0.0126,same passes at the fitted speed

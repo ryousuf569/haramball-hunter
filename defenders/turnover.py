@@ -17,11 +17,38 @@ ADV_FLOOR    = 0.5    # lambda multiplier at worst closing speed; 1.0 at best
 V_MAX        = 5.0    # mirrors engine.V_MAX; kept local so defenders/ never imports engine
 EPS          = 1e-6
 
-# RoboCup has no interception model to copy
-KICKABLE_AREA   = 1.085  # RoboCup player_size + ball_size + kickable_margin = 0.3 + 0.085 + 0.7
+# RoboCup has no interception model to copy.
+#
+# INTERCEPT_REACH is the perpendicular distance from the ball's swept segment
+# inside which a defender is deemed able to get a foot to it. It started as
+# RoboCup's kickable area (player_size + ball_size + kickable_margin = 0.3 +
+# 0.085 + 0.7 = 1.085), which is the radius a stationary player can touch a ball
+# from within one 100ms tick. That is the wrong quantity here: it is a reaching
+# distance, not an intercepting one. A pro closing a passing lane covers 2-3m in
+# the ~1s a short pass is in the air, so a gate at 1.085 only ever caught a
+# defender the pass was played straight at. 2.5m is that closing distance, and it
+# is the geometric gate only -- intercept_probability_vec still has to clear
+# INTERCEPT_P_MIN on the TTI, so being in the corridor is necessary, not
+# sufficient.
+INTERCEPT_REACH = 2.5
 INTERCEPT_P_MIN = 0.80   # control probability that counts as a won interception. CALIBRATED
-BALL_SPEED      = 15.0   # mirrors engine.BALL_SPEED, kept local for the same reason as V_MAX
 LOB_DIST        = 25.0   # passes longer than this would be lofted in real play
+
+# Mirrors engine.pass_speed, kept local for the same reason as V_MAX. These MUST
+# match physics/engine.py: this is how long the defence thinks the ball will take,
+# and ball_mechanics is how long it actually takes, so a mismatch is a defence
+# solving the wrong pursuit problem. Fitted in
+# physics/validation/pass_speed_calibration.py.
+PASS_SPEED_A    = 4.5292
+PASS_SPEED_B    = 0.3537
+PASS_SPEED_MAX  = 14.93
+BALL_SPEED      = PASS_SPEED_MAX   # scalar upper bound, for callers that need one
+
+
+def pass_speed(length):
+    """Ball speed in m/s for a pass of this length, in metres."""
+    length = np.maximum(np.asarray(length, dtype=float), 1e-6)
+    return np.minimum(PASS_SPEED_A * length ** PASS_SPEED_B, PASS_SPEED_MAX)
 
 # Offside. Attackers attack x=105, so their own half is x < 52.5 and no pass
 # received there can be offside. Kept local for the same reason as V_MAX.
@@ -97,7 +124,8 @@ def intercept_pass(players, ball, rng, prev_pos, dt=0.1):
         return None
 
     lob = ball["flight_target"] - ball["flight_start"]
-    if np.sqrt(lob @ lob) > LOB_DIST:
+    pass_length = np.sqrt(lob @ lob)
+    if pass_length > LOB_DIST:
         return None
 
     dmask = players["team"] == "defender"
@@ -116,13 +144,13 @@ def intercept_pass(players, ball, rng, prev_pos, dt=0.1):
 
     delta = dpos - closest
     sq = np.einsum("ij,ij->i", delta, delta)
-    near = sq <= KICKABLE_AREA * KICKABLE_AREA
+    near = sq <= INTERCEPT_REACH * INTERCEPT_REACH
     if not near.any():
         return None
 
     # T is how long the pass still has to run
     to_target = ball["flight_target"] - ball["position"]
-    T = np.sqrt(to_target @ to_target) / BALL_SPEED
+    T = np.sqrt(to_target @ to_target) / pass_speed(pass_length)
 
     react_exp = players["i_p"][dmask][near]
     p = intercept_probability_vec(T, react_exp)
