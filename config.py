@@ -4,14 +4,16 @@ from dataclasses import dataclass
 class EnvConfig:
     n_att: int = 10
     n_def: int = 11
-    alpha: float = 1.0          # PC_F3 weight in Phi
-    beta: float = 2.0           # PC_HS weight in Phi
+    alpha: float = 1.0 # PC_F3 weight in Phi
+    beta: float = 2.0 # PC_HS weight in Phi
     terminal_bonus: float = 5.0
-    gamma: float = 0.99
+    # Discount, shared by the learner and the shaping term, potential-based
+    # shaping is only policy-invariant when the two match, so this is one knob
+    gamma: float = 0.999
     use_gamma_in_shaping: bool = True
     zero_terminal_potential: bool = True
-    pc_backend: str = "spearman"   # or "knn"
-    t_max: int = 300
+    pc_backend: str = "spearman" # or "knn"
+    t_max: int = 500
 
 @dataclass
 class PPOConfig:

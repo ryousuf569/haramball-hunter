@@ -231,10 +231,20 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 
 
 def run_simulation(n_att=10, n_def=11, seed=54, n_ticks=2500, interval_ms=None,
-                   show_zones=False, start_holder=1, show_ppcf=True):
+                   show_zones=False, start_holder=1, show_ppcf=True,
+                   checkpoint='baseline_500k.pt', deterministic=True, max_ticks=None):
     """Open a matplotlib window and animate the engine in real time.
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
+
+    checkpoint is a path to a train.py .pt file. Given one, the attackers are
+    driven by the learned policy (environment/learned_env.py) instead of the
+    scripted baseline; the defenders stay scripted either way. max_ticks only
+    matters then -- it is the horizon the policy's clock feature was normalised
+    against, so it has to match the training EnvConfig.t_max or the observation
+    is out of distribution. It defaults to None, meaning read EnvConfig.t_max,
+    so the two cannot drift apart; pass an int only to override deliberately.
+    deterministic=False samples the policy instead of taking each head's argmax.
 
     start_holder chooses which attacker kicks off with the ball (attacker row
     index; see make_initial_world). Change it to watch the low block react to
@@ -255,6 +265,16 @@ def run_simulation(n_att=10, n_def=11, seed=54, n_ticks=2500, interval_ms=None,
     """
     if interval_ms is None:
         interval_ms = int(DT * 1000)
+    if max_ticks is None:
+        from config import EnvConfig
+        max_ticks = EnvConfig.t_max
+
+    # Imported lazily: pulling in learned_env drags in torch, which the scripted
+    # render has no use for.
+    actor = None
+    if checkpoint is not None:
+        from environment.learned_env import learned_step, load_actor
+        actor = load_actor(checkpoint, n_att=n_att, n_def=n_def)
 
     # rng is only used inside make_initial_world (for starting positions); the
     # step loop is now fully scripted, so we don't thread it through.
@@ -281,9 +301,17 @@ def run_simulation(n_att=10, n_def=11, seed=54, n_ticks=2500, interval_ms=None,
         world["tick"] += 1
 
         t_step0 = time.perf_counter()
-        world["players"], world["ball"], pc_att, outcome = step(
-            world["players"], world["ball"], attacker_ids, defender_state,
-            world["tick"], ppcf_grid=ppcf_grid)
+        if actor is None:
+            world["players"], world["ball"], pc_att, outcome = step(
+                world["players"], world["ball"], attacker_ids, defender_state,
+                world["tick"], ppcf_grid=ppcf_grid)
+        else:
+            # tick - 1: the env counts ticks already elapsed (0 on the first
+            # step), and that count feeds the observation's clock feature.
+            world["players"], world["ball"], pc_att, outcome = learned_step(
+                world["players"], world["ball"], attacker_ids, defender_state,
+                world["tick"] - 1, actor, ppcf_grid=ppcf_grid,
+                max_ticks=max_ticks, deterministic=deterministic)
         step_ms = (time.perf_counter() - t_step0) * 1000.0
 
         t = world["tick"] * DT

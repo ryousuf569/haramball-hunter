@@ -65,5 +65,5 @@ def check_shot_opening(players, ball, pcf_att):
 
     # Both thresholds come from environment/calibration/
     return bool(pcf_in_area(position, pcf_att)[0] >= 0.30
-                and scoring_probability(position)[0] >= 0.779
+                and scoring_probability(position)[0] >= 0.74
                 and nearest_defender_distance(players, position[0]))

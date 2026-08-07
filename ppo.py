@@ -1,7 +1,8 @@
 from environment.thread_limits import limit_threads
-limit_threads()
+limit_threads(1, torch_threads=1)
 
 import os, random, time
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,7 +12,19 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import gymnasium as gym
 
-from environment.lowblock_env import LowBlockEnv
+from gymnasium.vector import AutoresetMode
+
+from environment.lowblock_env import (
+    LowBlockEnv,
+    make_vector_env,
+    ACTION_HEADS,
+    SUCCESS,
+    FAILURE,
+    TIMEOUT,
+    ball_actions as ball_actions_fn,
+    obs_dim as obs_dim_fn,
+    state_dim as state_dim_fn,)
+
 from environment.reward import RewardConfig
 from config import EnvConfig, PPOConfig
 
@@ -19,7 +32,7 @@ N_DIR = 9
 N_SPEED = 3 
 N_ATT = 10
 N_DEF = 11
-
+DIR, SPEED, BALL = 0, 1, 2
 BALL_ACTIONS = N_ATT
 OBS_DIM = 6 + 4*(N_ATT - 1) + 3*N_DEF + 27
 STATE_DIM = 4*(N_ATT + N_DEF) + 2 + 2 
@@ -71,8 +84,45 @@ class Critic(nn.Module):
         h = self.trunk(obs)
         return self.val(h)
 
+class MultiCategorial:
+    def __init__(self, logits_list, masks_list=None):
 
-def make_env(cfg: EnvConfig):
+        self.logits_list = list(logits_list)
+        self.masks_list = None if masks_list is None else list(masks_list)
+
+        if self.masks_list is not None:
+            assert len(self.masks_list) == len(self.logits_list)
+            masked = []
+            for logits, mask in zip(self.logits_list, self.masks_list):
+                if mask is None:
+                    masked.append(logits)
+                    continue
+                assert mask.any(dim=-1).all(), "row with zero legal actions"
+                masked.append(torch.where(
+                    mask, logits, torch.tensor(
+                        torch.finfo(logits.dtype).min,
+                        dtype=logits.dtype, device=logits.device)))
+            self.logits_list = masked
+        self.cats = [Categorical(logits=logits) for logits in self.logits_list]
+
+    def sample(self):
+        return torch.stack([c.sample() for c in self.cats], dim=-1)
+
+    def mode(self):
+        return torch.stack([c.logits.argmax(dim=-1) for c in self.cats], dim=-1)
+
+    def log_prob(self, actions):
+        return sum(c.log_prob(actions[:, i]) for i, c in enumerate(self.cats))
+
+    def entropy(self):
+        return sum(self.head_entropies())
+
+    def head_entropies(self):
+        return [c.entropy() for c in self.cats]
+
+
+
+def env_kwargs(cfg: EnvConfig):
     reward_cfg = RewardConfig(
         alpha=cfg.alpha,
         beta=cfg.beta,
@@ -80,7 +130,7 @@ def make_env(cfg: EnvConfig):
         terminal_bonus=cfg.terminal_bonus,
         use_gamma=cfg.use_gamma_in_shaping,
         zero_terminal_potential=cfg.zero_terminal_potential)
-    return LowBlockEnv(
+    return dict(
         n_att=cfg.n_att,
         n_def=cfg.n_def,
         max_ticks=cfg.t_max,
@@ -88,16 +138,307 @@ def make_env(cfg: EnvConfig):
         scripted_attackers=False)
 
 
-env = make_env(EnvConfig())
-a = Actor(env.obs_dim, N_DIR, N_SPEED, env.ball_actions)
-c = Critic(env.state_dim, 1)
+def make_env(cfg: EnvConfig):
+    return LowBlockEnv(**env_kwargs(cfg))
 
-d, s, b = a(torch.zeros(4, env.obs_dim))
-assert d.shape == (4, N_DIR) and s.shape == (4, N_SPEED) and b.shape == (4, env.ball_actions)
-assert c(torch.zeros(4, env.state_dim)).shape == (4, 1)
-assert d.abs().max() < 0.1, "policy head init too large"
 
-# critic head should NOT be tiny, catches the std=0.01 bug
-v = c(torch.randn(64, env.state_dim))
-assert v.std() > 0.05, "value head init too small, should be std=1.0, not 0.01"
-print('all tests pass')
+def make_venv(cfg: EnvConfig, n_envs, seed=None, asynchronous=True):
+    return make_vector_env(n_envs=n_envs, asynchronous=asynchronous, seed=seed,
+                           autoreset_mode=AutoresetMode.SAME_STEP,
+                           **env_kwargs(cfg))
+
+
+# global_state()'s tail is [..., pc_f3, pc_hs, remaining_time], so Phi is
+# recoverable from the rollout with no second pitch-control call.
+STATE_PC_F3, STATE_PC_HS = -3, -2
+
+
+def episode_outcomes(info):
+    """(outcomes, ticks) for episodes that ended on this vector step"""
+    final = info.get("final_info")
+    if not final or "outcome" not in final:
+        return [], []
+    outcomes, ticks = final["outcome"], final.get("tick")
+    live = [i for i, o in enumerate(outcomes) if o is not None]
+    return ([outcomes[i] for i in live],
+            [] if ticks is None else [float(ticks[i]) for i in live])
+
+
+def phi_r2(phi, returns):
+    """r^2 of the best linear predictor of the return from Phi alone"""
+    p = phi.reshape(-1)
+    if p.std() == 0 or returns.std() == 0:
+        return float("nan")
+    p = p - p.mean()
+    r = returns - returns.mean()
+    return float((p @ r) ** 2 / ((p @ p) * (r @ r)))
+
+
+def explained_variance(values, returns):
+    var_returns = returns.var()
+    if var_returns == 0:
+        return float("nan")
+    return float(1 - (returns - values).var() / var_returns)
+
+
+class RolloutBuffer:
+
+    def __init__(self, n_steps, n_envs, n_att, obs_dim, state_dim, ball_actions, device="cpu"):
+        self.n_steps, self.n_envs = n_steps, n_envs
+        self.obs = torch.zeros(n_steps, n_envs, n_att, obs_dim, device=device)
+        self.masks = torch.zeros(n_steps, n_envs, n_att, ball_actions, dtype=torch.bool, device=device)
+        self.actions = torch.zeros(n_steps, n_envs, n_att, ACTION_HEADS, dtype=torch.long, device=device)
+        self.logprobs = torch.zeros(n_steps, n_envs, n_att, device=device)
+        self.states = torch.zeros(n_steps, n_envs, state_dim, device=device)
+        self.values = torch.zeros(n_steps, n_envs, device=device)
+        self.rewards = torch.zeros(n_steps, n_envs, device=device)
+        self.dones = torch.zeros(n_steps, n_envs, device=device)
+        self.ptr = 0
+
+    def reset(self):
+        self.ptr = 0
+
+    def add(self, obs, mask, state, action, logprob, value, reward, done):
+        t = self.ptr
+        assert t < self.n_steps, "buffer full, call reset()"
+        self.obs[t] = obs
+        self.masks[t] = mask
+        self.states[t] = state
+        self.actions[t] = action
+        self.logprobs[t] = logprob
+        self.values[t] = value
+        self.rewards[t] = reward
+        self.dones[t] = done
+        self.ptr += 1
+
+    def flat(self):
+        """Collapse (T, E) -> B, leaving the agent axis intact."""
+        return dict(
+            obs=self.obs.flatten(0, 1), # (B, n_att, obs_dim)
+            masks=self.masks.flatten(0, 1), # (B, n_att, ball_actions)
+            actions=self.actions.flatten(0, 1), # (B, n_att, 3)
+            logprobs=self.logprobs.flatten(0, 1), # (B, n_att)
+            states=self.states.flatten(0, 1), # (B, state_dim)
+            values=self.values.reshape(-1)) # (B,)
+
+def compute_gae(rewards, values, dones, next_value, next_done, gamma, lam):
+    T = rewards.shape[0]
+    advantages = torch.zeros_like(rewards)
+    lastgaelam = torch.zeros_like(rewards[0])
+    for t in reversed(range(T)):
+        if t == T - 1:
+            nextnonterminal = 1.0 - next_done
+            nextvalues = next_value
+        else:
+            nextnonterminal = 1.0 - dones[t + 1]
+            nextvalues = values[t + 1]
+        delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
+        lastgaelam = delta + gamma * lam * nextnonterminal * lastgaelam
+        advantages[t] = lastgaelam
+    return advantages, advantages + values
+
+def ppo_losses(newlogprob, entropy, newvalue, old_logprob, advantages, returns, cfg: PPOConfig):
+
+    adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    adv = adv.unsqueeze(-1)
+
+    logratio = newlogprob - old_logprob
+    ratio = logratio.exp()
+    pg_loss = torch.max(-adv * ratio, -adv * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef),).mean()
+
+    v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
+    entropy_loss = entropy.mean()
+
+    loss = pg_loss - cfg.ent_coef * entropy_loss + cfg.vf_coef * v_loss
+    with torch.no_grad():
+        approx_kl = ((ratio - 1) - logratio).mean()
+        clipfrac = ((ratio - 1).abs() > cfg.clip_coef).float().mean()
+    return loss, pg_loss, v_loss, entropy_loss, approx_kl, clipfrac
+
+def policy_dist(actor, obs, mask):
+    """obs (N, n_att, obs_dim), mask (N, n_att, ball_actions) -> one
+    MultiCategorial over N*n_att flattened agent rows."""
+    flat_obs = obs.flatten(0, 1)
+    flat_mask = mask.flatten(0, 1)
+    d, s, b = actor(flat_obs)
+    return MultiCategorial([d, s, b], [None, None, flat_mask])
+
+
+def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
+          torch_threads=None):
+    cfg = cfg if cfg is not None else PPOConfig()
+    env_cfg = env_cfg if env_cfg is not None else EnvConfig()
+    if torch_threads is None:
+        torch_threads = max(1, (os.cpu_count() or 2) // 2)
+    torch.set_num_threads(torch_threads)
+
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    device = torch.device("cpu")
+
+    n_att, n_def = env_cfg.n_att, env_cfg.n_def
+    n_players = n_att + n_def
+    obs_dim = obs_dim_fn(n_players)
+    state_dim = state_dim_fn(n_players, n_att)
+    n_ball = ball_actions_fn(n_att)
+
+    venv = make_venv(env_cfg, cfg.n_envs, seed=cfg.seed,
+                     asynchronous=asynchronous)
+
+    actor = Actor(obs_dim, N_DIR, N_SPEED, n_ball).to(device)
+    critic = Critic(state_dim, 1).to(device)
+    opt = optim.Adam(list(actor.parameters()) + list(critic.parameters()),
+                     lr=cfg.lr, eps=1e-5)
+
+    buf = RolloutBuffer(cfg.n_steps, cfg.n_envs, n_att, obs_dim, state_dim,
+                        n_ball, device)
+
+    # batch_size counts env-steps, not agent-steps: it is the unit the critic,
+    # the reward and the advantage all live on.
+    batch_size = cfg.n_envs * cfg.n_steps
+    minibatch_size = batch_size // cfg.n_minibatches
+    n_updates = cfg.total_timesteps // batch_size
+
+    # gamma and t_max are coupled (see EnvConfig.gamma). Printed so a horizon
+    # far shorter than the episode, which silently kills the terminal bonus,
+    # is visible at startup rather than inferred from a flat success rate.
+    horizon = 1.0 / (1.0 - env_cfg.gamma)
+    bonus_at_0 = env_cfg.gamma ** env_cfg.t_max * env_cfg.terminal_bonus
+    print(f"horizon {horizon:.0f} ticks (gamma {env_cfg.gamma}) vs episode "
+          f"{env_cfg.t_max} ticks | success from kickoff worth "
+          f"{bonus_at_0:.3f}")
+    if horizon < env_cfg.t_max / 4:
+        print("  WARNING: discount horizon << episode length, the terminal "
+              "bonus is effectively invisible from the start of an episode")
+
+    def to_t(x, dtype=torch.float32):
+        return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
+
+    obs_np, info = venv.reset(seed=cfg.seed)
+    next_obs = to_t(obs_np)
+    next_mask = to_t(info["action_mask"], torch.bool)
+    next_state = to_t(info["state"])
+    next_done = torch.zeros(cfg.n_envs, device=device)
+
+    global_step = 0
+    start = time.time()
+    ep_return = np.zeros(cfg.n_envs) # undiscounted, per env
+    ep_disc = np.zeros(cfg.n_envs) # discounted from each episode's own t=0
+    ep_t = np.zeros(cfg.n_envs, dtype=np.int64)
+    recent = deque(maxlen=100) # (outcome, ticks, undiscounted return)
+
+    for update in range(1, n_updates + 1):
+        buf.reset()
+        outcomes, ep_lens, ep_returns = [], [], []
+        t_update = time.time()
+
+        for _ in range(cfg.n_steps):
+            with torch.no_grad():
+                dist = policy_dist(actor, next_obs, next_mask)
+                action = dist.sample() # (E*n_att, 3)
+                logprob = dist.log_prob(action) # (E*n_att,)
+                value = critic(next_state).squeeze(-1) # (E,)
+            action = action.view(cfg.n_envs, n_att, ACTION_HEADS)
+
+            obs_np, reward, term, trunc, info = venv.step(action.cpu().numpy())
+
+            buf.add(next_obs, next_mask, next_state, action,
+                    logprob.view(cfg.n_envs, n_att), value,
+                    to_t(reward), next_done)
+
+            done = np.logical_or(term, trunc)
+            r = np.asarray(reward)
+            ep_return += r
+            ep_disc += (env_cfg.gamma ** ep_t) * r
+            ep_t += 1
+            if done.any():
+                outs, ticks = episode_outcomes(info)
+                rets = ep_return[done].tolist()
+                discs = ep_disc[done].tolist()
+                outcomes += outs
+                ep_lens += ticks
+                ep_returns += rets
+                recent.extend(zip(outs, ticks, rets, discs))
+                ep_return[done] = 0.0
+                ep_disc[done] = 0.0
+                ep_t[done] = 0
+
+            next_obs = to_t(obs_np)
+            next_mask = to_t(info["action_mask"], torch.bool)
+            next_state = to_t(info["state"])
+            next_done = to_t(done)
+            global_step += cfg.n_envs
+
+        with torch.no_grad():
+            next_value = critic(next_state).squeeze(-1)
+            advantages, returns = compute_gae(
+                buf.rewards, buf.values, buf.dones, next_value, next_done,
+                env_cfg.gamma, cfg.gae_lambda)
+
+        b = buf.flat()
+        b_adv = advantages.reshape(-1)
+        b_ret = returns.reshape(-1)
+
+        idx = np.arange(batch_size)
+        for _ in range(cfg.update_epochs):
+            np.random.shuffle(idx)
+            for s in range(0, batch_size, minibatch_size):
+                mb = idx[s:s + minibatch_size]
+
+                dist = policy_dist(actor, b["obs"][mb], b["masks"][mb])
+                mb_actions = b["actions"][mb].flatten(0, 1)   # (mb*n_att, 3)
+                newlogprob = dist.log_prob(mb_actions).view(len(mb), n_att)
+                entropy = dist.entropy().view(len(mb), n_att)
+                newvalue = critic(b["states"][mb]).squeeze(-1)
+
+                loss, pg_loss, v_loss, ent, approx_kl, clipfrac = ppo_losses(
+                    newlogprob, entropy, newvalue, b["logprobs"][mb],
+                    b_adv[mb], b_ret[mb], cfg)
+
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(actor.parameters()) + list(critic.parameters()),
+                    cfg.max_grad_norm)
+                opt.step()
+
+        ev = explained_variance(b["values"], b_ret)
+        phi = (env_cfg.alpha * buf.states[..., STATE_PC_F3]
+               + env_cfg.beta * buf.states[..., STATE_PC_HS])
+
+        w_out = [o for o, _, _, _ in recent]
+        w_len = [t for _, t, _, _ in recent]
+        w_ret = [r for _, _, r, _ in recent]
+        w_disc = [d for _, _, _, d in recent]
+        rate = lambda k: (w_out.count(k) / len(w_out) if w_out
+                          else float("nan"))
+        mean = lambda xs: float(np.mean(xs)) if xs else float("nan")
+
+        dt = time.time() - t_update
+        sps = int(batch_size / dt)
+        avg_sps = int(global_step / (time.time() - start))
+        print(f"upd {update}/{n_updates} | step {global_step} | "
+              f"{sps} sps (avg {avg_sps})")
+        print(f"  loss   pg {pg_loss.item():+.4f}  v {v_loss.item():.4f}  "
+              f"ent {ent.item():.3f}  kl {approx_kl.item():.4f}  "
+              f"clipfrac {clipfrac.item():.3f}")
+        print(f"  value  ev {ev:+.3f} (phi_r2 {phi_r2(phi, b_ret):.3f})  "
+              f"ret_std {b_ret.std().item():.4f}  "
+              f"ret_mean {b_ret.mean().item():+.4f}  "
+              f"adv_std {b_adv.std().item():.4f}")
+        print(f"  eps    +{len(outcomes):2d} (win {len(recent):3d})  "
+              f"success {rate(SUCCESS):.3f}  failure {rate(FAILURE):.3f}  "
+              f"timeout {rate(TIMEOUT):.3f}  "
+              f"len {mean(w_len):5.1f}  ret {mean(w_ret):+.3f} "
+              f"(disc {mean(w_disc):+.3f})")
+        print(f"  phi    min {phi.min().item():.4f}  "
+              f"mean {phi.mean().item():.4f}  max {phi.max().item():.4f}  "
+              f"std {phi.std().item():.4f}")
+
+    venv.close()
+    return actor, critic
+
+
+if __name__ == "__main__":
+    train()

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "haramball-hunter"
+version = "0.1.0"
+description = "Multi-agent PPO for breaking a low block"
+readme = "README.md"
+requires-python = ">=3.13"
+
+# Versions are the ones this was developed against.
+dependencies = [
+    "numpy==2.2.6",
+    "gymnasium==1.2.3",
+    "pandas==2.3.3",
+    "matplotlib==3.10.7",
+    "torch==2.13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+calibration = ["statsbombpy==1.21.0"]
+
+[project.scripts]
+train = "train:main"
+
+[tool.setuptools]
+py-modules = ["config", "ppo", "render", "schema", "train"]
+
+[tool.setuptools.packages.find]
+include = ["environment*", "physics*", "attackers*", "defenders*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

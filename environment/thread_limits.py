@@ -7,7 +7,8 @@ import os
 _THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")
 
 
-def limit_threads(n=1):
+def limit_threads(n=1, torch_threads=None):
+    """Pin BLAS/OpenMP to n threads per process."""
     value = str(n)
     for var in _THREAD_VARS:
         os.environ[var] = value
@@ -18,6 +19,6 @@ def limit_threads(n=1):
     except ImportError:
         pass
     else:
-        torch.set_num_threads(n)
+        torch.set_num_threads(n if torch_threads is None else torch_threads)
 
     return {var: os.environ[var] for var in _THREAD_VARS}
