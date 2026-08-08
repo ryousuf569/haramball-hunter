@@ -32,7 +32,13 @@ EPS          = 1e-6
 # sufficient.
 INTERCEPT_REACH = 2.5
 INTERCEPT_P_MIN = 0.80   # control probability that counts as a won interception. CALIBRATED
-LOB_DIST        = 25.0   # passes longer than this would be lofted in real play
+LOB_DIST        = 25.0   # passes longer than this are lofted
+# A lofted ball used to be uninterceptable outright, which made any pass over
+# 25m free. It is not free in real play: it clears the defence on the way up and
+# comes back down onto a contested landing spot. So a loft is only contestable
+# once it is past LOFT_DESCENT of its flight, and with a reduced reach there.
+LOFT_DESCENT    = 0.6
+LOFT_REACH      = 0.6    # fraction of INTERCEPT_REACH kept on a lofted ball
 
 # Mirrors engine.pass_speed, kept local for the same reason as V_MAX. These MUST
 # match physics/engine.py: this is how long the defence thinks the ball will take,
@@ -125,8 +131,13 @@ def intercept_pass(players, ball, rng, prev_pos, dt=0.1):
 
     lob = ball["flight_target"] - ball["flight_start"]
     pass_length = np.sqrt(lob @ lob)
+
+    reach = INTERCEPT_REACH
     if pass_length > LOB_DIST:
-        return None
+        flown = ball["position"] - ball["flight_start"]
+        if np.sqrt(flown @ flown) < LOFT_DESCENT * pass_length:
+            return None
+        reach = INTERCEPT_REACH * LOFT_REACH
 
     dmask = players["team"] == "defender"
     dpos = players["position"][dmask]
@@ -144,7 +155,7 @@ def intercept_pass(players, ball, rng, prev_pos, dt=0.1):
 
     delta = dpos - closest
     sq = np.einsum("ij,ij->i", delta, delta)
-    near = sq <= INTERCEPT_REACH * INTERCEPT_REACH
+    near = sq <= reach * reach
     if not near.any():
         return None
 

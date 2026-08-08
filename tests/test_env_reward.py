@@ -24,6 +24,8 @@ from environment.lowblock_env import (  # noqa: E402
     make_vector_env,
     norm_pos,
     norm_vel,
+    obs_clock_idx,
+    obs_dim,
 )
 from environment.reward import (  # noqa: E402
     attacker_control,
@@ -92,15 +94,22 @@ def test_env_telescoping_identity():
     # The seeds are picked, not a range: at max_ticks=120 the probe policy ends
     # nearly every episode in a turnover, and the identity has a different shape
     # on the other two endings (success pays terminal_bonus on top of the
-    # shaping; timeout zeroes Phi with no bonus). 10 and 17 reach a shot opening,
-    # 34 and 36 run the clock out. The assert at the bottom is what stops this
-    # from silently degrading back into eight turnovers.
+    # shaping; timeout zeroes Phi with no bonus). 5, 21 and 25 reach a shot
+    # opening, 3, 29 and 34 run the clock out. The assert at the bottom is what
+    # stops this from silently degrading back into seven turnovers.
+    #
+    # The probe passes on a slower cadence and sprints less than it used to.
+    # Passes are contestable at every length now and are collected by whoever is
+    # nearest where they land, so an east-biased sprint that releases every 8
+    # ticks aims every ball at a receiver who has already run 13m off it: under
+    # the old settings all seven seeds ended in a turnover and only the failure
+    # branch was being tested.
     outcomes = {}
-    for seed in (0, 1, 2, 10, 17, 34, 36):
+    for seed in (0, 1, 2, 5, 21, 25, 3, 29, 34):
         env = LowBlockEnv(max_ticks=120, scripted_attackers=False)
         _obs, info = env.reset(seed=seed)
         phi_0 = info["phi_0"]
-        act = _probe_policy(env, seed)
+        act = _probe_policy(env, seed, pass_every=40, east_bias=0.2)
         mask = info["action_mask"]
 
         total = 0.0
@@ -233,7 +242,7 @@ def test_obs_state_and_mask_shapes():
     env = LowBlockEnv(max_ticks=50, scripted_attackers=False)
     obs, info = env.reset(seed=0)
 
-    assert obs.shape == (env.n_att, 92), obs.shape
+    assert obs.shape == (env.n_att, obs_dim(env.n_players, env.n_att)), obs.shape
     assert obs.dtype == np.float32
     assert info["state"].shape == (99,), info["state"].shape
     assert info["state"].dtype == np.float32
@@ -250,7 +259,7 @@ def test_obs_state_and_mask_shapes():
 
     for t in range(40):
         obs, _r, term, _trunc, info = env.step(_hold_action(env))
-        assert obs.shape == (env.n_att, 92)
+        assert obs.shape == (env.n_att, obs_dim(env.n_players, env.n_att))
         assert info["state"].shape == (99,)
         assert info["action_mask"].shape == (env.n_att, env.ball_actions)
         assert info["action_mask"].sum(axis=1).min() >= 1, (
@@ -260,19 +269,21 @@ def test_obs_state_and_mask_shapes():
 
 
 def test_remaining_time_is_in_obs_and_state():
-    # Last obs column and last state entry, both counting 1 -> 0 over the
-    # horizon. Without it the same board at tick 10 and tick 299 is one input.
+    # Counts 1 -> 0 over the horizon in both encodings. Without it the same
+    # board at tick 10 and tick 299 is one input. The obs column is looked up
+    # rather than assumed to be last: the pitch-control tail sits after it.
     max_ticks = 25
     env = LowBlockEnv(max_ticks=max_ticks, scripted_attackers=False)
+    clock = obs_clock_idx(env.n_players)
     obs, info = env.reset(seed=13)
-    assert np.allclose(obs[:, -1], 1.0), obs[:, -1]
+    assert np.allclose(obs[:, clock], 1.0), obs[:, clock]
     assert info["state"][-1] == np.float32(1.0)
 
     for t in range(1, max_ticks + 1):
         obs, _r, term, _trunc, info = env.step(_hold_action(env))
         expected = np.float32(1.0 - t / max_ticks)
-        assert np.allclose(obs[:, -1], expected), (
-            f"tick {t}: obs clock {obs[0, -1]} != {expected}")
+        assert np.allclose(obs[:, clock], expected), (
+            f"tick {t}: obs clock {obs[0, clock]} != {expected}")
         assert np.allclose(info["state"][-1], expected)
         if term:
             break
@@ -317,17 +328,59 @@ def test_actor_and_critic_share_one_normalization():
             f"attacker {i}: ego velocity != its roster slot")
 
 
+def test_agent_one_hot_distinguishes_the_rows():
+    # Without it the shared weights are a function of where you are standing, so
+    # two attackers at the same point are guaranteed the same action
+    # distribution and no assignment of ten players to ten roles exists.
+    env = LowBlockEnv(max_ticks=40, scripted_attackers=False)
+    obs, info = env.reset(seed=11)
+    tail = obs[:, -env.n_att:]
+    assert np.array_equal(tail, np.eye(env.n_att, dtype=np.float32)), tail
+
+    # And it must survive a step, and stack the same way for every attacker.
+    for _ in range(10):
+        obs, _r, term, _trunc, info = env.step(_hold_action(env))
+        assert np.array_equal(obs[:, -env.n_att:],
+                              np.eye(env.n_att, dtype=np.float32))
+        if term:
+            break
+
+    # Two attackers standing in the same place still get distinct rows.
+    env.players["position"][1] = env.players["position"][0]
+    env.players["velocity"][1] = env.players["velocity"][0]
+    rows = env.obs()
+    assert not np.array_equal(rows[0], rows[1]), (
+        "co-located attackers produce identical observations")
+
+
+def test_agent_reward_is_per_attacker():
+    env = LowBlockEnv(max_ticks=40, scripted_attackers=False)
+    _obs, info = env.reset(seed=2)
+    assert info["agent_reward"].shape == (env.n_att,), info["agent_reward"].shape
+    assert np.array_equal(info["agent_reward"], np.zeros(env.n_att)), (
+        "reset should seed the per-agent potential, not pay on it")
+
+    for _ in range(15):
+        _obs, _r, term, _trunc, info = env.step(_action(env, EAST, FULL_SPEED))
+        ar = info["agent_reward"]
+        assert ar.shape == (env.n_att,) and np.isfinite(ar).all(), ar
+        if term:
+            break
+    assert ar.std() > 0.0, "every attacker was paid the same; is this a team scalar?"
+
+
 def test_vector_env_shapes_hold_up():
     # SyncVectorEnv validates against the declared spaces, and batches the obs to
     # (n_envs, n_att, 92) -- the wrappers are single-agent and treat the agent
     # axis as part of the observation shape. That is what we want; it just means
     # the leading axis of everything out of here is n_envs.
     n_envs, n_steps = 6, 100
+    OBS_W = obs_dim(21, 10)
     venv = make_vector_env(n_envs=n_envs, max_ticks=40,
                            scripted_attackers=False)
     try:
         obs, info = venv.reset(seed=0)
-        assert obs.shape == (n_envs, 10, 92), obs.shape
+        assert obs.shape == (n_envs, 10, OBS_W), obs.shape
         assert np.asarray(info["state"]).shape == (n_envs, 99)
         assert np.asarray(info["action_mask"]).shape == (n_envs, 10, 10)
 
@@ -335,7 +388,7 @@ def test_vector_env_shapes_hold_up():
             action = venv.action_space.sample()
             assert action.shape == (n_envs, 10, ACTION_HEADS), action.shape
             obs, r, term, trunc, info = venv.step(action)
-            assert obs.shape == (n_envs, 10, 92), f"step {t}: {obs.shape}"
+            assert obs.shape == (n_envs, 10, OBS_W), f"step {t}: {obs.shape}"
             assert r.shape == (n_envs,)
             assert term.shape == (n_envs,) and trunc.shape == (n_envs,)
             assert np.asarray(info["state"]).shape == (n_envs, 99)
@@ -398,15 +451,23 @@ def test_learned_attackers_bypass_the_baseline():
 
 def test_commanded_velocity_reaches_the_integrator():
     # Attackers move straight off the physics: hold a constant target and the
-    # integrator should ramp them onto it at A_MAX and hold there.
+    # integrator should ramp them onto it at A_MAX and hold there -- unless the
+    # target runs them into a line, which now zeroes that velocity component
+    # rather than leaving them pinned at x=105 advertising 5 m/s.
     env = LowBlockEnv(max_ticks=200, scripted_attackers=False)
     env.reset(seed=5)
     for _ in range(30):
         env.step(_action(env, EAST, FULL_SPEED))
 
+    att_pos = np.asarray(env.players["position"][:env.n_att], dtype=float)
     att_vel = np.asarray(env.players["velocity"][:env.n_att], dtype=float)
-    assert np.allclose(att_vel, [5.0, 0.0], atol=1e-3), (
-        f"attacker velocities {att_vel} did not converge on the commanded target")
+    at_line = att_pos[:, 0] >= 105.0 - 1e-6
+    assert at_line.any(), "seed 5 used to run at least one attacker into the line"
+
+    assert np.allclose(att_vel[~at_line], [5.0, 0.0], atol=1e-3), (
+        f"attacker velocities {att_vel[~at_line]} did not converge on the target")
+    assert np.allclose(att_vel[at_line, 0], 0.0), (
+        f"attackers held against the line still carry x-velocity {att_vel[at_line]}")
 
 
 def test_pass_action_decodes_to_the_holder_slot():
@@ -479,6 +540,8 @@ def main():
         test_obs_state_and_mask_shapes,
         test_remaining_time_is_in_obs_and_state,
         test_actor_and_critic_share_one_normalization,
+        test_agent_one_hot_distinguishes_the_rows,
+        test_agent_reward_is_per_attacker,
         test_vector_env_shapes_hold_up,
         test_learned_attackers_bypass_the_baseline,
         test_commanded_velocity_reaches_the_integrator,

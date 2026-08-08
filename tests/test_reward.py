@@ -11,15 +11,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dataclasses import replace  # noqa: E402
 
-from environment.lowblock_env import make_initial_world, make_ppcf_grid  # noqa: E402
+from environment.lowblock_env import (  # noqa: E402
+    compute_attacker_ppcf,
+    make_initial_world,
+    make_ppcf_grid,
+)
 from environment.reward import (  # noqa: E402
     FAILURE,
     SUCCESS,
     TIMEOUT,
     RewardConfig,
+    agent_potential,
+    agent_shaping,
     build_zone_masks,
     make_pcf_state,
     phi,
+    reset_agent_potential,
     reset_potential,
     step_reward,
 )
@@ -130,7 +137,7 @@ def test_static_state_living_cost():
     return phi_s, expected
 
 
-def test_terminal_bonus_only_on_success():
+def test_terminal_reward_is_signed_per_outcome():
     players0, _ = _world()
     ppcf_result = _ppcf(players0)
 
@@ -140,13 +147,19 @@ def test_terminal_bonus_only_on_success():
         reset_potential(players0, ppcf_result, F3_MASK, HS_MASK, pcf_state, CFG)
         _, parts = step_reward(players0, ppcf_result, F3_MASK, HS_MASK,
                                pcf_state, CFG, outcome=outcome)
-        got[outcome] = parts["terminal_bonus"]
+        got[outcome] = parts["terminal_reward"]
         assert parts["terminal"], f"{outcome} should be terminal"
         assert parts["phi_next"] == 0.0, f"{outcome}: terminal potential not zeroed"
 
     assert got[SUCCESS] == CFG.terminal_bonus, got
-    assert got[FAILURE] == 0.0 and got[TIMEOUT] == 0.0, (
-        f"no failure/timeout penalty by design, got {got}")
+    assert got[FAILURE] == CFG.turnover_penalty, got
+    assert got[TIMEOUT] == CFG.timeout_penalty, got
+
+    # Ordering reversed from the original -2 timeout / -1 turnover. That way
+    # round, conceding possession was cheaper than running the clock out from
+    # any state with less than a 1/7 chance of a shot opening, which is most of
+    # them -- so the objective paid a losing policy to give the ball away.
+    assert got[FAILURE] <= got[TIMEOUT] < got[SUCCESS], got
 
 
 def test_components_are_reported():
@@ -157,10 +170,10 @@ def test_components_are_reported():
 
     reward, parts = step_reward(players0, ppcf_result, F3_MASK, HS_MASK,
                                 pcf_state, CFG)
-    for key in ("reward", "shaping", "terminal_bonus", "phi_prev", "phi_next",
+    for key in ("reward", "shaping", "terminal_reward", "phi_prev", "phi_next",
                 "pc_f3", "pc_hs", "terminal", "outcome"):
         assert key in parts, f"missing component {key}"
-    assert abs(reward - (parts["shaping"] + parts["terminal_bonus"])) <= TOL
+    assert abs(reward - (parts["shaping"] + parts["terminal_reward"])) <= TOL
 
 
 def test_phi_scale_is_order_one():
@@ -175,15 +188,80 @@ def test_phi_scale_is_order_one():
         assert phi_s <= CFG.alpha + CFG.beta + TOL, phi_s
 
 
+N_ATT = 10
+
+
+def _pc_att(players, ball_pos):
+    return compute_attacker_ppcf(players, GRID, ball_pos)
+
+
+def _agent_rollout(rng, n_steps, jitter=3.0):
+    players0, ball = _world()
+    states = [players0] + _random_rollout(players0, rng, n_steps, jitter)
+    return states, np.asarray(ball["position"], dtype=float)
+
+
+def test_agent_shaping_telescopes_per_agent():
+    # Same guarantee as the team term, made ten times over: the per-attacker
+    # shaping is potential-based, so sum gamma^t F_i,t == -phi_i(s0) for each
+    # agent independently, whatever the ten of them did in between.
+    cfg = replace(CFG, agent_alpha=1.0)
+    for seed in (0, 1, 2):
+        rng = np.random.default_rng(seed)
+        states, ball_pos = _agent_rollout(rng, 4 + int(rng.integers(0, 4)))
+
+        pcf_state = make_pcf_state()
+        phi_0 = reset_agent_potential(pcf_state, _pc_att(states[0], ball_pos),
+                                      states[0]["position"][:N_ATT])
+
+        total = np.zeros(N_ATT)
+        for t, players in enumerate(states[1:]):
+            last = (t == len(states) - 2)
+            f = agent_shaping(pcf_state, _pc_att(players, ball_pos),
+                              players["position"][:N_ATT], cfg, terminal=last)
+            total += (cfg.gamma ** t) * f
+
+        assert np.abs(total + phi_0).max() <= TOL, (
+            f"seed {seed}: per-agent totals {total} != {-phi_0}")
+
+
+def test_agent_shaping_is_actually_per_agent():
+    # The whole point: the ten numbers must differ. If they did not, this would
+    # be the team scalar again under a new name.
+    players, ball = _world()
+    phi_i = agent_potential(_pc_att(players, np.asarray(ball["position"], dtype=float)),
+                            players["position"][:N_ATT])
+    assert phi_i.shape == (N_ATT,), phi_i.shape
+    assert phi_i.std() > 1e-3, f"per-agent potentials are all but identical: {phi_i}"
+    assert ((phi_i >= 0.0) & (phi_i <= 1.0)).all(), phi_i
+
+
+def test_agent_alpha_zero_switches_the_term_off():
+    cfg = replace(CFG, agent_alpha=0.0)
+    rng = np.random.default_rng(0)
+    states, ball_pos = _agent_rollout(rng, 4)
+
+    pcf_state = make_pcf_state()
+    reset_agent_potential(pcf_state, _pc_att(states[0], ball_pos),
+                          states[0]["position"][:N_ATT])
+    for players in states[1:]:
+        f = agent_shaping(pcf_state, _pc_att(players, ball_pos),
+                          players["position"][:N_ATT], cfg)
+        assert np.array_equal(f, np.zeros(N_ATT)), f
+
+
 def main():
     failures = 0
     tests = [
         test_telescoping_identity,
         test_telescoping_needs_terminal_zeroing,
         test_static_state_living_cost,
-        test_terminal_bonus_only_on_success,
+        test_terminal_reward_is_signed_per_outcome,
         test_components_are_reported,
         test_phi_scale_is_order_one,
+        test_agent_shaping_telescopes_per_agent,
+        test_agent_shaping_is_actually_per_agent,
+        test_agent_alpha_zero_switches_the_term_off,
     ]
     for fn in tests:
         try:

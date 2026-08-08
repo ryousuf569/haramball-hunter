@@ -30,13 +30,16 @@ from defenders.turnover import (
     apply_turnover,
 )
 from environment.grid import PC_NX, PC_NY, PC_CELL_SIZE
-from environment.termination import check_shot_opening
+from environment.termination import check_shot_opening, pcf_in_area
 from environment.reward import (
     RewardConfig,
+    agent_shaping,
     build_zone_masks,
     make_pcf_state,
+    reset_agent_potential,
     reset_potential_from_pc_att,
     step_reward_from_pc_att,
+    zone_value,
 )
 from attackers.calibrate_attacker_formation import sample_attacker_formation
 from defenders.calibrate_defender_formation import sample_defender_formation
@@ -75,9 +78,27 @@ def ball_actions(n_att):
 
 
 # Widths as functions of the roster, so a different n_att still lines up.
-def obs_dim(n_players):
+def obs_dim(n_players, n_att):
     # 4 ego + 4*n_players roster + 2 ball + 1 in-flight + 1 clock
-    return 4 + 4 * n_players + 4
+    # + 3 nearest-defender + 1 local pitch control + 2 zone pitch control
+    # + n_att agent one-hot
+    return 4 + 4 * n_players + 4 + 6 + n_att
+
+
+# Distance at which a defender stops mattering, for the nearest-defender
+# feature. Raw metres over the pitch diagonal would squash every distance that
+# matters (0-15 m) into the bottom tenth of the range; clipping here spends the
+# whole [0, 1] on the band where pressure actually changes behaviour.
+PRESSURE_RADIUS = 25.0
+
+
+def obs_clock_idx(n_players):
+    """Column of the remaining-time feature in build_obs' layout.
+
+    It used to be the last column; the pitch-control tail now sits after it, so
+    anything reading obs[:, -1] for the clock is reading pc_hs instead.
+    """
+    return 4 + 4 * n_players + 3
 
 
 def state_dim(n_players, n_att):
@@ -95,6 +116,15 @@ def norm_pos(pos):
 def norm_vel(vel):
     """Velocities -> [-1, 1]^2 (the integrator already caps speed at V_MAX)."""
     return (np.asarray(vel, dtype="f4") / np.float32(V_MAX)).astype("f4")
+
+
+def remaining_time(tick, max_ticks):
+    """Fraction of the horizon left, in [0, 1]. Not redundant: timeout is a
+    terminal here, not a truncation, so the same position is worth very
+    different amounts at tick 10 and tick 299. Without the clock the two are one
+    input and the env stops being Markov in the observation -- Pardo et al.,
+    Time Limits in Reinforcement Learning (2018). Do not delete it."""
+    return float(np.clip(1.0 - tick / max_ticks, 0.0, 1.0))
 
 
 # Row 0 keeper, 1-5 backline, 6-9 midfield, 10 forward -- the layout
@@ -128,6 +158,100 @@ _pc_corners = local_to_global(np.array([[0.0, 0.0],
                                          PC_NY * PC_CELL_SIZE]]))
 PC_EXTENT = (_pc_corners[0, 0], _pc_corners[1, 0],
              _pc_corners[0, 1], _pc_corners[1, 1])
+
+
+def nearest_defender_feats(players, n_att):
+    """(n_att, 3) float32: [unit vector toward nearest defender, scaled distance].
+
+    Rows n_att: are the defenders -- the same fixed roster order obs() uses.
+
+    A unit vector plus a separate magnitude rather than a raw relative vector:
+    the direction stays fully informative at any range, and the magnitude gets
+    its own clipped scale (see PRESSURE_RADIUS). The raw coordinates are already
+    in the observation, so this adds no information the network could not in
+    principle derive -- it adds it in the form the decision actually uses,
+    which is the difference between learnable and learnable in this lifetime.
+    """
+    att = np.asarray(players["position"][:n_att], dtype=float)
+    dfn = np.asarray(players["position"][n_att:], dtype=float)
+
+    delta = dfn[None, :, :] - att[:, None, :]        # (n_att, n_def, 2)
+    dist = np.linalg.norm(delta, axis=-1)            # (n_att, n_def)
+
+    rows = np.arange(len(att))
+    j = dist.argmin(axis=1)
+    v, d = delta[rows, j], dist[rows, j]
+
+    # d == 0 means a defender is standing exactly on the attacker; the zero
+    # vector is the honest answer for "which way", same guard as TTI_vec.
+    unit = v / np.where(d > 0, d, 1.0)[:, None]
+    scaled = np.minimum(d, PRESSURE_RADIUS) / PRESSURE_RADIUS
+    return np.concatenate([unit, scaled[:, None]], axis=1).astype("f4")
+
+
+def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
+              normalization="mean"):
+    """Per-agent observations, float32 (n_att, obs_dim). THE one implementation.
+
+    Row i is attacker i:
+        [0:4]     own position, own velocity
+        [4:88]    all 21 players, norm_pos block then norm_vel block, fixed
+                  roster order (attackers :n_att, then defenders)
+        [88:90]   ball position
+        [90]      ball in-flight flag
+        [91]      remaining time
+        [92:95]   nearest defender: unit vector (2), scaled distance (1)
+        [95]      local attacker pitch control, mean over the cells within
+                  termination.AREA_RADIUS of this attacker
+        [96:98]   pc_f3, pc_hs -- the two zone values Phi is built from
+        [98:108]  agent one-hot -- which of the n_att rows this is
+
+    Everything from index 4 to 92 is shared across rows; the ego prefix and the
+    last six are per-agent (bar the two zone values). The ego prefix is what
+    lets one set of weights act as ten agents, and duplicates the self slot
+    because the network cannot otherwise find it.
+
+    The one-hot is what makes a formation representable at all. Without it the
+    shared weights are a pure function of where you are standing, so two
+    attackers at the same point are guaranteed the same action distribution and
+    nothing can assign ten players to ten distinct roles.
+
+    pc_att is the (PC_NX, PC_NY) attacker-control surface for the state being
+    observed -- the same one step() already computes for the shot test, so the
+    new features cost no extra pitch-control call. Callers must pass the
+    surface matching THIS state; a stale one silently teaches the wrong thing.
+
+    LowBlockEnv.obs and learned_env.obs both route here. They used to be
+    hand-kept clones, which is a standing invitation for the inference path to
+    feed a policy a layout it was not trained on.
+    """
+    pos = norm_pos(players["position"])
+    vel = norm_vel(players["velocity"])
+
+    flat_pc = np.asarray(pc_att, dtype=float).reshape(-1)
+    shared = np.concatenate([
+        pos.reshape(-1),
+        vel.reshape(-1),
+        norm_pos(ball["position"]).reshape(-1),
+        np.array([ball["state"] == "in_flight",
+                  remaining_time(tick, max_ticks)], dtype="f4"),
+    ])
+    zones = np.array([zone_value(flat_pc, f3_mask, normalization),
+                      zone_value(flat_pc, hs_mask, normalization)], dtype="f4")
+
+    ego = np.concatenate([pos[:n_att], vel[:n_att]], axis=1)
+    near = nearest_defender_feats(players, n_att)
+    local_pc = pcf_in_area(
+        np.asarray(players["position"][:n_att], dtype=float),
+        np.asarray(pc_att, dtype=float).reshape(PC_NX, PC_NY),
+    ).astype("f4")[:, None]
+
+    tail = np.broadcast_to(zones, (n_att, zones.size))
+    agent_id = np.eye(n_att, dtype="f4")
+    return np.concatenate(
+        [ego, np.broadcast_to(shared, (n_att, shared.size)),
+         near, local_pc, tail, agent_id],
+        axis=1).astype("f4")
 
 
 def compute_attacker_ppcf(players, ppcf_grid, ball_pos):
@@ -234,7 +358,10 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
             pc_att = compute_attacker_ppcf(players, ppcf_grid, ball["position"])
         return players, ball, pc_att, FAILURE
 
-    ball = ball_mechanics(ball, players, pass_decision)
+    # The rng gives the pass its placement error; a scattered ball can land
+    # nearer a defender than the intended receiver, which is what ball_mechanics
+    # resolves. Same generator as the duels, so one seed still fixes the episode.
+    ball = ball_mechanics(ball, players, pass_decision, defender_state["rng"])
 
     # 5) attacker pitch control on the post-integration state. Runs before the
     #    turnover checks because it also caches each player's TTI to the ball in
@@ -260,6 +387,18 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
             ball = apply_turnover(ball, winner)
             if verbose:
                 print(f"    TURNOVER (intercept) tick {tick_count}: defender {winner} cut out the pass")
+            if exit_on_turnover:
+                sys.exit()
+
+    # A pass that arrived this tick can have been collected by a defender rather
+    # than cut out mid-flight -- ball_mechanics gives it to whoever is nearest
+    # the landing spot. Neither turnover test above sees that, so check it here.
+    if winner is None and ball["state"] == "held":
+        holder = ball.get("holder_id")
+        if holder is not None and players["team"][players["id"] == holder][0] == DEFENDER_LABEL:
+            winner = int(holder)
+            if verbose:
+                print(f"    TURNOVER (loose pass) tick {tick_count}: defender {winner} collected it")
             if exit_on_turnover:
                 sys.exit()
 
@@ -324,7 +463,7 @@ class LowBlockEnv(gym.Env):
         n_players = n_att + n_def
         self.n_players = n_players
         self.ball_actions = ball_actions(n_att)
-        self.obs_dim = obs_dim(n_players)
+        self.obs_dim = obs_dim(n_players, n_att)
         self.state_dim = state_dim(n_players, n_att)
 
         # Bounds are the unit box, not pitch metres -- see norm_pos/norm_vel.
@@ -332,8 +471,16 @@ class LowBlockEnv(gym.Env):
         ego_hi = [1.0, 1.0, 1.0, 1.0]
         pos_lo, pos_hi = np.zeros(2 * n_players), np.ones(2 * n_players)
         vel_lo, vel_hi = -np.ones(2 * n_players), np.ones(2 * n_players)
-        row_lo = np.concatenate([ego_lo, pos_lo, vel_lo, [0.0, 0.0], [0.0], [0.0]])
-        row_hi = np.concatenate([ego_hi, pos_hi, vel_hi, [1.0, 1.0], [1.0], [1.0]])
+        # Tail, in build_obs order: nearest-defender unit vector (2, in
+        # [-1, 1]), its scaled distance (1), local pitch control (1), then
+        # pc_f3/pc_hs -- unbounded above for the same reason as the critic's,
+        # normalization="area" puts them in square metres.
+        near_lo, near_hi = [-1.0, -1.0, 0.0], [1.0, 1.0, 1.0]
+        pc_lo, pc_hi = [0.0, 0.0, 0.0], [1.0, np.inf, np.inf]
+        row_lo = np.concatenate([ego_lo, pos_lo, vel_lo, [0.0, 0.0], [0.0],
+                                 [0.0], near_lo, pc_lo, np.zeros(n_att)])
+        row_hi = np.concatenate([ego_hi, pos_hi, vel_hi, [1.0, 1.0], [1.0],
+                                 [1.0], near_hi, pc_hi, np.ones(n_att)])
         self.observation_space = gym.spaces.Box(
             low=np.tile(row_lo, (n_att, 1)).astype("f4"),
             high=np.tile(row_hi, (n_att, 1)).astype("f4"),
@@ -364,43 +511,23 @@ class LowBlockEnv(gym.Env):
         # pitch-control call.
         self.pc_f3 = 0.0
         self.pc_hs = 0.0
+        # The full (PC_NX, PC_NY) surface, kept so obs() can read local pitch
+        # control off it. reset() fills it before the first obs() call.
+        self.pc_att = None
 
     def remaining_time(self):
-        """Fraction of the horizon left, in [0, 1]. Not redundant: timeout is a
-        terminal here, not a truncation, so the same position is worth very
-        different amounts at tick 10 and tick 299. Without the clock the two are
-        one input and the env stops being Markov in the observation -- Pardo et
-        al., Time Limits in Reinforcement Learning (2018). Do not delete it.
-        """
-        return float(np.clip(1.0 - self.tick / self.max_ticks, 0.0, 1.0))
+        return remaining_time(self.tick, self.max_ticks)
 
     def obs(self):
-        """Per-agent observations, float32 (n_att, obs_dim). Row i is attacker i:
+        """See build_obs -- this is a thin binding of it to the env's state.
 
-            [0:4]    own position, own velocity
-            [4:88]   all 21 players, norm_pos block then norm_vel block, in
-                     fixed roster order (attackers :n_att, then defenders)
-            [88:90]  ball position
-            [90]     ball in-flight flag
-            [91]     remaining time
-
-        Rows share everything from index 4 on. The ego prefix is what lets one
-        set of weights act as ten agents, and duplicates the self slot because
-        the network cannot otherwise find it.
+        self.pc_att is the surface from the step that produced the current
+        state, so the observation's pitch-control features describe the state
+        the policy is about to act in, not the one before it.
         """
-        pos = norm_pos(self.players["position"])
-        vel = norm_vel(self.players["velocity"])
-        shared = np.concatenate([
-            pos.reshape(-1),
-            vel.reshape(-1),
-            norm_pos(self.ball["position"]).reshape(-1),
-            np.array([self.ball["state"] == "in_flight",
-                      self.remaining_time()], dtype="f4"),
-        ])
-        ego = np.concatenate([pos[:self.n_att], vel[:self.n_att]], axis=1)
-        return np.concatenate(
-            [ego, np.broadcast_to(shared, (self.n_att, shared.size))],
-            axis=1).astype("f4")
+        return build_obs(self.players, self.ball, self.n_att, self.tick,
+                         self.max_ticks, self.pc_att, self.f3_mask,
+                         self.hs_mask, self.cfg.normalization)
 
     def holder_row(self):
         """Attacker row holding the ball, or None if it is in flight or a
@@ -478,11 +605,15 @@ class LowBlockEnv(gym.Env):
             pc_att, self.f3_mask, self.hs_mask, self.pcf_state, self.cfg)
         self.pc_f3 = parts["pc_f3"]
         self.pc_hs = parts["pc_hs"]
+        self.pc_att = pc_att
+        reset_agent_potential(self.pcf_state, pc_att,
+                              self.players["position"][:self.n_att])
 
         return self.obs(), {"phi_0": phi_0, "pc_f3": parts["pc_f3"],
                             "pc_hs": parts["pc_hs"], "tick": self.tick,
                             "state": self.global_state(),
-                            "action_mask": self.action_mask()}
+                            "action_mask": self.action_mask(),
+                            "agent_reward": np.zeros(self.n_att, dtype="f4")}
 
     def decode_action(self, action):
         """(n_att, 3) of (direction, speed, ball) -> the two arrays step() wants.
@@ -530,9 +661,20 @@ class LowBlockEnv(gym.Env):
 
         self.pc_f3 = parts["pc_f3"]
         self.pc_hs = parts["pc_hs"]
+        # world_step only returns a surface when it was given a grid; it always
+        # is here, but keep the last one rather than write None into obs().
+        if pc_att is not None:
+            self.pc_att = pc_att
         parts["tick"] = self.tick
         parts["state"] = self.global_state()
         parts["action_mask"] = self.action_mask()
+        # Per-attacker shaping, on the same surface. It rides alongside the
+        # scalar reward rather than inside it: the team reward stays exactly
+        # what reward_readme.md describes, and the learner adds this per agent.
+        parts["agent_reward"] = agent_shaping(
+            self.pcf_state, self.pc_att,
+            self.players["position"][:self.n_att], self.cfg,
+            terminal=terminated).astype("f4")
         return self.obs(), float(reward), terminated, truncated, parts
 
 

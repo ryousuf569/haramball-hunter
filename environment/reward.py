@@ -1,7 +1,8 @@
 import numpy as np
 from collections import deque
 from dataclasses import dataclass
-from environment.grid import PC_CELL_SIZE
+from environment.grid import PC_CELL_SIZE, PC_NX, PC_NY
+from environment.termination import pcf_in_area
 
 CELL_AREA = PC_CELL_SIZE ** 2
 ATTACKER_LABEL = "attacker"
@@ -24,8 +25,11 @@ class RewardConfig:
     alpha: float = 1.0 # weight on final-third control
     beta: float = 1.0 # extra weight on the half-space corridors
     gamma: float = 0.99 # must match the learner's discount
-    terminal_bonus: float = 5.0 # B, paid on SUCCESS only
+    terminal_bonus: float = 5.0 # B, paid on SUCCESS
+    turnover_penalty: float = -1.0 # FAILURE
+    timeout_penalty: float = -0.5 # TIMEOUT, and never harsher than a turnover
     normalization: str = "mean" # see zone_value: "mean" is O(1), "area" is m^2
+    agent_alpha: float = 0.5 # weight on the per-attacker local shaping term
     use_gamma: bool = True # flag 1: gamma in the shaping term
     zero_terminal_potential: bool = True # flag 2: Phi(terminal) := 0
 
@@ -38,6 +42,7 @@ class RewardConfig:
 def make_pcf_state():
     return {
         "prev_pcf": deque(maxlen=2),
+        "prev_agent": None,
     }
 
 
@@ -132,8 +137,15 @@ def is_terminal(outcome):
 
 
 def terminal_reward(outcome, cfg):
-    # B on success, 0 on turnover and timeout
-    return cfg.terminal_bonus if outcome == SUCCESS else 0.0
+    # Signed, and no longer a "bonus": B on success, and a penalty on each of
+    # the two ways of not scoring. Non-terminal steps pay 0.
+    if outcome == SUCCESS:
+        return cfg.terminal_bonus
+    if outcome == FAILURE:
+        return cfg.turnover_penalty
+    if outcome == TIMEOUT:
+        return cfg.timeout_penalty
+    return 0.0
 
 
 def reset_potential_from_pc_att(pc_att, f3_mask, hs_mask, pcf_state, cfg):
@@ -165,7 +177,7 @@ def step_reward_from_pc_att(pc_att, f3_mask, hs_mask, pcf_state, cfg, outcome=No
     components = {
         "reward": reward,
         "shaping": shaping,
-        "terminal_bonus": bonus,
+        "terminal_reward": bonus,
         "phi_prev": phi_prev,
         "phi_next": 0.0 if (terminal and cfg.zero_terminal_potential) else phi_s,
         "pc_f3": parts["pc_f3"],
@@ -174,6 +186,28 @@ def step_reward_from_pc_att(pc_att, f3_mask, hs_mask, pcf_state, cfg, outcome=No
         "outcome": outcome,
     }
     return reward, components
+
+def agent_potential(pc_att, att_pos):
+    grid = np.asarray(pc_att, dtype=float).reshape(PC_NX, PC_NY)
+    return pcf_in_area(np.asarray(att_pos, dtype=float), grid)
+
+
+def reset_agent_potential(pcf_state, pc_att, att_pos):
+    phi_i = agent_potential(pc_att, att_pos)
+    pcf_state["prev_agent"] = phi_i
+    return phi_i
+
+
+def agent_shaping(pcf_state, pc_att, att_pos, cfg, terminal=False):
+    phi_i = agent_potential(pc_att, att_pos)
+    prev = pcf_state.get("prev_agent")
+    arriving = (np.zeros_like(phi_i)
+                if (terminal and cfg.zero_terminal_potential) else phi_i)
+    g = cfg.gamma if cfg.use_gamma else 1.0
+
+    out = np.zeros_like(phi_i) if prev is None else g * arriving - prev
+    pcf_state["prev_agent"] = phi_i
+    return cfg.agent_alpha * out
 
 
 def step_reward(players, ppcf_result, f3_mask, hs_mask, pcf_state, cfg, outcome=None):

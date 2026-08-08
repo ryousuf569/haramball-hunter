@@ -17,6 +17,7 @@ from environment.lowblock_env import (
     make_ppcf_grid,
     step,
 )
+from environment.reward import build_zone_masks
 
 # --- style -------------------------------------------------------------
 PITCH_COLOR = "#1e5631"
@@ -230,9 +231,9 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # state to render_frame.
 
 
-def run_simulation(n_att=10, n_def=11, seed=0, n_ticks=2500, interval_ms=None,
+def run_simulation(n_att=10, n_def=11, seed=42, n_ticks=2500, interval_ms=None,
                    show_zones=False, start_holder=1, show_ppcf=True,
-                   checkpoint='baseline_500k.pt', deterministic=True, max_ticks=None):
+                   checkpoint='5M_baseline_policy.pt', deterministic=True, max_ticks=None):
     """Open a matplotlib window and animate the engine in real time.
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
@@ -292,8 +293,12 @@ def run_simulation(n_att=10, n_def=11, seed=0, n_ticks=2500, interval_ms=None,
     # mutable state carried across FuncAnimation frames. step_ms/render_ms
     # accumulate the per-tick cost split so the running means below aren't
     # dominated by whichever tick happened to be slow.
+    # Zone masks are a pure function of the grid, so build them once alongside
+    # it. pc_att starts None; learned_step seeds it on the first tick.
+    zone_masks = build_zone_masks(ppcf_grid)
+
     world = {"players": players, "ball": ball, "tick": 0,
-             "step_ms": 0.0, "render_ms": 0.0}
+             "step_ms": 0.0, "render_ms": 0.0, "pc_att": None}
 
     budget_ms = DT * 1000.0
 
@@ -308,10 +313,15 @@ def run_simulation(n_att=10, n_def=11, seed=0, n_ticks=2500, interval_ms=None,
         else:
             # tick - 1: the env counts ticks already elapsed (0 on the first
             # step), and that count feeds the observation's clock feature.
+            # pc_att is threaded back in: the policy's observation needs the
+            # surface for the state it is acting in, and that is the one the
+            # previous tick already computed.
             world["players"], world["ball"], pc_att, outcome = learned_step(
                 world["players"], world["ball"], attacker_ids, defender_state,
                 world["tick"] - 1, actor, ppcf_grid=ppcf_grid,
-                max_ticks=max_ticks, deterministic=deterministic)
+                max_ticks=max_ticks, deterministic=deterministic,
+                pc_att=world["pc_att"], zone_masks=zone_masks)
+            world["pc_att"] = pc_att
         step_ms = (time.perf_counter() - t_step0) * 1000.0
 
         t = world["tick"] * DT

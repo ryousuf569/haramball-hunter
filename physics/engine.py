@@ -14,10 +14,37 @@ PASS_SPEED_B = 0.3537
 PASS_SPEED_MAX = 14.93   # median speed of real passes over 25m; the fit is capped here
 BALL_SPEED = PASS_SPEED_MAX   # scalar upper bound, for callers that need one
 
+# Placement error, as a fraction of pass length, and how far the intended
+# receiver may be from where the ball lands and still collect it. Without these
+# a pass is a teleport: the ball snapped onto the target's release-time position
+# and changed hands however far the target had since run, which made a long ball
+# strictly safer than keeping it.
+PASS_SIGMA = 0.03
+RECEPTION_RADIUS = 3.0
+
+PITCH_X = 105.0
+PITCH_Y = 68.0
+
 
 def pass_speed(length):
     length = np.maximum(np.asarray(length, dtype=float), 1e-6)
     return np.minimum(PASS_SPEED_A * length ** PASS_SPEED_B, PASS_SPEED_MAX)
+
+
+def pass_scatter(length, rng):
+    if rng is None:
+        return np.zeros(2)
+    return rng.normal(0.0, PASS_SIGMA * float(length), size=2)
+
+
+def receiver_at(players, position, target_id):
+    # The intended target gets it if it is still near the landing spot, else
+    # whoever is closest does -- which may be a defender.
+    target_pos = get_position_by_id(players, target_id)
+    if np.linalg.norm(np.asarray(target_pos, dtype=float) - position) <= RECEPTION_RADIUS:
+        return target_id
+    delta = np.asarray(players['position'], dtype=float) - position
+    return int(players['id'][np.argmin(np.einsum('ij,ij->i', delta, delta))])
 
 ball = {
     'state': str,
@@ -79,7 +106,7 @@ def ball_action(ball_idx, holder_id, player_ids):
     else:
         return holder_id, False, None
 
-def ball_mechanics(ball, players, pass_decision):
+def ball_mechanics(ball, players, pass_decision, rng=None):
     holder_id, is_pass, target_id = pass_decision
     ball = dict(ball)  # copy, don't mutate caller's dict
 
@@ -88,6 +115,10 @@ def ball_mechanics(ball, players, pass_decision):
             # holder just released it -- freeze start/target, switch to flight
             start_pos = get_position_by_id(players, holder_id)
             target_pos = get_position_by_id(players, target_id)
+            length = np.linalg.norm(np.asarray(target_pos, dtype=float)
+                                    - np.asarray(start_pos, dtype=float))
+            target_pos = (np.asarray(target_pos, dtype=float)
+                          + pass_scatter(length, rng)).astype('f4')
 
             ball['state'] = 'in_flight'
             ball['holder_id'] = None
@@ -112,7 +143,9 @@ def ball_mechanics(ball, players, pass_decision):
             # arrives this tick -- snap, don't overshoot
             ball['position'] = ball['flight_target']
             ball['state'] = 'held'
-            ball['holder_id'] = ball['target_id']
+            ball['holder_id'] = receiver_at(
+                players, np.asarray(ball['flight_target'], dtype=float),
+                ball['target_id'])
             ball['target_id'] = None
         else:
             direction = remaining_vector / remaining_distance
@@ -138,8 +171,13 @@ def kinematics_integrator(players, target_velocities):
     acceleration_realized = (new_velocity - players['velocity']) / DT
     new_position = players['position'] + players['velocity'] * DT + 0.5 * acceleration_realized * DT**2
 
-    new_position[:, 0] = np.clip(new_position[:, 0], 0.0, 105.0)
-    new_position[:, 1] = np.clip(new_position[:, 1], 0.0, 68.0)
+    # Clip position AND kill the velocity component that ran into the line.
+    # Clipping alone left a player pinned at x=105 advertising 5 m/s it was not
+    # travelling, and made the boundary a free place to park.
+    for axis, hi in ((0, PITCH_X), (1, PITCH_Y)):
+        outside = (new_position[:, axis] < 0.0) | (new_position[:, axis] > hi)
+        new_velocity[outside, axis] = 0.0
+        new_position[:, axis] = np.clip(new_position[:, axis], 0.0, hi)
 
     players = players.copy()
     players['velocity'] = new_velocity

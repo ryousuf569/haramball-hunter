@@ -29,13 +29,11 @@ from environment.reward import RewardConfig
 from config import EnvConfig, PPOConfig
 
 N_DIR = 9
-N_SPEED = 3 
+N_SPEED = 3
 N_ATT = 10
 N_DEF = 11
 DIR, SPEED, BALL = 0, 1, 2
 BALL_ACTIONS = N_ATT
-OBS_DIM = 6 + 4*(N_ATT - 1) + 3*N_DEF + 27
-STATE_DIM = 4*(N_ATT + N_DEF) + 2 + 2 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -65,24 +63,60 @@ class Actor(nn.Module):
         return self.head1(h), self.head2(h), self.head3(h)
 
 class Critic(nn.Module):
+    """One value head per attacker. The reward is per-agent now, so the value
+    has to be too; the input is still the global state, so the heads differ by
+    slot rather than by what they can see."""
 
     def __init__(self, state, n1):
-    
+
             super().__init__()
-    
-            # 3 layer network
-            # obs_dim -> 256 -> 256
+
+            # obs_dim -> 256 -> 256 -> 256. The two-layer version explained 5%
+            # of the return variance on-policy, which made the advantages mostly
+            # value error.
             self.trunk = nn.Sequential(
                 layer_init(nn.Linear(state, 256)),
                 nn.Tanh(),
                 layer_init(nn.Linear(256, 256)),
+                nn.Tanh(),
+                layer_init(nn.Linear(256, 256)),
                 nn.Tanh())
-    
+
             self.val = layer_init(nn.Linear(256, n1), std=1.0)
 
     def forward(self, obs):
         h = self.trunk(obs)
         return self.val(h)
+
+
+class RunningNorm:
+    """Running mean/std of the value targets. The critic regresses normalised
+    returns and its output is scaled back for GAE, so a reward scale that drifts
+    over training does not keep re-scaling the value loss."""
+
+    def __init__(self):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 1e-4
+
+    def update(self, x):
+        bm, bv, bc = float(x.mean()), float(x.var()), x.numel()
+        total = self.count + bc
+        d = bm - self.mean
+        self.mean += d * bc / total
+        self.var = ((self.var * self.count + bv * bc
+                     + d * d * self.count * bc / total) / total)
+        self.count = total
+
+    @property
+    def std(self):
+        return max(self.var ** 0.5, 1e-6)
+
+    def normalize(self, x):
+        return (x - self.mean) / self.std
+
+    def denormalize(self, x):
+        return x * self.std + self.mean
 
 class MultiCategorial:
     def __init__(self, logits_list, masks_list=None):
@@ -120,6 +154,26 @@ class MultiCategorial:
     def head_entropies(self):
         return [c.entropy() for c in self.cats]
 
+    def masked_head_entropies(self):
+        """One scalar per head, averaged over rows that have a real choice.
+
+        A row masked down to a single legal action has entropy exactly 0 and no
+        gradient. Averaging those in -- which entropy().mean() does -- scaled the
+        ball head's regulariser by the fraction of rows holding the ball, about
+        0.4%, while the two movement heads took the full coefficient on every
+        row. That asymmetry is why the ball head collapsed and the movement heads
+        never left uniform."""
+        out = []
+        masks = self.masks_list or [None] * len(self.cats)
+        for c, mask in zip(self.cats, masks):
+            e = c.entropy()
+            if mask is None:
+                out.append(e.mean())
+                continue
+            live = mask.sum(-1) > 1
+            out.append(e[live].mean() if live.any() else e.sum() * 0.0)
+        return out
+
 
 
 def env_kwargs(cfg: EnvConfig):
@@ -128,6 +182,9 @@ def env_kwargs(cfg: EnvConfig):
         beta=cfg.beta,
         gamma=cfg.gamma,
         terminal_bonus=cfg.terminal_bonus,
+        turnover_penalty=cfg.turnover_penalty,
+        timeout_penalty=cfg.timeout_penalty,
+        agent_alpha=cfg.agent_alpha,
         use_gamma=cfg.use_gamma_in_shaping,
         zero_terminal_potential=cfg.zero_terminal_potential)
     return dict(
@@ -164,13 +221,30 @@ def episode_outcomes(info):
             [] if ticks is None else [float(ticks[i]) for i in live])
 
 
+def agent_rewards(info, done, n_envs, n_att):
+    """(n_envs, n_att) per-attacker shaping for this vector step.
+
+    Under SAME_STEP autoreset a terminated env's info is the one reset() built,
+    so the terminal step's per-agent reward is in final_info instead -- taking
+    the top-level array there would silently pair the team's terminal reward
+    with the next episode's shaping."""
+    out = np.asarray(info["agent_reward"], dtype=np.float32).reshape(n_envs, n_att)
+    final = info.get("final_info")
+    if final is not None and "agent_reward" in final:
+        have = np.asarray(final["_agent_reward"], dtype=bool)
+        fin = np.asarray(final["agent_reward"], dtype=np.float32).reshape(n_envs, n_att)
+        out = np.where((have & done)[:, None], fin, out)
+    return out
+
+
 def phi_r2(phi, returns):
     """r^2 of the best linear predictor of the return from Phi alone"""
     p = phi.reshape(-1)
-    if p.std() == 0 or returns.std() == 0:
+    r = returns.reshape(-1)
+    if p.std() == 0 or r.std() == 0:
         return float("nan")
     p = p - p.mean()
-    r = returns - returns.mean()
+    r = r - r.mean()
     return float((p @ r) ** 2 / ((p @ p) * (r @ r)))
 
 
@@ -190,9 +264,10 @@ class RolloutBuffer:
         self.actions = torch.zeros(n_steps, n_envs, n_att, ACTION_HEADS, dtype=torch.long, device=device)
         self.logprobs = torch.zeros(n_steps, n_envs, n_att, device=device)
         self.states = torch.zeros(n_steps, n_envs, state_dim, device=device)
-        self.values = torch.zeros(n_steps, n_envs, device=device)
-        self.rewards = torch.zeros(n_steps, n_envs, device=device)
-        self.dones = torch.zeros(n_steps, n_envs, device=device)
+        # Per-agent now: one value head and one reward channel per attacker.
+        self.values = torch.zeros(n_steps, n_envs, n_att, device=device)
+        self.rewards = torch.zeros(n_steps, n_envs, n_att, device=device)
+        self.dones = torch.zeros(n_steps, n_envs, 1, device=device)
         self.ptr = 0
 
     def reset(self):
@@ -219,7 +294,7 @@ class RolloutBuffer:
             actions=self.actions.flatten(0, 1), # (B, n_att, 3)
             logprobs=self.logprobs.flatten(0, 1), # (B, n_att)
             states=self.states.flatten(0, 1), # (B, state_dim)
-            values=self.values.reshape(-1)) # (B,)
+            values=self.values.flatten(0, 1)) # (B, n_att)
 
 def compute_gae(rewards, values, dones, next_value, next_done, gamma, lam):
     T = rewards.shape[0]
@@ -237,23 +312,25 @@ def compute_gae(rewards, values, dones, next_value, next_done, gamma, lam):
         advantages[t] = lastgaelam
     return advantages, advantages + values
 
-def ppo_losses(newlogprob, entropy, newvalue, old_logprob, advantages, returns, cfg: PPOConfig):
-
+def ppo_losses(newlogprob, ent_terms, newvalue, old_logprob, advantages, returns, cfg: PPOConfig):
+    # advantages, returns, newvalue and newlogprob are all (mb, n_att): the
+    # advantage is the agent's own now, not one team scalar broadcast ten ways.
     adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-    adv = adv.unsqueeze(-1)
 
     logratio = newlogprob - old_logprob
     ratio = logratio.exp()
     pg_loss = torch.max(-adv * ratio, -adv * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef),).mean()
 
     v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
-    entropy_loss = entropy.mean()
 
-    loss = pg_loss - cfg.ent_coef * entropy_loss + cfg.vf_coef * v_loss
+    coefs = (cfg.ent_coef_dir, cfg.ent_coef_speed, cfg.ent_coef_ball)
+    entropy_loss = sum(c * e for c, e in zip(coefs, ent_terms))
+
+    loss = pg_loss - entropy_loss + cfg.vf_coef * v_loss
     with torch.no_grad():
         approx_kl = ((ratio - 1) - logratio).mean()
         clipfrac = ((ratio - 1).abs() > cfg.clip_coef).float().mean()
-    return loss, pg_loss, v_loss, entropy_loss, approx_kl, clipfrac
+    return loss, pg_loss, v_loss, sum(ent_terms), approx_kl, clipfrac
 
 def policy_dist(actor, obs, mask):
     """obs (N, n_att, obs_dim), mask (N, n_att, ball_actions) -> one
@@ -279,7 +356,7 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
 
     n_att, n_def = env_cfg.n_att, env_cfg.n_def
     n_players = n_att + n_def
-    obs_dim = obs_dim_fn(n_players)
+    obs_dim = obs_dim_fn(n_players, n_att)
     state_dim = state_dim_fn(n_players, n_att)
     n_ball = ball_actions_fn(n_att)
 
@@ -287,9 +364,10 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
                      asynchronous=asynchronous)
 
     actor = Actor(obs_dim, N_DIR, N_SPEED, n_ball).to(device)
-    critic = Critic(state_dim, 1).to(device)
+    critic = Critic(state_dim, n_att).to(device)
     opt = optim.Adam(list(actor.parameters()) + list(critic.parameters()),
                      lr=cfg.lr, eps=1e-5)
+    ret_norm = RunningNorm()
 
     buf = RolloutBuffer(cfg.n_steps, cfg.n_envs, n_att, obs_dim, state_dim,
                         n_ball, device)
@@ -304,10 +382,16 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
     # far shorter than the episode, which silently kills the terminal bonus,
     # is visible at startup rather than inferred from a flat success rate.
     horizon = 1.0 / (1.0 - env_cfg.gamma)
-    bonus_at_0 = env_cfg.gamma ** env_cfg.t_max * env_cfg.terminal_bonus
-    print(f"horizon {horizon:.0f} ticks (gamma {env_cfg.gamma}) vs episode "
-          f"{env_cfg.t_max} ticks | success from kickoff worth "
-          f"{bonus_at_0:.3f}")
+    discount_at_T = env_cfg.gamma ** env_cfg.t_max
+    credit = 1.0 / (1.0 - env_cfg.gamma * cfg.gae_lambda)
+    print(f"obs {obs_dim} state {state_dim} | horizon {horizon:.0f} ticks "
+          f"(gamma {env_cfg.gamma}) vs episode {env_cfg.t_max} ticks")
+    print(f"  GAE credit window 1/(1-gamma*lambda) = {credit:.0f} ticks "
+          f"(lambda {cfg.gae_lambda})")
+    print(f"  terminals from kickoff (x gamma^T = {discount_at_T:.3f}):  "
+          f"success {discount_at_T * env_cfg.terminal_bonus:+.3f}  "
+          f"turnover {discount_at_T * env_cfg.turnover_penalty:+.3f}  "
+          f"timeout {discount_at_T * env_cfg.timeout_penalty:+.3f}")
     if horizon < env_cfg.t_max / 4:
         print("  WARNING: discount horizon << episode length, the terminal "
               "bonus is effectively invisible from the start of an episode")
@@ -319,7 +403,7 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
     next_obs = to_t(obs_np)
     next_mask = to_t(info["action_mask"], torch.bool)
     next_state = to_t(info["state"])
-    next_done = torch.zeros(cfg.n_envs, device=device)
+    next_done = torch.zeros(cfg.n_envs, 1, device=device)
 
     global_step = 0
     start = time.time()
@@ -338,17 +422,23 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
                 dist = policy_dist(actor, next_obs, next_mask)
                 action = dist.sample() # (E*n_att, 3)
                 logprob = dist.log_prob(action) # (E*n_att,)
-                value = critic(next_state).squeeze(-1) # (E,)
+                value = ret_norm.denormalize(critic(next_state)) # (E, n_att)
             action = action.view(cfg.n_envs, n_att, ACTION_HEADS)
 
             obs_np, reward, term, trunc, info = venv.step(action.cpu().numpy())
 
+            done = np.logical_or(term, trunc)
+            # Each attacker is paid the team reward plus its own local shaping.
+            # Both are potential-based, so neither moves the optimum; the second
+            # is the only part of the signal an individual attacker controls.
+            r = np.asarray(reward)
+            agent_r = (r[:, None]
+                       + agent_rewards(info, done, cfg.n_envs, n_att))
+
             buf.add(next_obs, next_mask, next_state, action,
                     logprob.view(cfg.n_envs, n_att), value,
-                    to_t(reward), next_done)
+                    to_t(agent_r), next_done)
 
-            done = np.logical_or(term, trunc)
-            r = np.asarray(reward)
             ep_return += r
             ep_disc += (env_cfg.gamma ** ep_t) * r
             ep_t += 1
@@ -367,18 +457,23 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
             next_obs = to_t(obs_np)
             next_mask = to_t(info["action_mask"], torch.bool)
             next_state = to_t(info["state"])
-            next_done = to_t(done)
+            next_done = to_t(done).unsqueeze(-1)
             global_step += cfg.n_envs
 
         with torch.no_grad():
-            next_value = critic(next_state).squeeze(-1)
+            next_value = ret_norm.denormalize(critic(next_state))
             advantages, returns = compute_gae(
                 buf.rewards, buf.values, buf.dones, next_value, next_done,
                 env_cfg.gamma, cfg.gae_lambda)
 
         b = buf.flat()
-        b_adv = advantages.reshape(-1)
-        b_ret = returns.reshape(-1)
+        b_adv = advantages.flatten(0, 1)
+        b_ret = returns.flatten(0, 1)
+        # Critic regresses normalised targets; the stats come from this batch
+        # before it is used, so the value it produced above is not rescaled
+        # halfway through an update.
+        ret_norm.update(b_ret)
+        b_ret_n = ret_norm.normalize(b_ret)
 
         idx = np.arange(batch_size)
         for _ in range(cfg.update_epochs):
@@ -389,12 +484,12 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
                 dist = policy_dist(actor, b["obs"][mb], b["masks"][mb])
                 mb_actions = b["actions"][mb].flatten(0, 1)   # (mb*n_att, 3)
                 newlogprob = dist.log_prob(mb_actions).view(len(mb), n_att)
-                entropy = dist.entropy().view(len(mb), n_att)
-                newvalue = critic(b["states"][mb]).squeeze(-1)
+                ent_terms = dist.masked_head_entropies()
+                newvalue = critic(b["states"][mb])
 
                 loss, pg_loss, v_loss, ent, approx_kl, clipfrac = ppo_losses(
-                    newlogprob, entropy, newvalue, b["logprobs"][mb],
-                    b_adv[mb], b_ret[mb], cfg)
+                    newlogprob, ent_terms, newvalue, b["logprobs"][mb],
+                    b_adv[mb], b_ret_n[mb], cfg)
 
                 opt.zero_grad()
                 loss.backward()
@@ -406,6 +501,7 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
         ev = explained_variance(b["values"], b_ret)
         phi = (env_cfg.alpha * buf.states[..., STATE_PC_F3]
                + env_cfg.beta * buf.states[..., STATE_PC_HS])
+        phi = phi.unsqueeze(-1).expand_as(buf.rewards)
 
         w_out = [o for o, _, _, _ in recent]
         w_len = [t for _, t, _, _ in recent]
@@ -421,7 +517,9 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
         print(f"upd {update}/{n_updates} | step {global_step} | "
               f"{sps} sps (avg {avg_sps})")
         print(f"  loss   pg {pg_loss.item():+.4f}  v {v_loss.item():.4f}  "
-              f"ent {ent.item():.3f}  kl {approx_kl.item():.4f}  "
+              f"ent {ent.item():.3f} "
+              f"(dir {ent_terms[0].item():.2f} spd {ent_terms[1].item():.2f} "
+              f"ball {ent_terms[2].item():.2f})  kl {approx_kl.item():.4f}  "
               f"clipfrac {clipfrac.item():.3f}")
         print(f"  value  ev {ev:+.3f} (phi_r2 {phi_r2(phi, b_ret):.3f})  "
               f"ret_std {b_ret.std().item():.4f}  "
