@@ -6,10 +6,12 @@ import gymnasium as gym
 from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 from physics.engine import (
     DT,
+    DRIBBLE_V_MAX,
     V_MAX,
     action_decoding,
     ball_action,
     ball_mechanics,
+    cap_speed,
     direction_lookup,
     kinematics_integrator,
     local_to_global,
@@ -27,6 +29,7 @@ from defenders.turnover import (
     intercept_pass,
     check_offside,
     nearest_defender_to,
+    offside_line,
     apply_turnover,
 )
 from environment.grid import PC_NX, PC_NY, PC_CELL_SIZE
@@ -81,8 +84,8 @@ def ball_actions(n_att):
 def obs_dim(n_players, n_att):
     # 4 ego + 4*n_players roster + 2 ball + 1 in-flight + 1 clock
     # + 3 nearest-defender + 1 local pitch control + 2 zone pitch control
-    # + n_att agent one-hot
-    return 4 + 4 * n_players + 4 + 6 + n_att
+    # + 2 offside (line, own margin) + n_att agent one-hot
+    return 4 + 4 * n_players + 4 + 8 + n_att
 
 
 # Distance at which a defender stops mattering, for the nearest-defender
@@ -189,6 +192,70 @@ def nearest_defender_feats(players, n_att):
     return np.concatenate([unit, scaled[:, None]], axis=1).astype("f4")
 
 
+# Metres either side of the offside line that the margin feature resolves.
+# Beyond this the exact number stops mattering: you are either comfortably
+# onside or comfortably off.
+OFFSIDE_MARGIN_SCALE = 20.0
+
+
+def holder_row_of(ball, attacker_ids):
+    """Attacker row holding the ball, or None. Row index, not player id."""
+    holder_id = ball.get("holder_id")
+    if holder_id is None:
+        return None
+    rows = np.flatnonzero(np.asarray(attacker_ids) == holder_id)
+    return int(rows[0]) if rows.size else None
+
+
+def ball_action_mask(players, ball, attacker_ids, n_att):
+    """Legal ball actions, bool (n_att, ball_actions), True == legal.
+
+    Index 0 is HOLD and is legal on every row; index k is the k-th sorted
+    teammate id, matching engine.ball_action. Non-holders get HOLD only -- one
+    legal action rather than none, because an all-False row sends a masked
+    softmax to NaN while a one-hot row gives log-prob 0 and entropy 0 for free.
+
+    The holder additionally loses any target the pass would be flagged offside
+    for. That is not a convenience: 43% of all passing losses were offside
+    turnovers, a flat tax the policy cannot avoid because the line is the
+    second-largest defender x and nothing in the observation used to say so.
+    Masking them turns passing from uniformly worse than carrying into the
+    better option under pressure (crossover at ~4m of defender distance). A real
+    player does not attempt an obviously offside pass either.
+    """
+    mask = np.zeros((n_att, ball_actions(n_att)), dtype=bool)
+    mask[:, 0] = True
+
+    row = holder_row_of(ball, attacker_ids)
+    if row is None:
+        return mask
+
+    mask[row, :] = True
+    holder_id = int(np.asarray(attacker_ids)[row])
+    mates = np.sort(np.asarray(attacker_ids)[np.asarray(attacker_ids) != holder_id])
+    for k, target_id in enumerate(mates):
+        if check_offside(players, holder_id, int(target_id)):
+            mask[row, k + 1] = False
+    return mask
+
+
+def offside_feats(players, n_att):
+    """(n_att, 2) float32: the offside line, and each attacker's margin to it.
+
+    Column 0 is the line in normalised pitch x, shared by every row -- an
+    attacker cannot make a run to stay onside without knowing where the line is.
+    Column 1 is its own signed margin, positive when onside, scaled the same way
+    as the nearest-defender distance and for the same reason: the raw
+    coordinates are already in the observation, but not in the form the decision
+    uses.
+    """
+    line = offside_line(players)
+    own_x = np.asarray(players["position"][:n_att, 0], dtype=float)
+    margin = np.clip((line - own_x) / OFFSIDE_MARGIN_SCALE, -1.0, 1.0)
+    col = np.full(n_att, line / PITCH_LENGTH, dtype="f4")
+    return np.stack([col, margin.astype("f4")], axis=1)
+
+
 def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
               normalization="mean"):
     """Per-agent observations, float32 (n_att, obs_dim). THE one implementation.
@@ -204,7 +271,8 @@ def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
         [95]      local attacker pitch control, mean over the cells within
                   termination.AREA_RADIUS of this attacker
         [96:98]   pc_f3, pc_hs -- the two zone values Phi is built from
-        [98:108]  agent one-hot -- which of the n_att rows this is
+        [98:100]  offside line (shared), own signed margin to it
+        [100:110] agent one-hot -- which of the n_att rows this is
 
     Everything from index 4 to 92 is shared across rows; the ego prefix and the
     last six are per-agent (bar the two zone values). The ego prefix is what
@@ -250,7 +318,7 @@ def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
     agent_id = np.eye(n_att, dtype="f4")
     return np.concatenate(
         [ego, np.broadcast_to(shared, (n_att, shared.size)),
-         near, local_pc, tail, agent_id],
+         near, local_pc, tail, offside_feats(players, n_att), agent_id],
         axis=1).astype("f4")
 
 
@@ -326,6 +394,16 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
             players, ball, tick_count)
     ball_idx = attacker_ball_idx
     target_velocities[att_mask] = attacker_velocities
+
+    # 1b) whoever is carrying the ball is capped below V_MAX. Applied to the
+    #     target, not the integrator, so acceleration and everything else is
+    #     unchanged and the cap lifts the tick the ball leaves his feet.
+    carrier_id = ball.get("holder_id") if ball["state"] == "held" else None
+    if carrier_id is not None:
+        carrier = np.flatnonzero(players["id"] == carrier_id)
+        if carrier.size:
+            target_velocities[carrier[0]] = cap_speed(
+                target_velocities[carrier[0]], DRIBBLE_V_MAX)
 
     # 2) defenders run their script, in defender-row order (rows n_att:).
     defender_velocities = compute_defender_targets(players, ball, defender_state)
@@ -477,10 +555,14 @@ class LowBlockEnv(gym.Env):
         # normalization="area" puts them in square metres.
         near_lo, near_hi = [-1.0, -1.0, 0.0], [1.0, 1.0, 1.0]
         pc_lo, pc_hi = [0.0, 0.0, 0.0], [1.0, np.inf, np.inf]
+        # offside line in normalised x, then a signed margin in [-1, 1]
+        off_lo, off_hi = [0.0, -1.0], [1.0, 1.0]
         row_lo = np.concatenate([ego_lo, pos_lo, vel_lo, [0.0, 0.0], [0.0],
-                                 [0.0], near_lo, pc_lo, np.zeros(n_att)])
+                                 [0.0], near_lo, pc_lo, off_lo,
+                                 np.zeros(n_att)])
         row_hi = np.concatenate([ego_hi, pos_hi, vel_hi, [1.0, 1.0], [1.0],
-                                 [1.0], near_hi, pc_hi, np.ones(n_att)])
+                                 [1.0], near_hi, pc_hi, off_hi,
+                                 np.ones(n_att)])
         self.observation_space = gym.spaces.Box(
             low=np.tile(row_lo, (n_att, 1)).astype("f4"),
             high=np.tile(row_hi, (n_att, 1)).astype("f4"),
@@ -567,20 +649,9 @@ class LowBlockEnv(gym.Env):
         ]).astype("f4")
 
     def action_mask(self):
-        """Legal ball actions, bool (n_att, ball_actions), True == legal.
-
-        The holder's row is fully legal; every other row gets exactly index 0,
-        HOLD, which is the no-op there anyway. One legal action rather than none
-        is the point: an all-False row sends a masked softmax to NaN, while a
-        one-hot row gives log-prob 0 and entropy 0 for free, so non-holders drop
-        out of both loss terms with no special-casing in the learner.
-        """
-        mask = np.zeros((self.n_att, self.ball_actions), dtype=bool)
-        mask[:, 0] = True
-        row = self.holder_row()
-        if row is not None:
-            mask[row, :] = True
-        return mask
+        """See ball_action_mask -- this is a thin binding of it to the env."""
+        return ball_action_mask(self.players, self.ball, self.attacker_ids,
+                                self.n_att)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)

@@ -28,9 +28,11 @@ from defenders.defenders import (  # noqa: E402
     PRESS_LATCH_TICKS,
     PRESS_MAX_EXCURSION,
     V_MAX,
+    PRESS_LEAD_SECONDS,
     apply_pressure_trigger,
     in_press_band,
     make_defender_state,
+    press_aim,
     press_target,
 )
 from schema import player_dt  # noqa: E402
@@ -342,6 +344,70 @@ def test_coverer_holds_position_for_the_whole_commitment():
     assert state["press_latch"]["coverer"] == coverer
     # shifts at 0.6 * V_MAX, not a full-speed charge
     assert np.isclose(np.linalg.norm(tv[coverer]), 0.6 * V_MAX, atol=1e-6)
+
+
+# --- press_aim: leading a carrier -------------------------------------------
+def test_press_aim_leads_a_moving_carrier():
+    # Pure pursuit at equal top speed never closes: a scripted carry kept the
+    # press latched on 95% of ticks and still never got inside the 1.2m duel
+    # radius. The presser has to run at where the carrier is going.
+    players, ball = _world()
+    players["velocity"][0] = [5.0, 0.0]
+    target_pos = players["position"][0]
+    presser = np.array([88.0, 30.0])
+
+    aim = press_aim(players, ball, int(players["id"][0]), target_pos, presser,
+                    V_MAX)
+    assert aim[0] > target_pos[0], f"aim {aim} is not ahead of the carrier"
+    gap = np.linalg.norm(np.asarray(target_pos, dtype=float) - presser)
+    assert np.allclose(aim, np.asarray(target_pos, dtype=float)
+                       + np.array([5.0, 0.0]) * min(gap / V_MAX,
+                                                    PRESS_LEAD_SECONDS))
+
+
+def test_press_aim_does_not_lead_a_stationary_carrier():
+    players, ball = _world()
+    players["velocity"][0] = [0.0, 0.0]
+    aim = press_aim(players, ball, int(players["id"][0]),
+                    players["position"][0], np.array([88.0, 30.0]), V_MAX)
+    assert np.allclose(aim, players["position"][0])
+
+
+def test_press_aim_does_not_lead_a_ball_in_flight():
+    # flight_target is already fixed at release, so there is nothing to lead --
+    # and leading it would send the presser past the reception point.
+    players, ball = _world()
+    players["velocity"][1] = [5.0, 0.0]
+    ball = _in_flight(players, ball, 1, [79.0, 33.0])
+    target_pos, key = press_target(players, ball)
+    aim = press_aim(players, ball, key, target_pos, np.array([88.0, 30.0]),
+                    V_MAX)
+    assert np.allclose(aim, target_pos)
+
+
+def test_lead_closes_on_a_carrier_that_pure_pursuit_cannot_catch():
+    # Both run at V_MAX, so the gap only shrinks if the presser cuts the corner.
+    players, ball = _world()
+    carrier_v = np.array([0.0, 5.0])
+    players["velocity"][0] = carrier_v
+    carrier = np.asarray(players["position"][0], dtype=float).copy()
+    presser = carrier + np.array([6.0, 0.0])
+
+    pursuit, lead = presser.copy(), presser.copy()
+    pos = carrier.copy()
+    for _ in range(40):
+        for chaser, aim in ((pursuit, pos),
+                            (lead, pos + carrier_v * PRESS_LEAD_SECONDS)):
+            step = aim - chaser
+            n = np.linalg.norm(step)
+            if n > 1e-9:
+                chaser += (step / n) * V_MAX * 0.1
+        pos = pos + carrier_v * 0.1
+
+    d_pursuit = np.linalg.norm(pursuit - pos)
+    d_lead = np.linalg.norm(lead - pos)
+    assert d_lead < d_pursuit, (
+        f"leading ({d_lead:.2f}m) did not beat pure pursuit ({d_pursuit:.2f}m)")
 
 
 def _main():

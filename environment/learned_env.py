@@ -24,6 +24,7 @@ from environment.lowblock_env import (
     N_DIRECTIONS,
     N_SPEEDS,
     TIMEOUT,
+    ball_action_mask,
     ball_actions,
     build_obs,
     compute_attacker_ppcf,
@@ -71,14 +72,15 @@ def obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
                      f3_mask, hs_mask, normalization)
 
 
-def action_mask(ball, attacker_ids, n_att):
-    """(n_att, ball_actions) bool -- clone of LowBlockEnv.action_mask."""
-    mask = np.zeros((n_att, ball_actions(n_att)), dtype=bool)
-    mask[:, 0] = True
-    row = holder_row(ball, attacker_ids)
-    if row is not None:
-        mask[row, :] = True
-    return mask
+def action_mask(players, ball, attacker_ids, n_att):
+    """(n_att, ball_actions) bool -- forwards to the one canonical mask.
+
+    This used to be a hand-kept clone of LowBlockEnv.action_mask. It stopped
+    being safe as one the moment the mask started filtering offside targets:
+    a policy handed a laxer mask at inference than it trained on does not
+    error, it just plays passes it was never allowed to consider.
+    """
+    return ball_action_mask(players, ball, attacker_ids, n_att)
 
 
 def decode_action(action, ball, attacker_ids, n_att):
@@ -135,7 +137,7 @@ def learned_step(players, ball, attacker_ids, defender_state, tick, actor,
 
     n_att = len(attacker_ids)
     o = obs(players, ball, n_att, tick, max_ticks, pc_att, *zone_masks)
-    m = action_mask(ball, attacker_ids, n_att)
+    m = action_mask(players, ball, attacker_ids, n_att)
     action = select_action(actor, o, m, deterministic, device)
     avel, ball_idx = decode_action(action, ball, attacker_ids, n_att)
 

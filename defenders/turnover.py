@@ -171,6 +171,20 @@ def intercept_pass(players, ball, rng, prev_pos, dt=0.1):
         return int(players["id"][dmask][near][best])
     return None
 
+def offside_line(players):
+    """x of the last outfield defender, or the halfway line if there are too few.
+
+    The keeper is normally the deepest, so the second largest x is the outfielder
+    who sets the line. Exposed because the observation carries it as a feature
+    and the ball mask tests against it; check_offside reads it from here so the
+    two cannot drift apart.
+    """
+    def_x = players["position"][players["team"] == "defender"][:, 0]
+    if def_x.size < 2:
+        return float(HALFWAY_X)
+    return float(np.partition(def_x, -2)[-2])
+
+
 def check_offside(players, holder_id, target_id):
     # RoboCup marks offside on the kick event, not continuously, so the env runs
     # this right after ball_action and before ball_mechanics
@@ -189,13 +203,10 @@ def check_offside(players, holder_id, target_id):
     if target_x <= ball_x:
         return False
 
-    def_x = players["position"][players["team"] == "defender"][:, 0]
-    if def_x.size < 2:
+    if (players["team"] == "defender").sum() < 2:
         return False
 
-    # last outfield defender
-    line = np.partition(def_x, -2)[-2]
-    return bool(target_x > line)
+    return bool(target_x > offside_line(players))
 
 def nearest_defender_to(players, position):
     dmask = players["team"] == "defender"

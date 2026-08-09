@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from environment.lowblock_env import (  # noqa: E402
     FAILURE,
+    LowBlockEnv,
     make_initial_world,
     make_ppcf_grid,
 )
@@ -27,11 +28,13 @@ from defenders.turnover import (  # noqa: E402
     intercept_pass,
 )
 from physics.engine import (  # noqa: E402
+    DRIBBLE_V_MAX,
     DT,
     PASS_SIGMA,
     RECEPTION_RADIUS,
     V_MAX,
     ball_mechanics,
+    cap_speed,
     kinematics_integrator,
     pass_scatter,
     receiver_at,
@@ -210,6 +213,72 @@ def test_a_pass_collected_by_a_defender_ends_the_episode():
     assert outcome == FAILURE, f"attackers abandoned the ball and kept it ({outcome})"
     holder = ball["holder_id"]
     assert players["team"][players["id"] == holder][0] == "defender"
+
+
+def test_cap_speed_only_touches_what_is_over_the_cap():
+    slow = np.array([1.0, 0.0], dtype="f4")
+    assert np.allclose(cap_speed(slow, DRIBBLE_V_MAX), slow)
+
+    fast = np.array([0.0, V_MAX], dtype="f4")
+    out = cap_speed(fast, DRIBBLE_V_MAX)
+    assert abs(np.linalg.norm(out) - DRIBBLE_V_MAX) < 1e-5
+    assert out[1] > 0, "direction was not preserved"
+
+
+def test_the_carrier_is_slower_than_a_free_runner():
+    # Equal top speeds meant a chasing defender could never close on a carrier,
+    # so walking the ball in from midfield was uncontested.
+    assert DRIBBLE_V_MAX < V_MAX
+    # Not seed 5: that one starts with an attacker already inside the shot gate
+    # and ends in success on tick 0, so there is no carry to measure.
+    env = LowBlockEnv(max_ticks=120, scripted_attackers=False)
+    env.reset(seed=3)
+
+    # Short enough that nobody has reached the goal line -- a player held
+    # against it has had that velocity component zeroed and is not a fair
+    # comparison for "did anyone reach full speed".
+    east_full = np.tile([0, 2, 0], (env.n_att, 1)).astype(np.int64)
+    for _ in range(15):
+        _obs, _r, term, _trunc, _i = env.step(east_full)
+        if term:
+            break
+
+    row = env.holder_row()
+    assert row is not None, "seed 5 should still have an attacker on the ball"
+    pos = np.asarray(env.players["position"][:env.n_att], dtype=float)
+    speeds = np.linalg.norm(np.asarray(env.players["velocity"][:env.n_att],
+                                       dtype=float), axis=1)
+
+    assert speeds[row] <= DRIBBLE_V_MAX + 1e-3, (
+        f"carrier is running at {speeds[row]:.2f} m/s")
+
+    off_ball = (np.arange(env.n_att) != row) & (pos[:, 0] < 105.0 - 1e-6)
+    assert off_ball.any(), "no off-ball attacker left to compare against"
+    assert (speeds[off_ball] > DRIBBLE_V_MAX).any(), (
+        f"nobody off the ball beat the dribble cap: {speeds[off_ball]}")
+
+
+def test_the_cap_lifts_when_the_ball_leaves_his_feet():
+    from physics.engine import DRIBBLE_SPEED
+    assert 0.0 < DRIBBLE_SPEED < 1.0
+    env = LowBlockEnv(max_ticks=120, scripted_attackers=False)
+    env.reset(seed=3)
+    row = env.holder_row()
+
+    act = np.tile([0, 2, 0], (env.n_att, 1)).astype(np.int64)
+    act[row, 2] = 4     # release it
+    env.step(act)
+    assert env.holder_row() != row, "the pass did not leave"
+
+    for _ in range(20):
+        _obs, _r, term, _trunc, _i = env.step(np.tile([0, 2, 0], (env.n_att, 1)).astype(np.int64))
+        if term:
+            return
+    pos = np.asarray(env.players["position"][row], dtype=float)
+    if pos[0] < 105.0 - 1e-6:
+        speed = float(np.linalg.norm(env.players["velocity"][row]))
+        assert speed > DRIBBLE_V_MAX, (
+            f"the ex-carrier is still capped at {speed:.2f} m/s")
 
 
 def _main():

@@ -59,18 +59,32 @@ The two penalties fix that, at a stated price:
   optimum", and may **not** claim "the objective is just whether a shot opening
   was reached". Any no-shaping baseline has to run the same base reward, or the
   comparison is between two different problems.
-- **A turnover is now at least as expensive as a timeout** (`-1` vs `-0.5`).
-  The original ordering was the other way round -- timeout `-2`, turnover `-1`
-  -- on the argument that timeout is the ending a policy can always guarantee by
-  recycling possession, so it had to cost more than trying and failing. That
-  argument has a price the write-up recorded and the 5M run then paid: from a
-  state with success probability `p`, playing on to a timeout is worth
-  `5p - 2(1 - p)` and conceding now is worth `-1`, so conceding wins whenever
-  `p < 1/7`. The measured success rate was 15-20%, i.e. right on that boundary,
-  and the trained policy released the ball on the first tick of every
-  possession. Reversing the two removes the incentive to concede; the stalemate
-  ending is still the worst non-scoring outcome available on any state the
-  attackers can actually convert.
+- **Timeout `-1.5` is the worst ending, turnover `-1` sits between it and
+  success.** The original pair was `-2` / `-1`, on the argument that timeout is
+  the ending a policy can always guarantee by recycling possession, so it has to
+  cost more than trying and failing. That argument is right; the specific values
+  were not. Write `p` for the chance of working a shot opening from here:
+
+  | option | value |
+  | --- | --- |
+  | concede now | `turnover_penalty` |
+  | stall to the horizon | `timeout_penalty` |
+  | play on | `5p + turnover_penalty * (1 - p)` |
+
+  Playing on is worth `6p - 1` at the current numbers, which is `>= -1` for
+  every `p`. So it beats conceding for any `p > 0`, and beats stalling
+  unconditionally. Both degenerate endings are dominated.
+
+  At `-2` timeout, stalling was so expensive that conceding beat it below
+  `p = 1/7` -- and with success unreachable (see below) the learner sat exactly
+  there. An intermediate revision used `-0.5`, which fixed that but made
+  stalling safe below `p = 1/12`. `-1.5` removes both.
+
+  This ordering only means anything if `p` is actually non-zero. It was not:
+  reaching a shot opening requires carrying the ball 40-60 consecutive ticks,
+  and the ball head could not represent that, so neither the 5M nor the 480k run
+  ever observed a single success and the whole terminal term was inert. The fix
+  for that is `Actor.hold_bias`, not these two constants.
 
 `RewardConfig.turnover_penalty` / `timeout_penalty` are ordinary tuning knobs,
 unlike the two flags above.

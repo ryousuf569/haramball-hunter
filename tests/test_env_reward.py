@@ -328,6 +328,77 @@ def test_actor_and_critic_share_one_normalization():
             f"attacker {i}: ego velocity != its roster slot")
 
 
+def test_offside_targets_are_masked_out():
+    # 43% of all passing losses were offside turnovers -- a flat tax the policy
+    # could not avoid, because the line is the second-largest defender x and
+    # nothing in the observation said so. The holder should not be offered them.
+    from defenders.turnover import check_offside  # noqa: E402
+
+    env = LowBlockEnv(max_ticks=200, scripted_attackers=False)
+    _obs, info = env.reset(seed=11)
+
+    seen_illegal = 0
+    for _ in range(120):
+        row = env.holder_row()
+        if row is not None:
+            mask = env.action_mask()
+            assert mask[row, 0], "HOLD must stay legal or the softmax goes NaN"
+            holder_id = int(env.attacker_ids[row])
+            mates = np.sort(env.attacker_ids[env.attacker_ids != holder_id])
+            for k, tid in enumerate(mates):
+                off = check_offside(env.players, holder_id, int(tid))
+                assert mask[row, k + 1] == (not off), (
+                    f"target {tid}: mask says {mask[row, k+1]}, offside={off}")
+                seen_illegal += int(off)
+        _obs, _r, term, _trunc, info = env.step(_action(env, EAST, FULL_SPEED))
+        if term:
+            break
+
+    assert seen_illegal > 0, (
+        "no offside target came up in 120 ticks; this test proved nothing")
+
+
+def test_a_masked_pass_is_never_offered_even_with_everyone_beyond_the_line():
+    # If every teammate is offside the row collapses to HOLD alone. That must
+    # still be one legal action, not zero.
+    env = LowBlockEnv(max_ticks=60, scripted_attackers=False)
+    env.reset(seed=2)
+    row = env.holder_row()
+    env.players["position"][:env.n_att, 0] = 104.0
+    env.players["position"][row, 0] = 60.0
+    env.players["position"][env.n_att:, 0] = 70.0
+
+    mask = env.action_mask()
+    assert mask.sum(axis=1).min() >= 1
+    assert mask[row].sum() == 1 and mask[row, 0], mask[row]
+
+
+def test_offside_line_and_margin_are_in_the_obs():
+    from defenders.turnover import offside_line  # noqa: E402
+
+    env = LowBlockEnv(max_ticks=60, scripted_attackers=False)
+    obs, _info = env.reset(seed=4)
+    # the two columns sit just before the agent one-hot
+    line_col = obs[:, -env.n_att - 2]
+    margin_col = obs[:, -env.n_att - 1]
+
+    line = offside_line(env.players)
+    assert np.allclose(line_col, line / 105.0, atol=1e-6), (line_col[0], line)
+    assert np.allclose(line_col, line_col[0]), "the line is shared by every row"
+
+    own_x = np.asarray(env.players["position"][:env.n_att, 0], dtype=float)
+    expected = np.clip((line - own_x) / 20.0, -1.0, 1.0)
+    assert np.allclose(margin_col, expected, atol=1e-6)
+    # and it actually separates the rows, or it is telling the policy nothing
+    assert margin_col.std() > 0.0
+
+    # an attacker beyond the line reads negative, one behind it reads positive
+    ahead = own_x > line
+    if ahead.any():
+        assert (margin_col[ahead] < 0).all()
+    assert (margin_col[~ahead] >= 0).all()
+
+
 def test_agent_one_hot_distinguishes_the_rows():
     # Without it the shared weights are a function of where you are standing, so
     # two attackers at the same point are guaranteed the same action
@@ -540,6 +611,9 @@ def main():
         test_obs_state_and_mask_shapes,
         test_remaining_time_is_in_obs_and_state,
         test_actor_and_critic_share_one_normalization,
+        test_offside_targets_are_masked_out,
+        test_a_masked_pass_is_never_offered_even_with_everyone_beyond_the_line,
+        test_offside_line_and_margin_are_in_the_obs,
         test_agent_one_hot_distinguishes_the_rows,
         test_agent_reward_is_per_attacker,
         test_vector_env_shapes_hold_up,

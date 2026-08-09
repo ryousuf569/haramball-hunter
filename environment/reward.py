@@ -27,7 +27,7 @@ class RewardConfig:
     gamma: float = 0.99 # must match the learner's discount
     terminal_bonus: float = 5.0 # B, paid on SUCCESS
     turnover_penalty: float = -1.0 # FAILURE
-    timeout_penalty: float = -0.5 # TIMEOUT, and never harsher than a turnover
+    timeout_penalty: float = -1.5 # TIMEOUT, the worst of the two non-scoring ends
     normalization: str = "mean" # see zone_value: "mean" is O(1), "area" is m^2
     agent_alpha: float = 0.5 # weight on the per-attacker local shaping term
     use_gamma: bool = True # flag 1: gamma in the shaping term

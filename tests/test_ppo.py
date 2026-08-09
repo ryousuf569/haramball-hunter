@@ -115,6 +115,25 @@ def test_critic_has_one_head_per_attacker():
     assert out.shape == (5, N_ATT), out.shape
 
 
+def test_hold_bias_makes_carrying_the_default():
+    # Carrying into the scoring radius is 40-60 consecutive HOLDs. From a
+    # uniform ball head that is 0.1^50, which is why no run has ever observed a
+    # success. The head has to start on HOLD for the terminal to be reachable.
+    actor = Actor(64, 9, 3, N_ATT)
+    _d, _s, b = actor(torch.zeros(1, 64))
+    p_hold = torch.softmax(b, dim=-1)[0, 0].item()
+    assert p_hold > 0.9, f"P(HOLD) at init is {p_hold:.3f}"
+
+    # Expected carry length, and the odds of a carry long enough to matter.
+    assert 1.0 / (1.0 - p_hold) > 10, "carries are too short to cross the block"
+    assert p_hold ** 50 > 1e-3, f"a 50-tick carry has probability {p_hold ** 50:.2e}"
+
+    uniform = Actor(64, 9, 3, N_ATT, hold_bias=0.0)
+    _d, _s, b = uniform(torch.zeros(1, 64))
+    assert abs(torch.softmax(b, dim=-1)[0, 0].item() - 1 / N_ATT) < 0.02, (
+        "hold_bias=0 should leave the head uniform")
+
+
 def test_actor_input_width_matches_the_env():
     env = LowBlockEnv(max_ticks=20, scripted_attackers=False)
     obs, _info = env.reset(seed=0)

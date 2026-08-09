@@ -42,7 +42,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class Actor(nn.Module):
 
-    def __init__(self, obs_dim, n1, n2, n3):
+    def __init__(self, obs_dim, n1, n2, n3, hold_bias=5.0):
 
         super().__init__()
 
@@ -57,15 +57,14 @@ class Actor(nn.Module):
         self.head1 = layer_init(nn.Linear(256, n1), std=0.01)
         self.head2 = layer_init(nn.Linear(256, n2), std=0.01)
         self.head3 = layer_init(nn.Linear(256, n3), std=0.01)
+        with torch.no_grad():
+            self.head3.bias[0] = hold_bias
 
     def forward(self, obs):
         h = self.trunk(obs)
         return self.head1(h), self.head2(h), self.head3(h)
 
 class Critic(nn.Module):
-    """One value head per attacker. The reward is per-agent now, so the value
-    has to be too; the input is still the global state, so the heads differ by
-    slot rather than by what they can see."""
 
     def __init__(self, state, n1):
 

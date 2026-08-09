@@ -1,0 +1,2 @@
+anchor_quantile,run_speed_min,possession_radius,rel_speed_max,pooled_ratio,median_player_ratio,fitted_dribble_speed,previous_guess,n_carry_runs,n_free_runs,n_players,frame_anchor_p95_ratio
+0.95,4.0,1.5,2.0,0.9298588370047944,0.8089357046744795,0.81,0.82,124,2957,12,1.448129701998765

@@ -25,6 +25,21 @@ RECEPTION_RADIUS = 3.0
 PITCH_X = 105.0
 PITCH_Y = 68.0
 
+# Fitted to Metrica in physics/validation/dribble_speed_calibration.py: the
+# median per-player ratio of p95 peak speed on carrying runs to p95 peak speed
+# on ball-free runs, over efforts of at least 4 m/s. 124 carrying runs, 2957
+# free runs, 12 players. Only the ratio transfers -- real players top out near
+# 9 m/s against V_MAX = 5.0. See that script for the anchor that failed first.
+DRIBBLE_SPEED = 0.81
+DRIBBLE_V_MAX = DRIBBLE_SPEED * V_MAX
+
+
+def cap_speed(velocities, v_cap):
+    v = np.atleast_2d(np.asarray(velocities, dtype="f4"))
+    speed = np.linalg.norm(v, axis=1, keepdims=True)
+    scale = np.divide(v_cap, speed, out=np.ones_like(speed), where=speed > v_cap)
+    return (v * np.minimum(scale, 1.0)).reshape(np.shape(velocities))
+
 
 def pass_speed(length):
     length = np.maximum(np.asarray(length, dtype=float), 1e-6)

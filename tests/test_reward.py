@@ -155,11 +155,20 @@ def test_terminal_reward_is_signed_per_outcome():
     assert got[FAILURE] == CFG.turnover_penalty, got
     assert got[TIMEOUT] == CFG.timeout_penalty, got
 
-    # Ordering reversed from the original -2 timeout / -1 turnover. That way
-    # round, conceding possession was cheaper than running the clock out from
-    # any state with less than a 1/7 chance of a shot opening, which is most of
-    # them -- so the objective paid a losing policy to give the ball away.
-    assert got[FAILURE] <= got[TIMEOUT] < got[SUCCESS], got
+    # Timeout is the worst ending, because it is the one a policy can always
+    # guarantee by recycling possession.
+    assert got[TIMEOUT] < got[FAILURE] < got[SUCCESS], got
+
+    # ...but not so much worse that giving the ball away beats playing on.
+    # Playing on from success probability p is worth
+    # 5p + turnover_penalty*(1-p); it has to dominate both degenerate endings
+    # for every p, which pins timeout_penalty <= turnover_penalty and
+    # turnover_penalty <= terminal_bonus.
+    for p in (0.0, 0.05, 0.1, 0.5, 1.0):
+        play_on = CFG.terminal_bonus * p + CFG.turnover_penalty * (1 - p)
+        assert play_on >= CFG.turnover_penalty, (p, play_on)
+        assert play_on > CFG.timeout_penalty, (
+            f"stalling beats attacking at p={p}: {CFG.timeout_penalty} vs {play_on}")
 
 
 def test_components_are_reported():

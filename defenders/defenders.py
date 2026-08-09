@@ -29,6 +29,11 @@ PRESS_BAND_FRONT = -20.0 # 4.7m in front of the midfield line
 PRESS_BAND_BEHIND = 5.0 # past this the ball is through; it is the keeper's
 PRESS_MAX_EXCURSION = 10.0 # leash off own slot; real press path p90 is 9.1m
 PRESS_LATCH_TICKS = 25 # 2.5s; real commitment p90 is 2.44s
+# Seconds of the carrier's motion the presser aims ahead of. Running at where
+# the ball is now is pure pursuit, and a pursuer with the same top speed as the
+# man he is chasing never closes: the press latched on 95% of ticks against a
+# scripted carry and still never got inside the 1.2m ground_duel radius.
+PRESS_LEAD_SECONDS = 1.0
 
 backline_offset = np.array([[-1.77, -20], [0.93, -10], [1.42, 0], [0.80, 10], [-1.38, 20]])
 midline_offset = np.array([[-0.47, -15], [0.18, -5], [0.44, 5], [-0.20, 15]])
@@ -137,6 +142,24 @@ def press_target(players, ball):
     return players["position"][players["id"] == holder_id][0], holder_id
 
 
+def press_aim(players, ball, target_key, target_pos, presser_pos, v_max):
+    """Where the presser runs, leading a carrier by how long he needs to get there.
+
+    A ball in flight already has a fixed destination, so there is nothing to
+    lead; only a carrier moves the target while the presser is closing on it.
+    """
+    if ball["state"] != "held" or target_key is None:
+        return target_pos
+
+    vel = players["velocity"][players["id"] == target_key]
+    if vel.size == 0:
+        return target_pos
+
+    gap = np.linalg.norm(np.asarray(target_pos, dtype=float) - presser_pos)
+    lead = min(gap / max(v_max, 1e-6), PRESS_LEAD_SECONDS)
+    return np.asarray(target_pos, dtype=float) + np.asarray(vel[0], dtype=float) * lead
+
+
 def in_press_band(target_pos, back_line_x):
     rel_back = float(target_pos[0]) - float(back_line_x)
     return PRESS_BAND_FRONT <= rel_back <= PRESS_BAND_BEHIND
@@ -210,7 +233,9 @@ def apply_pressure_trigger(players, ball, def_positions, def_slots, target_veloc
         latch["ticks_left"] = PRESS_LATCH_TICKS
         latch["target_key"] = target_key
 
-    to_target = target_pos - def_positions[presser]
+    aim = press_aim(players, ball, target_key, target_pos,
+                    def_positions[presser], v_max)
+    to_target = aim - def_positions[presser]
     d = np.linalg.norm(to_target)
     if d > 1e-6:
         target_velocities[presser] = (to_target / d) * v_max

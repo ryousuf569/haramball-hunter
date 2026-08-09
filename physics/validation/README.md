@@ -230,3 +230,80 @@ and less time at anyone's feet), and attacker successes fell from 9 to 5.
 **Caveat.** One match, 793 passes, one competition. The trend is strong and
 physically unsurprising, but the constants are not claimed to three significant
 figures for other leagues or eras.
+
+---
+
+## Dribble speed calibration
+
+`engine.DRIBBLE_SPEED` caps a ball carrier at `DRIBBLE_SPEED * V_MAX`. It exists
+because without it a carrier and the defender chasing him both top out at
+`V_MAX`, so a pure-pursuit press can never close: the block latched onto a
+scripted carry on 95% of ticks and still never got inside the 1.2m `ground_duel`
+radius, and carry-and-shoot converted 98% against the full low block. The
+constant was originally 0.82, picked to make that number look reasonable.
+`dribble_speed_calibration.py` measures it instead.
+
+**Deriving carries.** Metrica's event file has no `CARRY` type, so possession
+comes from tracking: a player is on the ball when he is the nearest player to
+it, within `POSSESSION_RADIUS = 1.5m`, **and** moving with it
+(`REL_SPEED_MAX = 2.0 m/s`). The relative-velocity gate is not optional. Metrica
+tracks the ball in 2D, so a pass flying over a sprinter sits inside the radius
+for several frames; without the gate those frames are counted as very fast
+carries.
+
+**Anchor 1, every frame. This one fails, and that is worth recording.** Split
+every tracked frame by whether the player was on the ball:
+
+| quantile | carrying | free | ratio |
+| --- | --- | --- | --- |
+| 0.50 | 2.61 | 1.35 | 1.930 |
+| 0.75 | 4.19 | 2.42 | 1.729 |
+| 0.90 | 5.63 | 3.68 | 1.532 |
+| 0.95 | 6.47 | 4.47 | 1.448 |
+| 0.99 | 7.53 | 6.16 | 1.222 |
+
+Every ratio is above 1, i.e. "carrying makes you faster". It is selection bias.
+Carrying only happens while a player is active, whereas the free sample is
+3,145,002 frames of a whole match and is mostly walking. No quantile of this
+comparison is usable, which is why the second anchor matches on effort.
+
+**Anchor 2, peak speed of matched runs. This is the one used.** A run is a spell
+of at least 8 frames (0.32s) above `RUN_SPEED_MIN = 4.0 m/s`, classified by the
+fraction of it spent on the ball (>= 0.60 carrying, <= 0.05 free). Comparing
+peak speed across runs puts both samples on the same kind of effort:
+
+| quantile | carrying | free | ratio |
+| --- | --- | --- | --- |
+| 0.50 | 5.09 | 4.91 | 1.038 |
+| 0.75 | 5.82 | 5.77 | 1.009 |
+| 0.90 | 6.67 | 6.89 | 0.968 |
+| 0.95 | 7.19 | 7.74 | 0.930 |
+| 0.99 | 8.14 | 9.66 | 0.842 |
+
+The ratio falls monotonically with the quantile, which is the physically
+expected shape: the ball costs nothing at a jog and costs most at top speed.
+`DRIBBLE_SPEED` is a **cap**, so it is anchored high. The pooled p95 ratio is
+0.930; the median per-player p95 ratio, which controls for a fast winger both
+carrying and running fast, is **0.809**, and that is the fitted value:
+
+**`DRIBBLE_SPEED = 0.81`**, a carrier cap of 4.05 m/s against `V_MAX = 5.0`.
+
+Only the ratio transfers. Real players peak near 9-10 m/s and the sim's `V_MAX`
+is 5.0, the same argument `turnover.py` makes for taking RoboCup's duel aspect
+ratio and not its absolute size.
+
+| File | Contents |
+|---|---|
+| `results/dribble_speed_fit.png` | Both anchors, and the per-player scatter the fit comes from |
+| `results/dribble_runs.png` | Run durations by kind, and the ratio-vs-quantile curve for both anchors |
+| `results/dribble_runs.csv` | Every classified run: peak/mean speed, duration, possession fraction |
+| `results/dribble_speed_per_player.csv` | Per-player p95 peaks and ratios |
+| `results/dribble_speed_params.csv` | Fitted constant and the inputs that produced it |
+
+**Caveats.** The sample is thin where it matters: 124 carrying runs against 2957
+free runs, and only 12 players clear `MIN_RUNS_PER_PLAYER = 5` on both sides.
+The per-player IQR is 0.740-1.000, so 0.81 is the centre of a wide band and the
+pooled estimate of 0.930 is inside it. One match, one competition. The direction
+and the shape of the quantile curve are solid; the third significant figure is
+not. That the fitted value landed on the original 0.82 guess is a coincidence
+worth naming rather than a confirmation.
