@@ -203,7 +203,7 @@ def test_a_pass_collected_by_a_defender_ends_the_episode():
 
     outcome = None
     for tick in range(80):
-        players, ball, _pc, outcome = world_step(
+        players, ball, _pc, _own, outcome = world_step(
             players, ball, attacker_ids, defender_state, tick, ppcf_grid=grid,
             attacker_velocities=vel, attacker_ball_idx=ball_idx, verbose=False)
         ball_idx = np.zeros(len(attacker_ids), dtype=int)

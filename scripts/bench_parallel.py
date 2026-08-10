@@ -53,8 +53,9 @@ def _worker(worker_id, seed, barrier, out_q, warmup_s, timed_s):
         count = 0
         while time.time() < deadline:
             try:
-                players, ball, _pc, _out = step(players, ball, ids, dstate, tick,
-                                                ppcf_grid=grid)
+                players, ball, _pc, _own, _out = step(players, ball, ids,
+                                                      dstate, tick,
+                                                      ppcf_grid=grid)
             except SystemExit:  # turnover exit path; treated as episode end
                 players, ball, ids, dstate, tick = reset()
                 count += 1

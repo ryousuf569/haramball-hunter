@@ -2,7 +2,7 @@ import numpy as np
 from collections import deque
 from dataclasses import dataclass
 from environment.grid import PC_CELL_SIZE, PC_NX, PC_NY
-from environment.termination import pcf_in_area
+from environment.termination import own_pcf_in_area
 
 CELL_AREA = PC_CELL_SIZE ** 2
 ATTACKER_LABEL = "attacker"
@@ -187,19 +187,27 @@ def step_reward_from_pc_att(pc_att, f3_mask, hs_mask, pcf_state, cfg, outcome=No
     }
     return reward, components
 
-def agent_potential(pc_att, att_pos):
-    grid = np.asarray(pc_att, dtype=float).reshape(PC_NX, PC_NY)
-    return pcf_in_area(np.asarray(att_pos, dtype=float), grid)
+def f3_cell_mask(f3_mask):
+    """The final-third zone mask as a (PC_NX, PC_NY) grid."""
+    return np.asarray(f3_mask).reshape(PC_NX, PC_NY)
 
 
-def reset_agent_potential(pcf_state, pc_att, att_pos):
-    phi_i = agent_potential(pc_att, att_pos)
+def agent_potential(pc_own, att_pos, f3_mask):
+    """Attacker i's OWN pitch control in the disc around itself, counting only
+    final-third cells. (n_att,)."""
+    own = np.asarray(pc_own, dtype=float).reshape(PC_NX, PC_NY, -1)
+    return own_pcf_in_area(np.asarray(att_pos, dtype=float), own,
+                           cell_mask=f3_cell_mask(f3_mask))
+
+
+def reset_agent_potential(pcf_state, pc_own, att_pos, f3_mask):
+    phi_i = agent_potential(pc_own, att_pos, f3_mask)
     pcf_state["prev_agent"] = phi_i
     return phi_i
 
 
-def agent_shaping(pcf_state, pc_att, att_pos, cfg, terminal=False):
-    phi_i = agent_potential(pc_att, att_pos)
+def agent_shaping(pcf_state, pc_own, att_pos, cfg, f3_mask, terminal=False):
+    phi_i = agent_potential(pc_own, att_pos, f3_mask)
     prev = pcf_state.get("prev_agent")
     arriving = (np.zeros_like(phi_i)
                 if (terminal and cfg.zero_terminal_potential) else phi_i)

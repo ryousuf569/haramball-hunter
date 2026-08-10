@@ -31,16 +31,40 @@ _r = int(AREA_RADIUS // PC_CELL_SIZE)
 _di, _dj = np.meshgrid(np.arange(-_r, _r + 1), np.arange(-_r, _r + 1), indexing="ij")
 _within = (_di ** 2 + _dj ** 2) * PC_CELL_SIZE ** 2 <= AREA_RADIUS ** 2
 AREA_DI, AREA_DJ = _di[_within], _dj[_within]
+AREA_CELLS = len(AREA_DI)
 
-def pcf_in_area(position, pcf_grid):
+
+def area_cells(position):
+    local = global_to_local(np.atleast_2d(np.asarray(position, dtype=float)))
+    idx = np.floor(local / PC_CELL_SIZE).astype(int)
+
+    ii = idx[:, 0, None] + AREA_DI
+    jj = idx[:, 1, None] + AREA_DJ
+    valid = (ii >= 0) & (ii < PC_NX) & (jj >= 0) & (jj < PC_NY)
+    return np.clip(ii, 0, PC_NX - 1), np.clip(jj, 0, PC_NY - 1), valid
+
+
+def _masked_mean(vals, ii, jj, valid, cell_mask):
+    vals = np.where(valid, vals, 0.0)
+    if cell_mask is not None:
+        vals = np.where(np.asarray(cell_mask)[ii, jj], vals, 0.0)
+    return vals.sum(axis=1) / AREA_CELLS
+
+
+def pcf_in_area(position, pcf_grid, cell_mask=None):
     # mean pitch control over the cells within AREA_RADIUS of the player.
     # pcf_grid is step()'s pc_att, already reshaped to (PC_NX, PC_NY).
+    # cell_mask, if given, is a (PC_NX, PC_NY) bool: cells outside it count 0.
+    ii, jj, valid = area_cells(position)
+    return _masked_mean(np.asarray(pcf_grid)[ii, jj], ii, jj, valid, cell_mask)
 
-    idx = nearest_grid_cell(position)
-    ii = np.clip(idx[:, 0, None] + AREA_DI, 0, PC_NX - 1)
-    jj = np.clip(idx[:, 1, None] + AREA_DJ, 0, PC_NY - 1)
 
-    return pcf_grid[ii, jj].mean(axis=1)
+def own_pcf_in_area(position, pcf_own, cell_mask=None):
+    position = np.atleast_2d(np.asarray(position, dtype=float))
+    ii, jj, valid = area_cells(position)
+    who = np.arange(position.shape[0])[:, None]
+    return _masked_mean(np.asarray(pcf_own)[ii, jj, who], ii, jj, valid,
+                        cell_mask)
 
 def nearest_defender_distance(players, position):
     # metres to the closest defender, keeper included

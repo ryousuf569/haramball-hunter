@@ -307,7 +307,7 @@ def run_simulation(n_att=10, n_def=11, seed=42, n_ticks=2500, interval_ms=None,
 
         t_step0 = time.perf_counter()
         if actor is None:
-            world["players"], world["ball"], pc_att, outcome = step(
+            world["players"], world["ball"], pc_att, _own, outcome = step(
                 world["players"], world["ball"], attacker_ids, defender_state,
                 world["tick"], ppcf_grid=ppcf_grid)
         else:

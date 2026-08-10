@@ -141,7 +141,10 @@ def learned_step(players, ball, attacker_ids, defender_state, tick, actor,
     action = select_action(actor, o, m, deterministic, device)
     avel, ball_idx = decode_action(action, ball, attacker_ids, n_att)
 
-    players, ball, pc_att, outcome = world_step(
+    # The per-attacker breakdown world_step also returns feeds the reward only,
+    # and this is the inference path -- dropped here, so learned_step keeps the
+    # 4-tuple render.py unpacks.
+    players, ball, pc_att, _pc_own, outcome = world_step(
         players, ball, attacker_ids, defender_state, tick,
         ppcf_grid=ppcf_grid, attacker_velocities=avel,
         attacker_ball_idx=ball_idx, verbose=verbose)

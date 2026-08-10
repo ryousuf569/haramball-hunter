@@ -200,12 +200,24 @@ def test_phi_scale_is_order_one():
 N_ATT = 10
 
 
-def _pc_att(players, ball_pos):
-    return compute_attacker_ppcf(players, GRID, ball_pos)
+def _pc_own(players, ball_pos):
+    # The per-attacker breakdown, which is what the per-agent potential reads
+    # now -- an attacker's own control, not the team's sum.
+    return compute_attacker_ppcf(players, GRID, ball_pos, per_attacker=True)[1]
+
+
+def _advanced_world(seed=11):
+    # The sampled formation sits around x = 66, so most of it is behind the
+    # final-third line and scores an honest zero under the masked potential.
+    # Push it forward for the tests that need the term to be live.
+    players, ball = _world(seed)
+    players = players.copy()
+    players["position"][:N_ATT, 0] += 22.0
+    return players, ball
 
 
 def _agent_rollout(rng, n_steps, jitter=3.0):
-    players0, ball = _world()
+    players0, ball = _advanced_world()
     states = [players0] + _random_rollout(players0, rng, n_steps, jitter)
     return states, np.asarray(ball["position"], dtype=float)
 
@@ -220,14 +232,15 @@ def test_agent_shaping_telescopes_per_agent():
         states, ball_pos = _agent_rollout(rng, 4 + int(rng.integers(0, 4)))
 
         pcf_state = make_pcf_state()
-        phi_0 = reset_agent_potential(pcf_state, _pc_att(states[0], ball_pos),
-                                      states[0]["position"][:N_ATT])
+        phi_0 = reset_agent_potential(pcf_state, _pc_own(states[0], ball_pos),
+                                      states[0]["position"][:N_ATT], F3_MASK)
 
         total = np.zeros(N_ATT)
         for t, players in enumerate(states[1:]):
             last = (t == len(states) - 2)
-            f = agent_shaping(pcf_state, _pc_att(players, ball_pos),
-                              players["position"][:N_ATT], cfg, terminal=last)
+            f = agent_shaping(pcf_state, _pc_own(players, ball_pos),
+                              players["position"][:N_ATT], cfg, F3_MASK,
+                              terminal=last)
             total += (cfg.gamma ** t) * f
 
         assert np.abs(total + phi_0).max() <= TOL, (
@@ -237,12 +250,64 @@ def test_agent_shaping_telescopes_per_agent():
 def test_agent_shaping_is_actually_per_agent():
     # The whole point: the ten numbers must differ. If they did not, this would
     # be the team scalar again under a new name.
-    players, ball = _world()
-    phi_i = agent_potential(_pc_att(players, np.asarray(ball["position"], dtype=float)),
-                            players["position"][:N_ATT])
+    players, ball = _advanced_world()
+    ball_pos = np.asarray(ball["position"], dtype=float)
+    phi_i = agent_potential(_pc_own(players, ball_pos),
+                            players["position"][:N_ATT], F3_MASK)
     assert phi_i.shape == (N_ATT,), phi_i.shape
     assert phi_i.std() > 1e-3, f"per-agent potentials are all but identical: {phi_i}"
     assert ((phi_i >= 0.0) & (phi_i <= 1.0)).all(), phi_i
+
+
+def test_agent_potential_is_own_control_not_the_teams():
+    # The bug this replaced: fed the SUMMED surface, an attacker inherited its
+    # neighbours' control, so ten players stacked on one spot each scored ~1.0
+    # and nothing rewarded occupying distinct space. Own-control splits.
+    players, ball = _advanced_world()
+    ball_pos = np.asarray(ball["position"], dtype=float)
+
+    stacked = players.copy()
+    spot = np.array([88.0, 34.0])
+    stacked["position"][:N_ATT] = spot + np.linspace(-1.0, 1.0, N_ATT)[:, None]
+    phi_stacked = agent_potential(_pc_own(stacked, ball_pos),
+                                  stacked["position"][:N_ATT], F3_MASK)
+
+    alone = players.copy()
+    alone["position"][:N_ATT, 0] = 80.0
+    alone["position"][:N_ATT, 1] = np.linspace(4.0, 64.0, N_ATT)
+    alone["position"][0] = spot
+    phi_alone = agent_potential(_pc_own(alone, ball_pos),
+                                alone["position"][:N_ATT], F3_MASK)
+
+    assert phi_stacked[0] < phi_alone[0], (
+        f"crowding the same cells did not cost anything: stacked "
+        f"{phi_stacked[0]:.3f} vs spread {phi_alone[0]:.3f}")
+
+
+def test_agent_potential_is_zero_outside_the_final_third():
+    # Retreating behind the final-third line must be worth nothing, however
+    # much free grass is back there. This is the term that used to pay 0.71
+    # behind halfway against 0.29 in the final third.
+    players, ball = _world()
+    ball_pos = np.asarray(ball["position"], dtype=float)
+    deep = players.copy()
+    deep["position"][:N_ATT, 0] = 30.0          # behind halfway, and off-grid
+    deep["position"][:N_ATT, 1] = np.linspace(4.0, 64.0, N_ATT)
+    phi_i = agent_potential(_pc_own(deep, ball_pos),
+                            deep["position"][:N_ATT], F3_MASK)
+    assert np.array_equal(phi_i, np.zeros(N_ATT)), phi_i
+
+    # ... and the boundary ramps rather than stepping: a disc straddling the
+    # line counts only the cells past it.
+    edge = deep.copy()
+    edge["position"][:N_ATT, 0] = 70.0
+    phi_edge = agent_potential(_pc_own(edge, ball_pos),
+                               edge["position"][:N_ATT], F3_MASK)
+    inside = deep.copy()
+    inside["position"][:N_ATT, 0] = 76.0
+    phi_inside = agent_potential(_pc_own(inside, ball_pos),
+                                 inside["position"][:N_ATT], F3_MASK)
+    assert (phi_edge <= phi_inside + TOL).all(), (phi_edge, phi_inside)
 
 
 def test_agent_alpha_zero_switches_the_term_off():
@@ -251,11 +316,11 @@ def test_agent_alpha_zero_switches_the_term_off():
     states, ball_pos = _agent_rollout(rng, 4)
 
     pcf_state = make_pcf_state()
-    reset_agent_potential(pcf_state, _pc_att(states[0], ball_pos),
-                          states[0]["position"][:N_ATT])
+    reset_agent_potential(pcf_state, _pc_own(states[0], ball_pos),
+                          states[0]["position"][:N_ATT], F3_MASK)
     for players in states[1:]:
-        f = agent_shaping(pcf_state, _pc_att(players, ball_pos),
-                          players["position"][:N_ATT], cfg)
+        f = agent_shaping(pcf_state, _pc_own(players, ball_pos),
+                          players["position"][:N_ATT], cfg, F3_MASK)
         assert np.array_equal(f, np.zeros(N_ATT)), f
 
 
@@ -270,6 +335,8 @@ def main():
         test_phi_scale_is_order_one,
         test_agent_shaping_telescopes_per_agent,
         test_agent_shaping_is_actually_per_agent,
+        test_agent_potential_is_own_control_not_the_teams,
+        test_agent_potential_is_zero_outside_the_final_third,
         test_agent_alpha_zero_switches_the_term_off,
     ]
     for fn in tests:

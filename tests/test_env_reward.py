@@ -16,7 +16,9 @@ from environment.lowblock_env import (  # noqa: E402
     ACTION_HEADS,
     FAILURE,
     N_DIRECTIONS,
+    N_SCALARS,
     N_SPEEDS,
+    OFFSIDE_IDX,
     SUCCESS,
     TIMEOUT,
     LowBlockEnv,
@@ -304,28 +306,84 @@ def test_actor_and_critic_share_one_normalization():
 
     obs = env.obs()
     state = env.global_state()
-    n4 = 4 * env.n_players
+    n_p = env.n_players
 
-    # roster block: obs row carries it at [4 : 4+n4], state at [0 : n4]
-    assert np.array_equal(obs[0, 4:4 + n4], state[:n4]), (
-        "roster block differs between obs and state")
-    # ball position
-    assert np.array_equal(obs[0, 4 + n4:4 + n4 + 2], state[n4:n4 + 2]), (
-        "ball position differs between obs and state")
-    # and both are the raw world put through the shared helpers
+    # The obs is ego-relative now and the state is not, so they no longer share
+    # a roster block to compare entry for entry. What still has to agree is the
+    # scale: the ego prefix is the same quantity as the critic's own slot for
+    # that attacker, through the same helpers.
     assert np.array_equal(
-        state[:n4],
+        state[:4 * n_p],
         np.concatenate([norm_pos(env.players["position"]).reshape(-1),
                         norm_vel(env.players["velocity"]).reshape(-1)]))
 
-    # ego prefix is attacker i's own slot out of the roster block
     for i in range(env.n_att):
         assert np.array_equal(obs[i, :2], state[2 * i:2 * i + 2]), (
-            f"attacker {i}: ego position != its roster slot")
+            f"attacker {i}: ego position != its slot in the critic's state")
         assert np.array_equal(
             obs[i, 2:4],
-            state[2 * env.n_players + 2 * i:2 * env.n_players + 2 * i + 2]), (
-            f"attacker {i}: ego velocity != its roster slot")
+            state[2 * n_p + 2 * i:2 * n_p + 2 * i + 2]), (
+            f"attacker {i}: ego velocity != its slot in the critic's state")
+
+    # And a relative block really is relative: teammate slot j of row i is the
+    # j-th OTHER attacker by id, which is what ball action j+1 targets.
+    pos = np.asarray(env.players["position"][:env.n_att], dtype=np.float32)
+    for i in range(env.n_att):
+        mates = [j for j in range(env.n_att) if j != i]
+        for j, m in enumerate(mates):
+            got = obs[i, N_SCALARS + 4 * j:N_SCALARS + 4 * j + 2]
+            assert np.allclose(got, (pos[m] - pos[i]) / 105.0, atol=1e-6), (
+                f"row {i} teammate slot {j} is not attacker {m} relative")
+
+
+def test_teammate_slot_j_is_ball_action_j_plus_one():
+    # The one alignment the ball head depends on. Ball action k targets the
+    # k-th sorted teammate id (engine.ball_action); teammate slot j of the
+    # holder's obs row is the j-th other attacker by id. If those ever came
+    # apart the head would be choosing a target by reading a different player's
+    # coordinates, and nothing would error.
+    from physics.engine import ball_action  # noqa: E402
+
+    env = LowBlockEnv(max_ticks=40, scripted_attackers=False)
+    env.reset(seed=9)
+    row = env.holder_row()
+    obs = env.obs()
+    pos = np.asarray(env.players["position"][:env.n_att], dtype=np.float32)
+
+    for k in range(1, env.ball_actions):
+        idx = np.zeros(env.n_att, dtype=int)
+        idx[row] = k
+        _holder, is_pass, target_id = ball_action(
+            idx, env.ball["holder_id"], env.attacker_ids)
+        assert is_pass
+        target_row = int(np.flatnonzero(env.attacker_ids == target_id)[0])
+
+        slot = obs[row, N_SCALARS + 4 * (k - 1):N_SCALARS + 4 * (k - 1) + 2]
+        assert np.allclose(slot, (pos[target_row] - pos[row]) / 105.0,
+                           atol=1e-6), (
+            f"ball action {k} targets row {target_row}, but teammate slot "
+            f"{k - 1} holds someone else")
+
+
+def test_the_obs_is_ego_relative():
+    # Translate the whole world and every relative column must be unchanged.
+    # Only the four absolute ones -- own position and the offside pair -- move.
+    env = LowBlockEnv(max_ticks=40, scripted_attackers=False)
+    env.reset(seed=12)
+    before = env.obs().copy()
+
+    env.players["position"][:, 0] += 3.0
+    env.ball["position"] = np.asarray(env.ball["position"], dtype="f4") + [3.0, 0.0]
+    after = env.obs()
+
+    moved = ~np.isclose(before, after, atol=1e-5).all(axis=0)
+    absolute = {0, 1, OFFSIDE_IDX, OFFSIDE_IDX + 1}
+    unexpected = set(np.flatnonzero(moved)) - absolute
+    # pitch-control columns are recomputed from the shifted world, so allow them
+    unexpected -= {11, 12, 13}
+    assert not unexpected, (
+        f"columns {sorted(unexpected)} changed under a pure translation; they "
+        "are not ego-relative")
 
 
 def test_offside_targets_are_masked_out():
@@ -376,11 +434,12 @@ def test_a_masked_pass_is_never_offered_even_with_everyone_beyond_the_line():
 def test_offside_line_and_margin_are_in_the_obs():
     from defenders.turnover import offside_line  # noqa: E402
 
+    from environment.lowblock_env import OFFSIDE_IDX  # noqa: E402
+
     env = LowBlockEnv(max_ticks=60, scripted_attackers=False)
     obs, _info = env.reset(seed=4)
-    # the two columns sit just before the agent one-hot
-    line_col = obs[:, -env.n_att - 2]
-    margin_col = obs[:, -env.n_att - 1]
+    line_col = obs[:, OFFSIDE_IDX]
+    margin_col = obs[:, OFFSIDE_IDX + 1]
 
     line = offside_line(env.players)
     assert np.allclose(line_col, line / 105.0, atol=1e-6), (line_col[0], line)
@@ -611,6 +670,8 @@ def main():
         test_obs_state_and_mask_shapes,
         test_remaining_time_is_in_obs_and_state,
         test_actor_and_critic_share_one_normalization,
+        test_teammate_slot_j_is_ball_action_j_plus_one,
+        test_the_obs_is_ego_relative,
         test_offside_targets_are_masked_out,
         test_a_masked_pass_is_never_offered_even_with_everyone_beyond_the_line,
         test_offside_line_and_margin_are_in_the_obs,
