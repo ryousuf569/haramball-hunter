@@ -367,7 +367,7 @@ def test_teammate_slot_j_is_ball_action_j_plus_one():
 
 def test_the_obs_is_ego_relative():
     # Translate the whole world and every relative column must be unchanged.
-    # Only the four absolute ones -- own position and the offside pair -- move.
+    # Only the five absolute ones -- own position and the offside block -- move.
     env = LowBlockEnv(max_ticks=40, scripted_attackers=False)
     env.reset(seed=12)
     before = env.obs().copy()
@@ -377,7 +377,8 @@ def test_the_obs_is_ego_relative():
     after = env.obs()
 
     moved = ~np.isclose(before, after, atol=1e-5).all(axis=0)
-    absolute = {0, 1, OFFSIDE_IDX, OFFSIDE_IDX + 1}
+    # is_offside is absolute too: it tests against the halfway line.
+    absolute = {0, 1, OFFSIDE_IDX, OFFSIDE_IDX + 1, OFFSIDE_IDX + 2}
     unexpected = set(np.flatnonzero(moved)) - absolute
     # pitch-control columns are recomputed from the shifted world, so allow them
     unexpected -= {11, 12, 13}
@@ -456,6 +457,39 @@ def test_offside_line_and_margin_are_in_the_obs():
     if ahead.any():
         assert (margin_col[ahead] < 0).all()
     assert (margin_col[~ahead] >= 0).all()
+
+
+def test_is_offside_flag_matches_the_mask():
+    # Column OFFSIDE_IDX + 2 has to agree with what the holder's ball mask
+    # deletes, or the policy is told it is onside while the pass to it is gone.
+    from defenders.turnover import check_offside  # noqa: E402
+
+    from environment.lowblock_env import OFFSIDE_IDX  # noqa: E402
+
+    env = LowBlockEnv(max_ticks=200, scripted_attackers=False)
+    obs, _info = env.reset(seed=11)
+
+    seen_offside = 0
+    for _ in range(120):
+        flag = obs[:, OFFSIDE_IDX + 2]
+        assert set(np.unique(flag)) <= {0.0, 1.0}, np.unique(flag)
+
+        row = env.holder_row()
+        if row is not None:
+            holder_id = int(env.attacker_ids[row])
+            expected = np.array(
+                [check_offside(env.players, holder_id, int(tid))
+                 for tid in env.attacker_ids], dtype="f4")
+            assert np.array_equal(flag, expected), (flag, expected)
+            assert flag[row] == 0.0, "the carrier is never offside"
+            seen_offside += int(expected.sum() > 0)
+
+        obs, _r, term, _trunc, _info = env.step(_action(env, EAST, FULL_SPEED))
+        if term:
+            break
+
+    assert seen_offside > 0, (
+        "no attacker was ever offside in 120 ticks; this test proved nothing")
 
 
 def test_agent_one_hot_distinguishes_the_rows():

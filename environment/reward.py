@@ -19,6 +19,20 @@ TERMINAL_OUTCOMES = (SUCCESS, FAILURE, TIMEOUT)
 
 NORMALIZATIONS = ("mean", "area")
 
+# Offside, for the per-agent term below. Attackers attack x=105, so their own
+# half is x < 52.5 and nothing there is offside. Duplicated from
+# defenders.turnover rather than imported, same as the outcome labels above.
+HALFWAY_X = 52.5
+# Metres beyond the line at which the penalty saturates -- the same scale the
+# observation's margin feature resolves.
+OFFSIDE_DEPTH_SCALE = 20.0
+# Weight on it, in the same units as agent_potential's local control. Sized off
+# a measured rollout: a fully offside attacker gives up about what a p90
+# attacker's own control is worth (~0.2), which makes one metre of running back
+# worth ~0.01 -- roughly twice a typical tick's positional change, so it reads
+# as a signal rather than as noise.
+OFFSIDE_W = 0.2
+
 
 @dataclass(frozen=True)
 class RewardConfig:
@@ -192,22 +206,44 @@ def f3_cell_mask(f3_mask):
     return np.asarray(f3_mask).reshape(PC_NX, PC_NY)
 
 
-def agent_potential(pc_own, att_pos, f3_mask):
+def offside_depth(att_pos, line):
+    x = np.asarray(att_pos, dtype=float)[:, 0]
+    depth = np.clip((x - line) / OFFSIDE_DEPTH_SCALE, 0.0, 1.0)
+    return np.where(x > HALFWAY_X, depth, 0.0)
+
+
+def agent_potential(pc_own, att_pos, f3_mask, line=None):
     """Attacker i's OWN pitch control in the disc around itself, counting only
-    final-third cells. (n_att,)."""
+    final-third cells, minus its offside depth. (n_att,).
+
+    line is the offside line (turnover.offside_line). Supplied, an attacker
+    beyond it carries a potential penalty proportional to how far beyond, so the
+    telescoping agent_shaping already does pays him to run back onside and pays
+    nothing further once he is. Part of the POTENTIAL and not a per-tick fine:
+    that keeps the per-agent term policy-invariant in the same sense the rest of
+    the shaping is, and it means drifting offside costs once rather than every
+    tick it lasts.
+
+    Omitted (the default) the term is absent -- but reset and step must then
+    both omit it, or the first transition pays a penalty nothing ever seeded.
+    """
     own = np.asarray(pc_own, dtype=float).reshape(PC_NX, PC_NY, -1)
-    return own_pcf_in_area(np.asarray(att_pos, dtype=float), own,
-                           cell_mask=f3_cell_mask(f3_mask))
+    phi_i = own_pcf_in_area(np.asarray(att_pos, dtype=float), own,
+                            cell_mask=f3_cell_mask(f3_mask))
+    if line is None:
+        return phi_i
+    return phi_i - OFFSIDE_W * offside_depth(att_pos, line)
 
 
-def reset_agent_potential(pcf_state, pc_own, att_pos, f3_mask):
-    phi_i = agent_potential(pc_own, att_pos, f3_mask)
+def reset_agent_potential(pcf_state, pc_own, att_pos, f3_mask, line=None):
+    phi_i = agent_potential(pc_own, att_pos, f3_mask, line)
     pcf_state["prev_agent"] = phi_i
     return phi_i
 
 
-def agent_shaping(pcf_state, pc_own, att_pos, cfg, f3_mask, terminal=False):
-    phi_i = agent_potential(pc_own, att_pos, f3_mask)
+def agent_shaping(pcf_state, pc_own, att_pos, cfg, f3_mask, terminal=False,
+                  line=None):
+    phi_i = agent_potential(pc_own, att_pos, f3_mask, line)
     prev = pcf_state.get("prev_agent")
     arriving = (np.zeros_like(phi_i)
                 if (terminal and cfg.zero_terminal_potential) else phi_i)

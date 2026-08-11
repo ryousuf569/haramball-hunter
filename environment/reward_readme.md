@@ -105,3 +105,12 @@ coefficient of 0.01. The movement heads were being regularised toward uniform
 roughly twice as hard as they were being trained, and after 5M steps they had
 93% of the entropy of a uniform policy. `agent_alpha` weights this term; at 0
 the learner is back to a single team advantage broadcast to every agent.
+
+`phi_i` also subtracts `OFFSIDE_W * offside_depth`, an attacker's distance
+beyond the offside line, saturating at `OFFSIDE_DEPTH_SCALE` metres and zero in
+its own half. Being inside the potential rather than a per-tick fine is the
+point: drifting offside costs once instead of every tick, coming back refunds
+exactly what going out charged, and the telescoping identity above still holds
+term for term. It is continuous where the observation's `is_offside` flag is
+binary, so an attacker well beyond the line has a gradient toward the line
+rather than a cliff at it.

@@ -310,6 +310,58 @@ def test_agent_potential_is_zero_outside_the_final_third():
     assert (phi_edge <= phi_inside + TOL).all(), (phi_edge, phi_inside)
 
 
+def test_the_offside_term_pays_the_run_back():
+    from environment.reward import OFFSIDE_W  # noqa: E402
+
+    players, ball = _advanced_world()
+    ball_pos = np.asarray(ball["position"], dtype=float)
+    line = 80.0
+
+    # Onside, the term is off and the potential is bit-identical.
+    onside = players.copy()
+    onside["position"][:N_ATT, 0] = 75.0
+    pc = _pc_own(onside, ball_pos)
+    assert np.array_equal(
+        agent_potential(pc, onside["position"][:N_ATT], F3_MASK, line),
+        agent_potential(pc, onside["position"][:N_ATT], F3_MASK))
+
+    # Ten metres past it, it is exactly half of OFFSIDE_W (the 20m scale).
+    off = onside.copy()
+    off["position"][:N_ATT, 0] = 90.0
+    pc_off = _pc_own(off, ball_pos)
+    gap = (agent_potential(pc_off, off["position"][:N_ATT], F3_MASK)
+           - agent_potential(pc_off, off["position"][:N_ATT], F3_MASK, line))
+    assert np.allclose(gap, OFFSIDE_W * 0.5), gap
+
+    def _shaped(states, line):
+        pcf_state = make_pcf_state()
+        reset_agent_potential(pcf_state, _pc_own(states[0], ball_pos),
+                              states[0]["position"][:N_ATT], F3_MASK, line)
+        return np.array([
+            agent_shaping(pcf_state, _pc_own(p, ball_pos),
+                          p["position"][:N_ATT], CFG, F3_MASK, line=line)
+            for p in states[1:]]).sum(axis=0)
+
+    def _walk(xs):
+        out = []
+        for x in xs:
+            s = off.copy()
+            s["position"][:N_ATT, 0] = x
+            out.append(s)
+        return out
+
+    # Isolate the offside term by differencing against the same rollout without
+    # it: the local-control part is identical in both, so what is left is what
+    # the new term paid. Running back onside pays; running further off charges.
+    backwards = _walk([90.0, 88.0, 86.0, 84.0])
+    forwards = _walk([90.0, 92.0, 94.0, 96.0])
+    paid_back = _shaped(backwards, line) - _shaped(backwards, None)
+    paid_on = _shaped(forwards, line) - _shaped(forwards, None)
+
+    assert (paid_back > 0).all(), paid_back
+    assert (paid_on < 0).all(), paid_on
+
+
 def test_agent_alpha_zero_switches_the_term_off():
     cfg = replace(CFG, agent_alpha=0.0)
     rng = np.random.default_rng(0)
@@ -337,6 +389,7 @@ def main():
         test_agent_shaping_is_actually_per_agent,
         test_agent_potential_is_own_control_not_the_teams,
         test_agent_potential_is_zero_outside_the_final_third,
+        test_the_offside_term_pays_the_run_back,
         test_agent_alpha_zero_switches_the_term_off,
     ]
     for fn in tests:

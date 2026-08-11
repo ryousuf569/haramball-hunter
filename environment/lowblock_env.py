@@ -25,6 +25,7 @@ from defenders.defenders import (
     gk_positioning,
 )
 from defenders.turnover import (
+    HALFWAY_X,
     ground_duel,
     intercept_pass,
     check_offside,
@@ -87,12 +88,13 @@ def ball_actions(n_att):
 K_DEF = 5
 
 # Scalars, in build_obs order, before the neighbour blocks and the one-hot.
-N_SCALARS = 16
-OFFSIDE_IDX = 14        # offside line, then own signed margin to it
+N_SCALARS = 17
+# second_last_def_x (the offside line), own signed margin to it, own is_offside
+OFFSIDE_IDX = 14
 
 
 def obs_dim(n_players, n_att):
-    # 16 scalars (see build_obs) + 4 per teammate + 4 per shown defender
+    # 17 scalars (see build_obs) + 4 per teammate + 4 per shown defender
     # + n_att agent one-hot
     return N_SCALARS + 4 * (n_att - 1) + 4 * K_DEF + n_att
 
@@ -265,21 +267,45 @@ def ball_action_mask(players, ball, attacker_ids, n_att):
     return mask
 
 
-def offside_feats(players, n_att):
-    """(n_att, 2) float32: the offside line, and each attacker's margin to it.
+def offside_feats(players, ball, n_att):
+    """(n_att, 3) float32: the offside line, each attacker's margin, its flag.
 
-    Column 0 is the line in normalised pitch x, shared by every row -- an
-    attacker cannot make a run to stay onside without knowing where the line is.
+    Column 0 is second_last_def_x -- the second-largest defender x, which is the
+    line -- in normalised pitch x, shared by every row. An attacker cannot make
+    a run to stay onside without knowing where the line is.
+
     Column 1 is its own signed margin, positive when onside, scaled the same way
     as the nearest-defender distance and for the same reason: the raw
     coordinates are already in the observation, but not in the form the decision
     uses.
+
+    Column 2 is is_offside, 1.0 when this attacker is in an offside position
+    right now: beyond the line, in the opponent half, and ahead of the ball --
+    the same three conditions turnover.check_offside applies at the moment of
+    release, read off the ball's current x rather than a hypothetical passer's.
+    A held ball sits on its holder, so while an attacker is carrying, this flag
+    is exactly "a pass to me would be flagged", which is exactly the set
+    ball_action_mask deletes from the holder's options. The margin alone does
+    not say that: whether an attacker beyond the line is actually offside also
+    depends on the halfway line and on where the ball is, so a negative margin
+    is the necessary condition and this is the decision. It is what tells an
+    attacker who has drifted beyond the line that he has to run back to be
+    passable to again.
     """
     line = offside_line(players)
     own_x = np.asarray(players["position"][:n_att, 0], dtype=float)
     margin = np.clip((line - own_x) / OFFSIDE_MARGIN_SCALE, -1.0, 1.0)
     col = np.full(n_att, line / PITCH_LENGTH, dtype="f4")
-    return np.stack([col, margin.astype("f4")], axis=1)
+
+    ball_x = float(np.asarray(ball["position"], dtype=float)[0])
+    flag = (own_x > line) & (own_x > HALFWAY_X) & (own_x > ball_x)
+    # check_offside gives up on a defence too small to have a second-last man,
+    # and offside_line falls back to the halfway line there; without this the
+    # flag would fire on a legal position the mask still allows.
+    if (players["team"] == DEFENDER_LABEL).sum() < 2:
+        flag = np.zeros(n_att, dtype=bool)
+
+    return np.stack([col, margin.astype("f4"), flag.astype("f4")], axis=1)
 
 
 def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
@@ -296,11 +322,12 @@ def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
         [11]      local attacker pitch control, mean over the cells within
                   termination.AREA_RADIUS of this attacker
         [12:14]   pc_f3, pc_hs -- the two zone values Phi is built from
-        [14:16]   offside line (shared), own signed margin to it
-        [16:52]   the other 9 attackers IN ID ORDER, relative position and
+        [14:17]   second_last_def_x, i.e. the offside line (shared), own signed
+                  margin to it, own is_offside flag
+        [17:53]   the other 9 attackers IN ID ORDER, relative position and
                   relative velocity
-        [52:72]   the K_DEF nearest defenders, nearest first, same four columns
-        [72:82]   agent one-hot -- which of the n_att rows this is
+        [53:73]   the K_DEF nearest defenders, nearest first, same four columns
+        [73:83]   agent one-hot -- which of the n_att rows this is
 
     This replaced an 84-column block holding all 21 players in ABSOLUTE
     coordinates and fixed roster order, identical in every row. Agent i had to
@@ -349,7 +376,7 @@ def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
                     np.asarray(pc_att, dtype=float).reshape(PC_NX, PC_NY)
                     ).astype("f4")[:, None],
         np.broadcast_to(zones, (n_att, zones.size)),
-        offside_feats(players, n_att),
+        offside_feats(players, ball, n_att),
     ], axis=1)
 
     # Teammates in id order: slot j is ball action j + 1, see the docstring.
@@ -615,16 +642,16 @@ class LowBlockEnv(gym.Env):
         # in-flight, clock, nearest-defender unit vector and scaled distance,
         # local pitch control, pc_f3/pc_hs (unbounded above for the same reason
         # as the critic's -- normalization="area" puts them in square metres),
-        # offside line and margin, then the two relative neighbour blocks and
-        # the one-hot.
+        # offside line, margin and flag, then the two relative neighbour blocks
+        # and the one-hot.
         n_nbr = (n_att - 1) + K_DEF
         row_lo = np.concatenate([
             [0.0, 0.0], [-1.0, -1.0], [-1.0, -1.0], [0.0], [0.0],
-            [-1.0, -1.0, 0.0], [0.0], [0.0, 0.0], [0.0, -1.0],
+            [-1.0, -1.0, 0.0], [0.0], [0.0, 0.0], [0.0, -1.0, 0.0],
             np.tile([-1.0, -1.0, -1.0, -1.0], n_nbr), np.zeros(n_att)])
         row_hi = np.concatenate([
             [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0], [1.0],
-            [1.0, 1.0, 1.0], [1.0], [np.inf, np.inf], [1.0, 1.0],
+            [1.0, 1.0, 1.0], [1.0], [np.inf, np.inf], [1.0, 1.0, 1.0],
             np.tile([1.0, 1.0, 1.0, 1.0], n_nbr), np.ones(n_att)])
         self.observation_space = gym.spaces.Box(
             low=np.tile(row_lo, (n_att, 1)).astype("f4"),
@@ -714,8 +741,7 @@ class LowBlockEnv(gym.Env):
             norm_pos(self.ball["position"]).reshape(-1),
             holder,
             np.array([self.pc_f3, self.pc_hs, self.remaining_time()],
-                     dtype="f4"),
-        ]).astype("f4")
+                     dtype="f4"),]).astype("f4")
 
     def action_mask(self):
         """See ball_action_mask -- this is a thin binding of it to the env."""
@@ -750,7 +776,7 @@ class LowBlockEnv(gym.Env):
         self.pc_own = pc_own
         reset_agent_potential(self.pcf_state, pc_own,
                               self.players["position"][:self.n_att],
-                              self.f3_mask)
+                              self.f3_mask, offside_line(self.players))
 
         return self.obs(), {"phi_0": phi_0, "pc_f3": parts["pc_f3"],
                             "pc_hs": parts["pc_hs"], "tick": self.tick,
@@ -815,10 +841,14 @@ class LowBlockEnv(gym.Env):
         # Per-attacker shaping, on the same surface. It rides alongside the
         # scalar reward rather than inside it: the team reward stays exactly
         # what reward_readme.md describes, and the learner adds this per agent.
+        # The line is passed here and at reset alike: the offside penalty is
+        # inside the potential, so an unseeded reset would bill the first
+        # transition for a position it never credited.
         parts["agent_reward"] = agent_shaping(
             self.pcf_state, self.pc_own,
             self.players["position"][:self.n_att], self.cfg,
-            self.f3_mask, terminal=terminated).astype("f4")
+            self.f3_mask, terminal=terminated,
+            line=offside_line(self.players)).astype("f4")
         return self.obs(), float(reward), terminated, truncated, parts
 
 
@@ -829,10 +859,10 @@ def make_vector_env(n_envs=6, asynchronous=False, seed=None,
     partial rather than a closure so the factories pickle for the Async spawn.
 
     autoreset_mode: Gymnasium defaults to AutoresetMode.NEXT_STEP, where the
-        call after a terminal one is a reset that ignores its action and pays
-        reward 0 -- a junk transition a learner has to mask out. SAME_STEP
-        resets on the terminal call instead, with the real terminal reward and
-        the final state in info["final_obs"]. Training should prefer SAME_STEP.
+    call after a terminal one is a reset that ignores its action and pays
+    reward 0 -- a junk transition a learner has to mask out. SAME_STEP
+    resets on the terminal call instead, with the real terminal reward and
+    the final state in info["final_obs"]. Training should prefer SAME_STEP.
     """
     fns = [partial(LowBlockEnv, **env_kwargs) for _ in range(n_envs)]
     cls = AsyncVectorEnv if asynchronous else SyncVectorEnv
