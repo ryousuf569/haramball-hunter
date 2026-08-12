@@ -354,7 +354,14 @@ def redraw(outdir):
     return runs
 
 
+def newest_figs():
+    """The figs folder of the most recent run under models/."""
+    import glob
+    dirs = sorted(glob.glob(os.path.join("models", "*", "figs")),
+                  key=os.path.getmtime)
+    return dirs[-1] if dirs else os.path.join("models", "figs")
+
+
 if __name__ == "__main__":
     import sys
-    redraw(sys.argv[1] if len(sys.argv) > 1 else
-           os.path.join("models", "figs"))
+    redraw(sys.argv[1] if len(sys.argv) > 1 else newest_figs())

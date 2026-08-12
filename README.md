@@ -25,8 +25,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 python render.py                          # watch a possession, 5M.pt driving the attackers
 python train.py                           # the three-arm experiment, 1M steps each
 python train.py --steps 200000            # a short rehearsal first
-python plots.py models/figs               # redraw figures from saved history JSON
-python scripts/diag_policy.py --ckpt models/constrained.pt
+python plots.py                           # redraw figures from the newest run
+python scripts/diag_policy.py --ckpt models/081126-500k/constrained.pt
 python scripts/diag_policy.py --random    # the control -- run this too
 ```
 
@@ -427,7 +427,9 @@ The curriculum and the seed are **identical across arms**; only the objective
 specification varies. Every arm measures all seven constraint rates, including
 A, which never optimises them — that is what makes the comparison meaningful.
 
-Figures land in `models/figs/`, four per arm plus two cross-arm:
+Each run gets its own folder, `models/<MMDDYY>-<steps>/`, holding the three
+checkpoints and a `figs/` subfolder. A 500k run started today lands in
+`models/081126-500k/`. Figures are four per arm plus two cross-arm:
 
 | file | what it shows |
 |---|---|
@@ -439,8 +441,9 @@ Figures land in `models/figs/`, four per arm plus two cross-arm:
 | `summary_table.png` | final 5% of updates, green where arm B's threshold is met |
 
 Each arm writes its checkpoint, a `_history.json` and its figures the moment it
-finishes, so a crash in arm C costs nothing from A and B. `python plots.py
-models/figs` redraws everything from the JSON without re-running.
+finishes, so a crash in arm C costs nothing from A and B. `python plots.py`
+redraws the newest run from its JSON without re-running, and it takes a path if
+you want an older one.
 
 **Budget ~17 h** for the full three-arm 1M run at the measured ~50 sps.
 `--steps 200000` is a ~3.5 h rehearsal; `--arms constrained` runs one.
