@@ -231,7 +231,7 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # state to render_frame.
 
 
-def run_simulation(n_att=10, n_def=11, seed=4, n_ticks=2500, interval_ms=None,
+def run_simulation(n_att=10, n_def=11, seed=100, n_ticks=2500, interval_ms=None,
                    show_zones=False, start_holder=1, show_ppcf=True,
                    checkpoint='5M.pt', deterministic=True, max_ticks=None):
     """Open a matplotlib window and animate the engine in real time.

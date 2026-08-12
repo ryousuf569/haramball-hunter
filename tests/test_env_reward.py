@@ -39,6 +39,10 @@ from physics.ppcf import PPCF_grid  # noqa: E402
 
 TOL = 1e-12
 
+# Columns per teammate slot in build_obs: relative position, relative velocity,
+# and that teammate's receiver pressure.
+MATE_COLS = 5
+
 FULL_SPEED = N_SPEEDS - 1        # speed_lookup[-1] == 1.0 * V_MAX
 EAST = 0                          # direction_lookup[0] == [1, 0]
 STAND = N_DIRECTIONS - 1          # direction_lookup[-1] == [0, 0]
@@ -331,7 +335,7 @@ def test_actor_and_critic_share_one_normalization():
     for i in range(env.n_att):
         mates = [j for j in range(env.n_att) if j != i]
         for j, m in enumerate(mates):
-            got = obs[i, N_SCALARS + 4 * j:N_SCALARS + 4 * j + 2]
+            got = obs[i, N_SCALARS + MATE_COLS * j:N_SCALARS + MATE_COLS * j + 2]
             assert np.allclose(got, (pos[m] - pos[i]) / 105.0, atol=1e-6), (
                 f"row {i} teammate slot {j} is not attacker {m} relative")
 
@@ -358,11 +362,64 @@ def test_teammate_slot_j_is_ball_action_j_plus_one():
         assert is_pass
         target_row = int(np.flatnonzero(env.attacker_ids == target_id)[0])
 
-        slot = obs[row, N_SCALARS + 4 * (k - 1):N_SCALARS + 4 * (k - 1) + 2]
+        base = N_SCALARS + MATE_COLS * (k - 1)
+        slot = obs[row, base:base + 2]
         assert np.allclose(slot, (pos[target_row] - pos[row]) / 105.0,
                            atol=1e-6), (
             f"ball action {k} targets row {target_row}, but teammate slot "
             f"{k - 1} holds someone else")
+
+
+def test_teammate_slots_carry_the_receivers_pressure():
+    # The column exists so the ball head can tell a pass into space from a pass
+    # into a defender. Two things have to hold: it is the RECEIVER's pressure,
+    # not the observer's, and slot j lines up with ball action j+1 like the
+    # other four columns do.
+    from environment.lowblock_env import receiver_pressure  # noqa: E402
+
+    env = LowBlockEnv(max_ticks=60, scripted_attackers=False)
+    obs, _info = env.reset(seed=5)
+    expected = receiver_pressure(env.players, env.n_att)
+
+    assert expected.shape == (env.n_att,)
+    assert ((expected >= 0.0) & (expected <= 1.0)).all(), expected
+
+    col = N_SCALARS + MATE_COLS - 1        # the fifth column of slot 0
+    for i in range(env.n_att):
+        mates = [j for j in range(env.n_att) if j != i]
+        for j, m in enumerate(mates):
+            got = obs[i, col + MATE_COLS * j]
+            assert np.isclose(got, expected[m], atol=1e-6), (
+                f"row {i} slot {j}: got {got}, expected attacker {m}'s "
+                f"pressure {expected[m]}")
+
+    # It must actually vary between teammates, or it is telling the ball head
+    # nothing it could act on.
+    assert expected.std() > 1e-3, f"pressure is flat across attackers: {expected}"
+
+
+def test_receiver_pressure_reads_pressure_not_grid_coverage():
+    # The trap this replaced: read off the pc_att grid, which spans only
+    # x in [43, 105], a deep receiver scores near zero because the grid does not
+    # reach him -- so the safest passes on the pitch looked like the most
+    # dangerous. Its own PPCF call has no such edge.
+    from environment.lowblock_env import receiver_pressure  # noqa: E402
+
+    env = LowBlockEnv(max_ticks=60, scripted_attackers=False)
+    env.reset(seed=6)
+
+    # One attacker alone deep in his own half, every defender up the other end.
+    env.players["position"][:env.n_att, 0] = 80.0
+    env.players["position"][0] = [20.0, 34.0]
+    env.players["position"][env.n_att:, 0] = 95.0
+    free = receiver_pressure(env.players, env.n_att)[0]
+
+    # ... and the same man with the whole block on top of him.
+    env.players["position"][env.n_att:] = [20.0, 34.0]
+    swarmed = receiver_pressure(env.players, env.n_att)[0]
+
+    assert free > 0.9, f"an unmarked attacker 25m behind the grid read {free}"
+    assert swarmed < free, (free, swarmed)
 
 
 def test_the_obs_is_ego_relative():

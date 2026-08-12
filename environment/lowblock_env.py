@@ -87,6 +87,43 @@ def ball_actions(n_att):
 # column of it was noise the movement heads had to learn to ignore.
 K_DEF = 5
 
+# Radius of the disc whose attacker pitch control each teammate slot carries --
+# "how much of the space around this pass target does my team control".
+#
+# 8m, from environment/calibration/pass_pressure_calibration.py. The radius was
+# swept from 3m to 35m and prediction of pass loss is FLAT across the whole
+# range (AUC 0.699 to 0.714, against a standard error of 0.025 -- the paired
+# bootstrap of 25m against 8m is +0.009 [-0.017, +0.035], straddling zero). So
+# the radius is not chosen on predictive power, because nothing distinguishes
+# them on it. It is chosen on the two things that do differ:
+#
+#   cost       49 cells per attacker against 489 at 25m, i.e. half the existing
+#              1054-cell grid rather than five times it
+#   spread     median 0.783 with an IQR of 0.454, the widest in the sweep.
+#              termination.AREA_RADIUS = 3.0 reads a median of 0.962 because
+#              every player controls the two metres under his own feet -- a
+#              saturated column gives a policy nothing to condition on, which is
+#              the actual reason not to reuse the shot gate's radius here.
+#
+# 8m is also the scale at which this reads as pressure on a receiver rather than
+# territorial control: a 25m disc is 27% of the pitch, and neighbouring
+# teammates' discs would overlap so heavily the ten columns stop being distinct.
+RECEIVER_RADIUS = 8.0
+
+
+def _disc_offsets(radius, cell=PC_CELL_SIZE):
+    """Metre offsets of every cell centre within `radius`, same construction as
+    termination.AREA_DI/AREA_DJ."""
+    r = int(radius // cell)
+    di, dj = np.meshgrid(np.arange(-r, r + 1), np.arange(-r, r + 1),
+                         indexing="ij")
+    within = (di ** 2 + dj ** 2) * cell ** 2 <= radius ** 2
+    return np.stack([di[within] * cell, dj[within] * cell], axis=1).astype("f4")
+
+
+RECEIVER_DISC = _disc_offsets(RECEIVER_RADIUS)
+RECEIVER_CELLS = len(RECEIVER_DISC)
+
 # Scalars, in build_obs order, before the neighbour blocks and the one-hot.
 N_SCALARS = 17
 # second_last_def_x (the offside line), own signed margin to it, own is_offside
@@ -94,9 +131,9 @@ OFFSIDE_IDX = 14
 
 
 def obs_dim(n_players, n_att):
-    # 17 scalars (see build_obs) + 4 per teammate + 4 per shown defender
+    # 17 scalars (see build_obs) + 5 per teammate + 4 per shown defender
     # + n_att agent one-hot
-    return N_SCALARS + 4 * (n_att - 1) + 4 * K_DEF + n_att
+    return N_SCALARS + 5 * (n_att - 1) + 4 * K_DEF + n_att
 
 
 # Distance at which a defender stops mattering, for the nearest-defender
@@ -308,6 +345,39 @@ def offside_feats(players, ball, n_att):
     return np.stack([col, margin.astype("f4"), flag.astype("f4")], axis=1)
 
 
+def receiver_pressure(players, n_att):
+    """(n_att,) float32: attacker pitch control in the RECEIVER_RADIUS disc
+    around each attacker, i.e. how much of the space around him his own team
+    would win a ball to. Row j is what a passer needs to know about pass target
+    j; build_obs hands each attacker the other nine.
+
+    Computed off its own PPCF call rather than read out of the pc_att grid,
+    which spans only x in [43, 105]. termination.pcf_in_area clips cell indices
+    into that box and counts the out-of-range cells as ZERO while still dividing
+    by the full cell count, so a grid read makes a deep receiver look swamped
+    when in fact the grid simply does not reach him. Measured, those receivers
+    were 4.6% of passes and lost the ball 2.6% of the time against 19.8% for the
+    rest -- the safest passes on the pitch, scored as the most dangerous. Off-
+    pitch cells are dropped here for the same reason, so a receiver near a
+    touchline is not credited with controlling the dead ground beyond it.
+
+    One PPCF call over all n_att discs at once (n_att * RECEIVER_CELLS cells),
+    not n_att calls. ball_pos is left None deliberately: it only drives the
+    players['i_p'] TTI cache, which step() owns and intercept_pass reads.
+    """
+    apos = np.asarray(players["position"][:n_att], dtype=float)
+    pts = (apos[:, None, :] + RECEIVER_DISC[None, :, :]).reshape(-1, 2)
+    on_pitch = ((pts >= 0.0) & (pts <= PITCH_EXTENT_XY)).all(axis=1)
+
+    per_player = PPCF_grid(pts, players)
+    att = per_player[:, players["team"] == ATTACKER_LABEL].sum(axis=1)
+
+    att = att.reshape(n_att, RECEIVER_CELLS)
+    valid = on_pitch.reshape(n_att, RECEIVER_CELLS)
+    total = np.where(valid, att, 0.0).sum(axis=1)
+    return (total / np.maximum(valid.sum(axis=1), 1)).astype("f4")
+
+
 def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
               normalization="mean"):
     """Per-agent observations, float32 (n_att, obs_dim). THE one implementation.
@@ -324,10 +394,13 @@ def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
         [12:14]   pc_f3, pc_hs -- the two zone values Phi is built from
         [14:17]   second_last_def_x, i.e. the offside line (shared), own signed
                   margin to it, own is_offside flag
-        [17:53]   the other 9 attackers IN ID ORDER, relative position and
-                  relative velocity
-        [53:73]   the K_DEF nearest defenders, nearest first, same four columns
-        [73:83]   agent one-hot -- which of the n_att rows this is
+        [17:62]   the other 9 attackers IN ID ORDER, five columns each:
+                  relative position, relative velocity, and that teammate's
+                  receiver_pressure -- attacker control of the 8m disc around
+                  him, which is what says whether a pass to him is into space
+                  or into a defender
+        [62:82]   the K_DEF nearest defenders, nearest first, four columns each
+        [82:92]   agent one-hot -- which of the n_att rows this is
 
     This replaced an 84-column block holding all 21 players in ABSOLUTE
     coordinates and fixed roster order, identical in every row. Agent i had to
@@ -380,10 +453,18 @@ def build_obs(players, ball, n_att, tick, max_ticks, pc_att, f3_mask, hs_mask,
     ], axis=1)
 
     # Teammates in id order: slot j is ball action j + 1, see the docstring.
+    # The fifth column is the pressure on that teammate, not on the observer:
+    # this is the block the ball head reads its options off, and the whole point
+    # is that the passer could not previously see the receiver's marker. The
+    # defender contesting a given receiver was inside the observer's own K_DEF
+    # window only 54.3% of the time, so for nearly half the targets the threat
+    # was absent from the observation entirely.
     mate_idx = np.array([[j for j in range(n_att) if j != i]
                          for i in range(n_att)])
+    pressure = receiver_pressure(players, n_att)
     mates = np.concatenate([rel_pos(apos[mate_idx], apos),
-                            rel_vel(avel[mate_idx], avel)], axis=-1)
+                            rel_vel(avel[mate_idx], avel),
+                            pressure[mate_idx][..., None]], axis=-1)
 
     # Defenders, nearest first.
     order = np.argsort(np.linalg.norm(dpos[None] - apos[:, None], axis=-1),
@@ -642,17 +723,19 @@ class LowBlockEnv(gym.Env):
         # in-flight, clock, nearest-defender unit vector and scaled distance,
         # local pitch control, pc_f3/pc_hs (unbounded above for the same reason
         # as the critic's -- normalization="area" puts them in square metres),
-        # offside line, margin and flag, then the two relative neighbour blocks
-        # and the one-hot.
-        n_nbr = (n_att - 1) + K_DEF
+        # offside line, margin and flag, then the two neighbour blocks -- five
+        # columns per teammate, the fifth being that teammate's receiver
+        # pressure in [0, 1], against four per shown defender -- and the one-hot.
         row_lo = np.concatenate([
             [0.0, 0.0], [-1.0, -1.0], [-1.0, -1.0], [0.0], [0.0],
             [-1.0, -1.0, 0.0], [0.0], [0.0, 0.0], [0.0, -1.0, 0.0],
-            np.tile([-1.0, -1.0, -1.0, -1.0], n_nbr), np.zeros(n_att)])
+            np.tile([-1.0, -1.0, -1.0, -1.0, 0.0], n_att - 1),
+            np.tile([-1.0, -1.0, -1.0, -1.0], K_DEF), np.zeros(n_att)])
         row_hi = np.concatenate([
             [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0], [1.0],
             [1.0, 1.0, 1.0], [1.0], [np.inf, np.inf], [1.0, 1.0, 1.0],
-            np.tile([1.0, 1.0, 1.0, 1.0], n_nbr), np.ones(n_att)])
+            np.tile([1.0, 1.0, 1.0, 1.0, 1.0], n_att - 1),
+            np.tile([1.0, 1.0, 1.0, 1.0], K_DEF), np.ones(n_att)])
         self.observation_space = gym.spaces.Box(
             low=np.tile(row_lo, (n_att, 1)).astype("f4"),
             high=np.tile(row_hi, (n_att, 1)).astype("f4"),
