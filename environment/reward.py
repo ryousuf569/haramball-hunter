@@ -46,6 +46,10 @@ class RewardConfig:
     agent_alpha: float = 0.5 # weight on the per-attacker local shaping term
     use_gamma: bool = True # flag 1: gamma in the shaping term
     zero_terminal_potential: bool = True # flag 2: Phi(terminal) := 0
+    # flag 3: keep the offside penalty inside agent_potential. Off by default
+    # now that costs.py constrains offside directly. The term is kept rather
+    # than deleted, so one flag puts it back.
+    offside_in_potential: bool = False
 
     def __post_init__(self):
         if self.normalization not in NORMALIZATIONS:

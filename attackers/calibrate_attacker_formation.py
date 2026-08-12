@@ -39,7 +39,11 @@ def _draw(rng, row):
 
 
 # Sample one 2-5-3 attacker shape in sim coordinates, (n_att, 2), deepest slot first
-def sample_attacker_formation(rng, n_att=N_SLOTS, anchor_x=None):
+#
+# x_shift pushes the whole sampled shape that many metres goalward. It is a
+# curriculum knob rather than part of the fit, and training anneals it to 0 so
+# a finished policy is measured on the fitted distribution.
+def sample_attacker_formation(rng, n_att=N_SLOTS, anchor_x=None, x_shift=0.0):
     slots, frame = load_params()
 
     cy = _draw(rng, frame["centroid_y"])
@@ -47,6 +51,7 @@ def sample_attacker_formation(rng, n_att=N_SLOTS, anchor_x=None):
         cx = _draw(rng, frame["centroid_x"])  # absolute depth: where real attackers line up
     else:
         cx = float(anchor_x) - _draw(rng, frame["backline_gap"])  # or the fitted gap behind a given backline x
+    cx += float(x_shift)
 
     # One shared factor, so a compressed shape compresses in both directions at once
     rho = float(frame["spread_corr"]["mean"])

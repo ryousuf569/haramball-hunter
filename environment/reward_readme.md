@@ -114,3 +114,27 @@ exactly what going out charged, and the telescoping identity above still holds
 term for term. It is continuous where the observation's `is_offside` flag is
 binary, so an attacker well beyond the line has a gradient toward the line
 rather than a cliff at it.
+
+**Both of these are off by default now.** `EnvConfig.agent_alpha` is `0.0` and
+`EnvConfig.offside_in_potential` is `False`; the code and the tests stay, and
+one flag each puts them back.
+
+## What moved out of the reward, and why
+
+The argument above is about the *optimum*. It is airtight and it was never the
+problem. The problem is what a finite on-policy run converges to, and measured
+against a uniform-random control the 5M checkpoint was worse than chance at
+every part of the task except getting upfield -- the one thing `Phi` pays for
+directly.
+
+So the behaviours moved to `environment/costs.py` as indicator constraints with
+interpretable rates, and `ppo.Lagrange` sets their weights. `reward.py` keeps
+what it was for: `Phi` plus the terminals, the task objective and nothing else.
+
+**The ablation claim is unaffected.** A constraint changes the *feasible set*,
+not the shaping, so the telescoping identity `tests/test_reward.py` asserts
+still holds exactly and every arm still shares an optimum.
+
+The measurements, the constraint set, the Lagrangian, and the success-gate
+curriculum that had to come with it are all in **README.md, "Behaviour
+constraints"**.

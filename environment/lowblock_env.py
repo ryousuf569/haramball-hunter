@@ -34,7 +34,12 @@ from defenders.turnover import (
     apply_turnover,
 )
 from environment.grid import PC_NX, PC_NY, PC_CELL_SIZE
-from environment.termination import check_shot_opening, pcf_in_area
+from environment.termination import (
+    SHOT_P_MIN,
+    check_shot_opening,
+    pcf_in_area,
+    shot_gate,
+)
 from environment.reward import (
     RewardConfig,
     agent_shaping,
@@ -47,6 +52,7 @@ from environment.reward import (
 )
 from attackers.calibrate_attacker_formation import sample_attacker_formation
 from defenders.calibrate_defender_formation import sample_defender_formation
+from environment import costs
 
 
 # Deferred so deleting the throwaway baseline can't make the env unimportable.
@@ -205,8 +211,10 @@ def _defender_formation_gk_5_4_1(rng, n_def=11):
 
 
 # Rows deepest-first (2 backline, 5 midfield, 3 forward), sampled the same way.
-def _attacker_formation_2_5_3(rng, n_att=10):
-    return sample_attacker_formation(rng, n_att=n_att).astype("f4")
+# x_shift is the curriculum knob; see sample_attacker_formation.
+def _attacker_formation_2_5_3(rng, n_att=10, x_shift=0.0):
+    return sample_attacker_formation(rng, n_att=n_att,
+                                     x_shift=x_shift).astype("f4")
 
 
 # PC_NX/PC_NY/PC_CELL_SIZE live in environment.grid so termination.py can bin a
@@ -495,7 +503,8 @@ def compute_attacker_ppcf(players, ppcf_grid, ball_pos, per_attacker=False):
     return pc_att, att.reshape(PC_NX, PC_NY, -1)
 
 
-def make_initial_world(n_att=10, n_def=11, seed=11, start_holder=0):
+def make_initial_world(n_att=10, n_def=11, seed=11, start_holder=0,
+                       x_shift=0.0):
     rng = np.random.default_rng(seed)
 
     players = np.zeros(n_att + n_def, dtype=player_dt)
@@ -506,7 +515,8 @@ def make_initial_world(n_att=10, n_def=11, seed=11, start_holder=0):
     # Both shapes are sampled from real low-block freeze frames, so `seed`
     # actually changes the initial state. Defenders are a keeper on its line
     # plus a resting 5-4-1 near the x=105 goal they defend.
-    players["position"][:n_att] = _attacker_formation_2_5_3(rng, n_att)
+    players["position"][:n_att] = _attacker_formation_2_5_3(rng, n_att,
+                                                            x_shift=x_shift)
     players["position"][n_att:] = _defender_formation_gk_5_4_1(rng, n_def)
     players["velocity"][:] = 0.0
 
@@ -533,7 +543,8 @@ def make_initial_world(n_att=10, n_def=11, seed=11, start_holder=0):
 
 def step(players, ball, attacker_ids, defender_state, tick_count,
          ppcf_grid=None, exit_on_turnover=False, attacker_velocities=None,
-         attacker_ball_idx=None, verbose=True):
+         attacker_ball_idx=None, verbose=True, event_sink=None,
+         shot_p_min=SHOT_P_MIN):
     """Advance the world one tick.
 
     Returns (players, ball, pc_att, pc_own, outcome). pc_own is the (PC_NX,
@@ -547,7 +558,19 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
     scripted by design and have no such seam.
 
     verbose: print turnover/shot events. LowBlockEnv turns this off.
+
+    event_sink: an optional dict filled in with what happened, rather than what
+    state the tick ended in. The cost indicators need to tell an intercepted
+    pass from a lost duel, and the outcome alone only says FAILURE. It is an
+    out-parameter because five callers already unpack the return tuple. Keys:
+        "turnover"  one of "offside" / "duel" / "intercept" / "loose pass"
+        "shot_gate" (pcf, scoring_p, def_clear) for the holder, or Nones
+
+    shot_p_min: the scoring-probability threshold of the success gate. Defaults
+    to the calibrated one, and LowBlockEnv passes its curriculum value.
     """
+    if event_sink is not None:
+        event_sink.clear()
     att_mask = players["team"] == ATTACKER_LABEL
     def_mask = players["team"] == DEFENDER_LABEL
 
@@ -598,6 +621,8 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
         target_pos = players["position"][players["id"] == target_id][0]
         winner = nearest_defender_to(players, target_pos)
         ball = apply_turnover(ball, winner)
+        if event_sink is not None:
+            event_sink["turnover"] = "offside"
         if verbose:
             print(f"    TURNOVER (offside) tick {tick_count}: pass to {target_id} flagged, "
                   f"defender {winner} gets it")
@@ -628,6 +653,8 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
     winner = ground_duel(players, ball, defender_state["rng"], None, dt=DT)
     if winner is not None:
         ball = apply_turnover(ball, winner)
+        if event_sink is not None:
+            event_sink["turnover"] = "duel"
         if verbose:
             print(f"    TURNOVER (duel) tick {tick_count}: defender {winner} won the ball")
         if exit_on_turnover:
@@ -637,6 +664,8 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
                                 prev_ball_pos, dt=DT)
         if winner is not None:
             ball = apply_turnover(ball, winner)
+            if event_sink is not None:
+                event_sink["turnover"] = "intercept"
             if verbose:
                 print(f"    TURNOVER (intercept) tick {tick_count}: defender {winner} cut out the pass")
             if exit_on_turnover:
@@ -649,6 +678,8 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
         holder = ball.get("holder_id")
         if holder is not None and players["team"][players["id"] == holder][0] == DEFENDER_LABEL:
             winner = int(holder)
+            if event_sink is not None:
+                event_sink["turnover"] = "loose pass"
             if verbose:
                 print(f"    TURNOVER (loose pass) tick {tick_count}: defender {winner} collected it")
             if exit_on_turnover:
@@ -659,11 +690,17 @@ def step(players, ball, attacker_ids, defender_state, tick_count,
     outcome = None
     if winner is not None:
         outcome = FAILURE
-    elif pc_att is not None and check_shot_opening(players, ball, pc_att):
+    elif pc_att is not None and check_shot_opening(players, ball, pc_att,
+                                                   p_min=shot_p_min):
         outcome = SUCCESS
         if verbose:
             print(f"    SHOT OPENING tick {tick_count}: attacker {ball['holder_id']} "
                   f"is clear to shoot")
+
+    # How close this tick came to the gate, so a run can see which condition is
+    # binding rather than only that the success rate is zero.
+    if event_sink is not None and pc_att is not None:
+        event_sink["shot_gate"] = shot_gate(players, ball, pc_att)
 
     return players, ball, pc_att, pc_own, outcome
 
@@ -686,6 +723,11 @@ class LowBlockEnv(gym.Env):
         action                (n_att, 3) MultiDiscrete: direction, speed, ball
         info["state"]         99-dim global vector, critic input
         info["action_mask"]   (n_att, ball_actions) bool, ball head only
+        info["agent_reward"]  (n_att,) per-attacker shaping
+        info["agent_cost"]    (n_att, N_COSTS) indicator costs, environment/costs.py
+        info["cost_attempt"]  (n_att, N_COSTS) the events each cost is a rate over
+        info["shot_gate"]     (3,) the episode's closest approach to the success
+                              gate, for diagnosing an unreachable terminal
 
     reset() returns state and mask too: a rollout needs V(s_0) and a legal first
     action before it has taken a step.
@@ -698,13 +740,20 @@ class LowBlockEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, n_att=10, n_def=11, max_ticks=300, cfg=None,
-                 scripted_attackers=True):
+                 scripted_attackers=True, shot_p_min=SHOT_P_MIN, x_shift=0.0):
         super().__init__()
         self.n_att = n_att
         self.n_def = n_def
         self.max_ticks = max_ticks
         self.cfg = cfg if cfg is not None else RewardConfig()
         self.scripted_attackers = scripted_attackers
+
+        # The two curriculum knobs. Plain attributes so training can move them
+        # mid-run with venv.set_attr, which is the only way into an async
+        # worker. They default to the calibrated task, so an env built by a
+        # test or by render.py gets the real thing and not the easy version.
+        self.shot_p_min = float(shot_p_min)
+        self.x_shift = float(x_shift)
 
         # Built once per env, not per episode: fixed geometry, and masks that
         # are a pure function of it.
@@ -776,6 +825,15 @@ class LowBlockEnv(gym.Env):
         # shaping term only -- the observation still sees the team surface.
         self.pc_own = None
 
+        # Cost bookkeeping for environment/costs.py. possession_start is when
+        # the current holder got the ball, pass_origin_row is who played the
+        # ball now in the air, and best_gate is the episode's near miss.
+        self.n_costs = costs.N_COSTS
+        self.possession_start = None
+        self.pass_origin_row = None
+        self.best_gate = None
+        self.event = {}
+
     def remaining_time(self):
         return remaining_time(self.tick, self.max_ticks)
 
@@ -842,8 +900,15 @@ class LowBlockEnv(gym.Env):
         (self.players, self.ball, self.attacker_ids,
          _rng, self.defender_state) = make_initial_world(
             n_att=self.n_att, n_def=self.n_def, seed=ep_seed,
-            start_holder=holder)
+            start_holder=holder, x_shift=self.x_shift)
         self.tick = 0
+
+        # The starting holder has had it since tick 0, so a pass on tick 0
+        # counts as a hot potato. That is correct, and is what 5M.pt does.
+        self.possession_start = 0
+        self.pass_origin_row = None
+        self.best_gate = None
+        self.event = {}
 
         # Phi(s0) comes from the initial state, which no step() has touched --
         # hence the one extra PPCF call per episode. Skipping it would break the
@@ -857,15 +922,20 @@ class LowBlockEnv(gym.Env):
         self.pc_hs = parts["pc_hs"]
         self.pc_att = pc_att
         self.pc_own = pc_own
-        reset_agent_potential(self.pcf_state, pc_own,
-                              self.players["position"][:self.n_att],
-                              self.f3_mask, offside_line(self.players))
+        reset_agent_potential(
+            self.pcf_state, pc_own, self.players["position"][:self.n_att],
+            self.f3_mask,
+            offside_line(self.players) if self.cfg.offside_in_potential else None)
 
+        zero_cost, zero_attempt = costs.empty_costs(self.n_att)
         return self.obs(), {"phi_0": phi_0, "pc_f3": parts["pc_f3"],
                             "pc_hs": parts["pc_hs"], "tick": self.tick,
                             "state": self.global_state(),
                             "action_mask": self.action_mask(),
-                            "agent_reward": np.zeros(self.n_att, dtype="f4")}
+                            "agent_reward": np.zeros(self.n_att, dtype="f4"),
+                            "agent_cost": zero_cost,
+                            "cost_attempt": zero_attempt,
+                            "shot_gate": np.zeros(3, dtype="f4")}
 
     def decode_action(self, action):
         """(n_att, 3) of (direction, speed, ball) -> the two arrays step() wants.
@@ -885,15 +955,43 @@ class LowBlockEnv(gym.Env):
             ball_idx[row] = int(a[row, 2])
         return vel, ball_idx
 
+    def intended_target_id(self, pre_row, ball_idx):
+        """Player id this tick's pass was aimed at, or None if it was a HOLD.
+
+        Read off the action, not the resulting ball, because an offside pass
+        goes straight to a defender and leaves no in-flight ball to inspect.
+        """
+        if pre_row is None:
+            return None
+        if ball_idx is not None:
+            k = int(np.asarray(ball_idx)[pre_row])
+            if k == 0:
+                return None
+            holder_id = int(self.attacker_ids[pre_row])
+            mates = np.sort(self.attacker_ids[self.attacker_ids != holder_id])
+            return int(mates[k - 1])
+        return (self.ball.get("target_id")
+                if self.ball["state"] == "in_flight" else None)
+
     def step(self, action):
         avel, ball_idx = (None, None)
         if not self.scripted_attackers:
             avel, ball_idx = self.decode_action(action)
 
+        # Snapshot what the cost indicators need, since it is gone by the time
+        # world_step returns.
+        pre_row = self.holder_row()
+        pre_pos = np.asarray(self.players["position"][:self.n_att],
+                             dtype=float).copy()
+        held_ticks = (self.tick - self.possession_start
+                      if pre_row is not None and self.possession_start is not None
+                      else 0)
+
         self.players, self.ball, pc_att, pc_own, outcome = world_step(
             self.players, self.ball, self.attacker_ids, self.defender_state,
             self.tick, ppcf_grid=self.ppcf_grid, attacker_velocities=avel,
-            attacker_ball_idx=ball_idx, verbose=False)
+            attacker_ball_idx=ball_idx, verbose=False, event_sink=self.event,
+            shot_p_min=self.shot_p_min)
         self.tick += 1
 
         # step() has no horizon of its own; the timeout is imposed here.
@@ -927,12 +1025,78 @@ class LowBlockEnv(gym.Env):
         # The line is passed here and at reset alike: the offside penalty is
         # inside the potential, so an unseeded reset would bill the first
         # transition for a position it never credited.
+        line = offside_line(self.players)
         parts["agent_reward"] = agent_shaping(
             self.pcf_state, self.pc_own,
             self.players["position"][:self.n_att], self.cfg,
             self.f3_mask, terminal=terminated,
-            line=offside_line(self.players)).astype("f4")
+            line=line if self.cfg.offside_in_potential else None).astype("f4")
+
+        cost, attempt = self.assess_costs(pre_row, pre_pos, held_ticks,
+                                          ball_idx, outcome, line)
+        parts["agent_cost"] = cost
+        parts["cost_attempt"] = attempt
+        parts["shot_gate"] = self.gate_report()
         return self.obs(), float(reward), terminated, truncated, parts
+
+    def assess_costs(self, pre_row, pre_pos, held_ticks, ball_idx, outcome,
+                     line):
+        """The tick's indicator costs, (n_att, N_COSTS) each. See costs.py.
+
+        Runs after world_step, so an attacker is billed for the position it
+        moved into. Pass costs are the exception and use pre-step geometry,
+        because a pass is judged on the situation it was played from.
+        """
+        cost, attempt = costs.per_tick_costs(self.players, self.ball,
+                                             self.n_att, line)
+
+        target_id = self.intended_target_id(pre_row, ball_idx)
+        if target_id is not None:
+            tgt_row = int(np.flatnonzero(self.attacker_ids == target_id)[0])
+            costs.release_costs(cost, attempt, pre_row, pre_pos[pre_row],
+                                pre_pos[tgt_row], held_ticks)
+
+        kind = self.event.get("turnover")
+        lost = kind in ("intercept", "loose pass", "offside")
+        if target_id is not None:
+            # Released this tick. Either it died on the spot, or it is now the
+            # pass whose fate a later tick will bill back to this row.
+            if lost:
+                costs.pass_lost_cost(cost, pre_row)
+            else:
+                self.pass_origin_row = pre_row
+        elif self.pass_origin_row is not None and lost:
+            costs.pass_lost_cost(cost, self.pass_origin_row)
+            self.pass_origin_row = None
+
+        terminated = outcome is not None
+        if terminated:
+            costs.terminal_costs(cost, attempt, outcome, SUCCESS)
+
+        # Possession bookkeeping for the next tick. A pass that found a
+        # team-mate clears the pending row, and one that found a defender was
+        # already billed above.
+        post_row = self.holder_row()
+        if post_row is not None:
+            self.pass_origin_row = None
+        if post_row != pre_row:
+            self.possession_start = self.tick if post_row is not None else None
+        return cost, attempt
+
+    def gate_report(self):
+        """(3,) float32: the episode's best shot at each gate condition.
+
+        The max over the episode of each condition, on ticks an attacker had
+        the ball. A zero success rate cannot tell an unreachable condition from
+        three that nearly held, and this can.
+        """
+        g = self.event.get("shot_gate")
+        if g is not None and g[0] is not None:
+            v = np.array([g[0], g[1], float(g[2])], dtype="f4")
+            self.best_gate = v if self.best_gate is None else np.maximum(
+                self.best_gate, v)
+        return (np.zeros(3, dtype="f4") if self.best_gate is None
+                else self.best_gate.copy())
 
 
 def make_vector_env(n_envs=6, asynchronous=False, seed=None,

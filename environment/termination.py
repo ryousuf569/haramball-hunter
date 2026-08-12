@@ -75,19 +75,58 @@ def nearest_defender_distance(players, position):
 
     return float(np.sqrt(d2.min())) > 3.0
 
-def check_shot_opening(players, ball, pcf_att):
+# The calibrated gate. Benchmark numbers are quoted against SHOT_P_MIN, and the
+# curriculum is allowed to run looser than it but never tighter.
+SHOT_PCF_MIN = 0.30
+SHOT_P_MIN = 0.74
 
+# Spearman's S(r) constants, named so the inverse cannot drift from the forward.
+_S_A, _S_B, _S_C = 0.93, 0.14, 0.48
+
+
+def radius_for_p(p):
+    """Distance from goal at which scoring_probability equals p, in metres.
+
+    Anneal a curriculum on this rather than on p. A p of 0.74 is a 15.7m
+    radius, but 0.60 looks like a small change and is 50m, over half the pitch.
+    """
+    p = float(p)
+    return (-np.log(p ** (1.0 / _S_C) / _S_A) / _S_B) ** 2
+
+
+def p_for_radius(r):
+    """scoring_probability at r metres from goal, the inverse of the above."""
+    return float((_S_A * np.exp(-_S_B * np.sqrt(float(r)))) ** _S_C)
+
+
+def shot_gate(players, ball, pcf_att):
+    """The three gate conditions, unthresholded: (pcf, scoring_p, def_clear).
+
+    Split out so a run can report which condition is binding, which a success
+    rate of zero never says. Returns Nones if no attacker has the ball.
+    """
     holder_id = ball.get("holder_id")
     if holder_id is None:
-        return False
+        return None, None, None
 
     holder = players[players["id"] == holder_id][0]
     if holder["team"] != "attacker":
-        return False
+        return None, None, None
 
     position = np.atleast_2d(np.asarray(holder["position"], dtype=float))
+    return (float(pcf_in_area(position, pcf_att)[0]),
+            float(scoring_probability(position)[0]),
+            bool(nearest_defender_distance(players, position[0])))
 
-    # Both thresholds come from environment/calibration/
-    return bool(pcf_in_area(position, pcf_att)[0] >= 0.30
-                and scoring_probability(position)[0] >= 0.74
-                and nearest_defender_distance(players, position[0]))
+
+def check_shot_opening(players, ball, pcf_att, p_min=SHOT_P_MIN,
+                       pcf_min=SHOT_PCF_MIN):
+
+    # Both default thresholds come from environment/calibration/. p_min is a
+    # parameter so a curriculum can start reachable and tighten onto the
+    # calibrated gate, and it is the only condition the curriculum moves.
+    pcf, p, clear = shot_gate(players, ball, pcf_att)
+    if pcf is None:
+        return False
+
+    return bool(pcf >= pcf_min and p >= p_min and clear)
