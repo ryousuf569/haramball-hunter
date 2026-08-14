@@ -300,9 +300,18 @@ one-variable comparison, and it is reverted. See `environment/reward_readme.md`.
 
 ```
 lambda_k = exp(z_k) / (exp(a0) + sum_j exp(z_j))
-z_k     += lr * (rate_k - d_k)
+v_k      = rate_k - d_k
+z_k     += lr * lambda_k * (v_k - sum_j lambda_j * v_j)
 A        = lambda_0 * A_R  -  sum_k lambda_k * A_C_k
 ```
+
+The `z` update is Algorithm 1's gradient of `lambda_k * v_k`, taken through the
+softmax. It used to be `z_k += lr * v_k`, which is not the same thing and is
+what made the 750k run's arm B a no-op: without the `lambda_k` factor a
+collapsed multiplier keeps falling instead of freezing, and without the
+centring a constraint gains weight for being violated at all rather than for
+being violated *more than the current weighted average*. The result was a
+one-way race that `no_success` won outright. See `Lagrange.update`.
 
 The minus sign is because the constraints are on costs to be kept *below* a
 threshold: an action that raises the expected count of intercepted passes has a
