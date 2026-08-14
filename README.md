@@ -270,22 +270,31 @@ costs a critic).
 
 | constraint | fires on | 5M | random | `d_k` |
 |---|---|---|---|---|
-| `pass_lost` | pass attempt | 26.1% | 9.9% | 0.08 |
+| `pass_lost` | pass attempt | 26.1% | 9.9% | 0.15 |
 | `cross_field` (\|dy\| > 20m) | pass attempt | 46.6% | 38.0% | 0.10 |
 | `hot_potato` (released <5 ticks) | pass attempt | 97.7% | 100% | 0.25 |
+| `held_too_long` (>40 ticks) | carry-tick | — | — | 0.10 |
 | `pass_back` (dx < -2m) | pass attempt | 37.5% | 42.7% | 0.25 |
 | `offside` | attacker-tick | 6.4% | 1.9% | 0.02 |
 | `far_from_ball` (>30m) | attacker-tick | 29.4% | 26.7% | 0.20 |
 | `no_success` | episode | 100% | 99.3% | 0.60 |
+
+`hot_potato` and `held_too_long` are a pair, and the pairing is not optional.
+The first 500k run had only `hot_potato`, which is one-sided, and the
+constrained arm satisfied it by **never releasing the ball**: one pass in 24
+episodes, an attacker on the ball 99.3% of ticks. A quantity with two bad tails
+needs an indicator on each. See `models/081126-500k/analysis/findings.md`.
 
 `hot_potato` is the one that buys dribbling. `DRIBBLE_V_MAX` already makes
 carrying cost speed, so carrying is otherwise strictly dominated and nothing in
 the reward makes it preferable. `far_from_ball` is the shape constraint: it is
 what stops ten attackers sprinting into the final third to inflate `PC_F3` and
 leaving every pass a 30m diagonal. `offside` replaces `OFFSIDE_W`, and
-`config.EnvConfig` now ships `agent_alpha = 0.0` and
-`offside_in_potential = False` — the code and its tests stay, and one flag each
-puts them back.
+`offside` **complements** `OFFSIDE_W` rather than replacing it: the potential
+term is continuous and the constraint is binary, and both stay on. An earlier
+pass switched off `agent_alpha` and the offside potential in the constrained
+arms; that was an overcorrection, it bundled two reward changes into a
+one-variable comparison, and it is reverted. See `environment/reward_readme.md`.
 
 ### The multipliers
 
@@ -310,10 +319,23 @@ that the combined advantage is normalised **once**, after the sum: normalising
 each channel first would rescale every constraint to unit variance and throw
 away exactly what the multipliers encode.
 
-`a0` is fixed, not learned. It sets the floor on how much of the simplex the
-task keeps: at `a0 = 0` with seven constraints all at `z = 0`, the reward holds
-1/8. Multipliers are held still for `warmup_updates` so the cost critics see
-data first, and move once per PPO update — a saddle-point problem needs the
+`a0` is fixed, not learned, and sets how much of the simplex the task starts
+with. It is `log(K)`, so the reward holds about half before any constraint
+moves. Two further guards were added after the first 500k run, both deviations
+from the paper and both earned:
+
+- **`z_clip`** bounds `|z|`. Without it a constraint that stays violated drifts
+  `z` linearly, the softmax saturates onto it, and everything else is starved.
+  Measured: five of eight constraints ended at `lambda ~0.000` *while still
+  violated*, one of them nearly five times its threshold.
+- **`reward_floor`** holds the task's share at 0.30, rescaling the constraints
+  to fit underneath. The bootstrap floors the reward at
+  `lambda_no_success`, but nothing stopped an individual constraint exceeding
+  that floor: `hot_potato` reached 0.69 against a reward weight of 0.26, and
+  the policy stopped passing.
+
+Multipliers are held still for `warmup_updates` so the cost critics see data
+first, and move once per PPO update, because a saddle-point problem needs the
 multipliers slower than the policy or the two oscillate.
 
 **The bootstrap constraint.** `no_success` is the main task restated as "fail
@@ -368,11 +390,15 @@ teaches a habit the policy has to unlearn when the gate closes. Level 0 is a
 25m gate with the attacking shape started 4m further on, which **uniform-random
 play converts 22% of the time** — dense enough that the terminal is a signal,
 far enough from free that there is something to learn. (30m gives random play
-51%, 35m gives 56%; the real gate at `x_shift = 0` gives 2.6%.) `advance_at`
-is 0.35, above that 22% floor, so a level is earned by beating chance rather
-than by arriving. Level 8 is the calibrated gate with the fitted formation, and
-the level never goes back down — oscillating the task definition underneath a
-value function is its own failure mode.
+51%, 35m gives 56%; the real gate at `x_shift = 0` gives 2.6%.) Level 8 is the
+calibrated gate with the fitted formation.
+
+**The ramp is on training progress, not on success rate.** It reaches level 8
+at `finish_frac` (0.70) of the run, so the last 30% of every run is on the real
+task. Advancing on success rate had two failures, both measured: a better
+policy tightened its own gate, so its success rate then described a harder task
+and arms were not comparable; and at 500k no arm got past level 4 of 8, which
+meant every checkpoint was scored on a gate it had never trained against.
 
 Nothing outside training ever sees the loosened gate: `scripts/diag_policy.py`,
 `render.py` and every env built by a test use `termination.SHOT_P_MIN`.
@@ -402,7 +428,7 @@ weight wearing a different hat.**
 
 | arm | objective | thresholds |
 |---|---|---|
-| A `reward_only` | plain PPO, the hand-weighted reward as it stood (`agent_alpha` 0.5, offside inside the potential) | — |
+| A `reward_only` | plain PPO on the hand-weighted reward | — |
 | B `constrained` | the seven constraints | **measured** off 5M.pt and the random control |
 | C `constrained_mistuned` | the seven constraints | **guessed** — "no bad passes at all", tighter than the physics allows |
 
@@ -423,9 +449,16 @@ impossible. A reward-weight failure never says that. That is
 violation for a whole run while its λ climbs is infeasible, and you can read it
 off the figure in seconds.
 
-The curriculum and the seed are **identical across arms**; only the objective
-specification varies. Every arm measures all seven constraint rates, including
-A, which never optimises them — that is what makes the comparison meaningful.
+**Every arm gets the same `EnvConfig`, the same curriculum and the same seed.**
+Only the constraint specification varies. Every arm measures all eight
+constraint rates, including A, which never optimises them — that is what makes
+the comparison meaningful.
+
+Two things make the success numbers comparable. The curriculum runs on a
+schedule rather than on success rate, so all arms sit at the same gate at the
+same step; and `PPOConfig.eval_every` runs a held-out evaluation against
+`termination.SHOT_P_MIN` throughout, which is the series `comparison.png`
+plots.
 
 Each run gets its own folder, `models/<MMDDYY>-<steps>/`, holding the three
 checkpoints and a `figs/` subfolder. A 500k run started today lands in

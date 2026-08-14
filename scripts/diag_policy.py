@@ -46,7 +46,8 @@ def resolve(path):
 
 
 def load_actor(path, n_att=10, n_def=11):
-    ckpt = torch.load(resolve(path), map_location="cpu")
+    # weights_only=False: see the same note in environment/learned_env.py.
+    ckpt = torch.load(resolve(path), map_location="cpu", weights_only=False)
     state = ckpt.get("actor", ckpt) if isinstance(ckpt, dict) else ckpt
     a = Actor(obs_dim(n_att + n_def, n_att), N_DIRECTIONS, N_SPEEDS,
               ball_actions(n_att))

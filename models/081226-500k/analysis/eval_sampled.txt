@@ -1,0 +1,154 @@
+########## reward_only ##########
+
+==============================================================================
+models/081226-500k/reward_only.pt sampled   (24 episodes)
+==============================================================================
+  success    8.3%  (2)
+  failure   83.3%  (20)
+  timeout    8.3%  (2)
+  ep length  mean  134.2  median   75.0 ticks  (13.4s)
+  turnovers by kind: {'loose pass': 10, 'duel': 2, 'intercept': 8}
+
+  PASSES: 125 total, 5.21 per episode
+    outcomes: complete 82.4%  loose pass 8.0%  intercept 6.4%  lost 1.6%  ? 1.6%
+    length  mean  35.9m  median  34.7  p90  63.7  max  74.8
+    dx      mean  +0.5m  forward 48.0%  sideways 4.8%  backward 47.2%
+    lateral |dy| mean  26.8m  cross-field(|dy|>20) 53.6%
+    presser: holder  11.4m  target  14.8m
+      complete    n= 103  len  36.2m  dx  -0.2m  tgt_press  15.3m
+      intercept   n=   8  len  30.1m  dx  -3.6m  tgt_press  11.5m
+      loose pass  n=  10  len  41.3m  dx +10.5m  tgt_press  10.0m
+      lost        n=   2  len  21.7m  dx +17.0m  tgt_press   9.1m
+
+  ON-BALL: holder ticks 156 (4.8% of ticks), flight 95.2%
+    hold prob (softmax P[HOLD] at holder)  mean 0.280
+    legal pass targets available  mean 8.24 / 9
+    holder speed 0.98 m/s   off-ball speed 1.05 m/s   (V_MAX 5.0)
+    holder dx/tick +0.079 m  -> +0.79 m/s net upfield while carrying
+
+  ACTION HEADS (all agent-ticks)
+    direction top5: (+0.0,+1.0)=45.7%  (+0.0,+0.0)=18.7%  (+0.7,-0.7)=17.8%  (+0.7,+0.7)=5.5%  (+0.0,-1.0)=3.0%
+    speed: 1.5=26.6%  3.0=32.4%  5.0=40.9%
+    HOLDER direction top5: (+0.0,+1.0)=32.1%  (+0.7,-0.7)=32.1%  (+0.0,+0.0)=10.3%  (+0.7,+0.7)=9.6%  (+1.0,+0.0)=5.1%
+    HOLDER speed: 1.5=26.3%  3.0=46.2%  5.0=27.6%
+    entropy  dir 0.714/2.197   spd 0.371/1.099   ball 1.750
+
+  FIELD PROGRESS
+    ball x: start  64.5  end  71.3  max  82.0  (final third = 70)
+    reached final third: 87.5% of episodes
+    mean attacker x: start  64.6  end  68.2
+
+  CANDIDATE CONSTRAINT RATES (measured -- use to set thresholds d_k)
+    pass lost                    16.0% of passes
+    pass cross-field |dy|>20m    53.6% of passes
+    pass backward dx<-2m         47.2% of passes
+    pass long >25m               65.6% of passes
+    release within <5 ticks      99.2% of passes   (held: mean 0.2 median 0 ticks)
+    release within <10 ticks    100.0% of passes
+    carrier pressed <3m          23.7% of carry-ticks
+    attacker offside              8.8% of attacker-ticks
+    attacker >30m from ball      46.1% of attacker-ticks   (mean dist 30.3m)
+    attackers in final third    4.40 / 10 per tick
+    attacker x spread (std)     14.7 m
+########## constrained ##########
+
+==============================================================================
+models/081226-500k/constrained.pt sampled   (24 episodes)
+==============================================================================
+  success    0.0%  (0)
+  failure  100.0%  (24)
+  timeout    0.0%  (0)
+  ep length  mean   61.0  median   57.5 ticks  (6.1s)
+  turnovers by kind: {'duel': 18, 'intercept': 3, 'loose pass': 3}
+
+  PASSES: 32 total, 1.33 per episode
+    outcomes: complete 81.2%  intercept 9.4%  loose pass 9.4%
+    length  mean  18.2m  median  17.4  p90  29.4  max  42.7
+    dx      mean  +3.2m  forward 53.1%  sideways 9.4%  backward 37.5%
+    lateral |dy| mean  13.0m  cross-field(|dy|>20) 18.8%
+    presser: holder   7.6m  target   8.3m
+      complete    n=  26  len  17.5m  dx  +3.0m  tgt_press   8.4m
+      intercept   n=   3  len  15.8m  dx -10.3m  tgt_press  10.9m
+      loose pass  n=   3  len  26.8m  dx +18.2m  tgt_press   4.8m
+
+  ON-BALL: holder ticks 1039 (71.0% of ticks), flight 29.0%
+    hold prob (softmax P[HOLD] at holder)  mean 0.965
+    legal pass targets available  mean 8.90 / 9
+    holder speed 1.50 m/s   off-ball speed 1.54 m/s   (V_MAX 5.0)
+    holder dx/tick +0.021 m  -> +0.21 m/s net upfield while carrying
+
+  ACTION HEADS (all agent-ticks)
+    direction top5: (+1.0,+0.0)=31.0%  (+0.0,+0.0)=19.6%  (-0.7,+0.7)=14.2%  (+0.0,+1.0)=11.9%  (-0.7,-0.7)=7.0%
+    speed: 1.5=56.2%  3.0=6.0%  5.0=37.8%
+    HOLDER direction top5: (+1.0,+0.0)=24.8%  (-0.7,+0.7)=21.6%  (+0.0,+0.0)=17.6%  (+0.0,+1.0)=9.6%  (+0.0,-1.0)=8.7%
+    HOLDER speed: 1.5=47.3%  3.0=7.4%  5.0=45.3%
+    entropy  dir 1.047/2.197   spd 0.413/1.099   ball 0.159
+
+  FIELD PROGRESS
+    ball x: start  64.5  end  71.5  max  74.2  (final third = 70)
+    reached final third: 70.8% of episodes
+    mean attacker x: start  64.6  end  67.6
+
+  CANDIDATE CONSTRAINT RATES (measured -- use to set thresholds d_k)
+    pass lost                    18.8% of passes
+    pass cross-field |dy|>20m    18.8% of passes
+    pass backward dx<-2m         37.5% of passes
+    pass long >25m               21.9% of passes
+    release within <5 ticks      25.0% of passes   (held: mean 17.3 median 13 ticks)
+    release within <10 ticks     31.2% of passes
+    carrier pressed <3m          38.5% of carry-ticks
+    attacker offside              0.7% of attacker-ticks
+    attacker >30m from ball      19.8% of attacker-ticks   (mean dist 19.8m)
+    attackers in final third    3.75 / 10 per tick
+    attacker x spread (std)     8.5 m
+########## constrained_mistuned ##########
+
+==============================================================================
+models/081226-500k/constrained_mistuned.pt sampled   (24 episodes)
+==============================================================================
+  success    0.0%  (0)
+  failure  100.0%  (24)
+  timeout    0.0%  (0)
+  ep length  mean   37.0  median   32.0 ticks  (3.7s)
+  turnovers by kind: {'loose pass': 13, 'duel': 10, 'intercept': 1}
+
+  PASSES: 25 total, 1.04 per episode
+    outcomes: loose pass 52.0%  complete 44.0%  intercept 4.0%
+    length  mean  18.2m  median  16.6  p90  30.2  max  42.1
+    dx      mean +10.4m  forward 80.0%  sideways 12.0%  backward 8.0%
+    lateral |dy| mean  12.2m  cross-field(|dy|>20) 12.0%
+    presser: holder   9.2m  target   6.4m
+      complete    n=  11  len  12.1m  dx  +2.8m  tgt_press   6.6m
+      intercept   n=   1  len  16.4m  dx +12.8m  tgt_press   2.9m
+      loose pass  n=  13  len  23.5m  dx +16.7m  tgt_press   6.4m
+
+  ON-BALL: holder ticks 546 (61.4% of ticks), flight 38.6%
+    hold prob (softmax P[HOLD] at holder)  mean 0.943
+    legal pass targets available  mean 8.78 / 9
+    holder speed 2.27 m/s   off-ball speed 2.88 m/s   (V_MAX 5.0)
+    holder dx/tick -0.051 m  -> -0.51 m/s net upfield while carrying
+
+  ACTION HEADS (all agent-ticks)
+    direction top5: (+0.0,+1.0)=38.5%  (+1.0,+0.0)=15.5%  (+0.0,-1.0)=13.3%  (+0.7,+0.7)=10.5%  (-0.7,+0.7)=8.2%
+    speed: 1.5=20.8%  3.0=15.6%  5.0=63.6%
+    HOLDER direction top5: (+0.0,+1.0)=29.7%  (+0.0,-1.0)=23.4%  (-0.7,-0.7)=16.7%  (-0.7,+0.7)=15.6%  (+1.0,+0.0)=6.0%
+    HOLDER speed: 1.5=7.5%  3.0=7.3%  5.0=85.2%
+    entropy  dir 0.852/2.197   spd 0.195/1.099   ball 0.207
+
+  FIELD PROGRESS
+    ball x: start  64.5  end  73.7  max  75.8  (final third = 70)
+    reached final third: 79.2% of episodes
+    mean attacker x: start  64.6  end  65.5
+
+  CANDIDATE CONSTRAINT RATES (measured -- use to set thresholds d_k)
+    pass lost                    56.0% of passes
+    pass cross-field |dy|>20m    12.0% of passes
+    pass backward dx<-2m          8.0% of passes
+    pass long >25m               24.0% of passes
+    release within <5 ticks      64.0% of passes   (held: mean 5.8 median 3 ticks)
+    release within <10 ticks     80.0% of passes
+    carrier pressed <3m          45.4% of carry-ticks
+    attacker offside              1.5% of attacker-ticks
+    attacker >30m from ball      13.9% of attacker-ticks   (mean dist 17.4m)
+    attackers in final third    3.55 / 10 per tick
+    attacker x spread (std)     9.6 m

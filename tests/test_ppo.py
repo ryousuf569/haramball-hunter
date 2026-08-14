@@ -109,6 +109,38 @@ def test_running_norm_tracks_mean_and_std():
     assert torch.allclose(rn.denormalize(rn.normalize(x)), x, atol=1e-3)
 
 
+def test_running_norm_follows_a_moving_distribution():
+    # The one that mattered. count used to grow without bound, so each batch
+    # moved the mean by batch/count and the statistics froze near whatever the
+    # returns looked like early. Measured on the 500k run: the return mean
+    # drifted +1.5 -> -1.0 as the curriculum advanced while the normaliser
+    # still said +0.25, so the critic regressed targets mis-centred by a full
+    # standard deviation and explained variance sat at 0 for the whole run.
+    torch.manual_seed(0)
+    rn = RunningNorm()
+    for update in range(650):
+        true_mean = 1.5 - 2.5 * (update / 650)
+        rn.update(torch.randn(7680) * 1.2 + true_mean)
+
+    assert abs(rn.mean - (-1.0)) < 0.2, (
+        f"normaliser reports {rn.mean:.3f} against a true mean of -1.0; "
+        f"is count still unbounded?")
+    assert abs(rn.std - 1.2) < 0.15, rn.std
+    assert rn.count <= RunningNorm.HORIZON + 1
+
+
+def test_running_norm_state_round_trips():
+    # The critic emits normalised values, so a checkpoint without these makes
+    # its output meaningless on reload.
+    rn = RunningNorm()
+    rn.update(torch.randn(1000) * 2.0 + 5.0)
+    clone = RunningNorm()
+    clone.load(rn.state())
+    x = torch.randn(50)
+    assert torch.allclose(clone.normalize(x), rn.normalize(x))
+    assert clone.count == rn.count
+
+
 def test_critic_has_one_head_per_attacker():
     critic = Critic(state_dim(N_ATT + N_DEF, N_ATT), N_ATT)
     out = critic(torch.zeros(5, state_dim(N_ATT + N_DEF, N_ATT)))

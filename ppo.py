@@ -127,6 +127,13 @@ class CostCritics(nn.Module):
             out[..., k] = rn.normalize(returns[..., k])
         return out
 
+    def norm_state(self):
+        return [rn.state() for rn in self.norms]
+
+    def load_norm_state(self, states):
+        for rn, s in zip(self.norms, states):
+            rn.load(s)
+
 
 class Lagrange:
     """Softmax-normalised multipliers for the constraints in costs.py.
@@ -149,7 +156,16 @@ class Lagrange:
         logits = logits - logits.max()
         e = np.exp(logits)
         w = e / e.sum()
-        return float(w[0]), w[1:]
+        lam0, lam = float(w[0]), w[1:]
+
+        # Keep the task's share above the floor, rescaling the constraints to
+        # fit underneath so the simplex still sums to 1.
+        floor = getattr(self.cfg, "reward_floor", 0.0)
+        if floor and lam0 < floor:
+            total = lam.sum()
+            lam = lam * ((1.0 - floor) / total) if total > 0 else lam
+            lam0 = floor
+        return lam0, lam
 
     def reward_weight(self, lam0, lam):
         """The bootstrap: lambda_0 := max(lambda_0, lambda_no_success).
@@ -167,22 +183,29 @@ class Lagrange:
         self.updates += 1
         if self.updates > self.cfg.warmup_updates:
             self.z += self.cfg.lr * (np.asarray(rates, dtype=np.float64) - self.d)
+            # Without the clip a constraint that stays violated drifts z
+            # linearly and the softmax saturates onto it, starving every other
+            # constraint of weight even while they are violated too.
+            clip = self.cfg.z_clip
+            if clip:
+                np.clip(self.z, -clip, clip, out=self.z)
         return self.all_lambdas()
 
 
 class Curriculum:
     """Anneal the success gate and the start state onto the real task.
 
-    Level 0 is the easy end and the last level is the calibrated gate. It
-    advances on recent success rate and never goes back down, because moving
-    the task around underneath a value function is its own failure mode.
+    Level 0 is the easy end and the last level is the calibrated gate, reached
+    at CurriculumConfig.finish_frac of training so the run ends on the real
+    task. The schedule is on training progress, not on success rate: a
+    success-rate trigger lets a better policy tighten its own gate, which makes
+    its success rate describe a harder task and stops arms being comparable.
     """
 
     def __init__(self, cfg: CurriculumConfig, target_p_min=SHOT_P_MIN):
         self.cfg = cfg
         self.target_radius = radius_for_p(target_p_min)
         self.level = cfg.steps if not cfg.enabled else 0
-        self.last_advance = 0
 
     @property
     def fraction(self):
@@ -194,18 +217,15 @@ class Curriculum:
         r = self.cfg.radius_start + f * (self.target_radius - self.cfg.radius_start)
         return p_for_radius(r), float(self.cfg.x_shift_start * (1.0 - f))
 
-    def maybe_advance(self, success_rate, n_episodes, update):
-        """True if this call moved the level."""
-        if self.level >= self.cfg.steps:
+    def advance_to(self, progress):
+        """Set the level from training progress in [0, 1]. True if it moved."""
+        if not self.cfg.enabled:
             return False
-        if n_episodes < self.cfg.min_episodes:
+        f = min(1.0, progress / max(self.cfg.finish_frac, 1e-9))
+        level = min(self.cfg.steps, int(f * self.cfg.steps))
+        if level == self.level:
             return False
-        if update - self.last_advance < self.cfg.hold_updates:
-            return False
-        if success_rate < self.cfg.advance_at:
-            return False
-        self.level += 1
-        self.last_advance = update
+        self.level = level
         return True
 
     def apply(self, venv):
@@ -220,10 +240,22 @@ class RunningNorm:
     returns and its output is scaled back for GAE, so a reward scale that drifts
     over training does not keep re-scaling the value loss."""
 
-    def __init__(self):
+    # Cap on the sample count, which is what makes this a RUNNING estimate
+    # rather than a lifetime one. Without it count grows without bound, each new
+    # batch moves the mean by batch/count, and the statistics freeze near
+    # whatever the distribution looked like early on. Measured on the 500k run:
+    # the return mean drifted from +1.5 to -1.0 as the curriculum advanced while
+    # the normaliser still reported +0.25, so the critic was regressing targets
+    # mis-centred by a full standard deviation and explained variance sat at 0.
+    # 100k samples is roughly a dozen updates at the default batch size, enough
+    # for a stable mean and short enough to follow a curriculum.
+    HORIZON = 100_000
+
+    def __init__(self, horizon=None):
         self.mean = 0.0
         self.var = 1.0
         self.count = 1e-4
+        self.horizon = self.HORIZON if horizon is None else horizon
 
     def update(self, x):
         bm, bv, bc = float(x.mean()), float(x.var()), x.numel()
@@ -232,7 +264,13 @@ class RunningNorm:
         self.mean += d * bc / total
         self.var = ((self.var * self.count + bv * bc
                      + d * d * self.count * bc / total) / total)
-        self.count = total
+        self.count = min(total, self.horizon)
+
+    def state(self):
+        return {"mean": self.mean, "var": self.var, "count": self.count}
+
+    def load(self, s):
+        self.mean, self.var, self.count = s["mean"], s["var"], s["count"]
 
     @property
     def std(self):
@@ -520,6 +558,38 @@ def ppo_losses(newlogprob, ent_terms, newvalue, old_logprob, advantages,
         clipfrac = ((ratio - 1).abs() > cfg.clip_coef).float().mean()
     return loss, pg_loss, v_loss, c_loss, sum(ent_terms), approx_kl, clipfrac
 
+@torch.no_grad()
+def evaluate(actor, venv, n_episodes, n_att, device="cpu"):
+    """Success rate on the CALIBRATED gate, whatever gate training is using.
+
+    The curriculum advances on success rate, so a better policy tightens its
+    own gate and its training success rate then describes a harder task. Two
+    arms at different levels are not comparable on that number. This one is
+    measured against a fixed task for every arm at every point in the run, so
+    it is the series a comparison figure should plot.
+    """
+    obs_np, info = venv.reset()
+    n_envs = venv.num_envs
+    outcomes, lengths = [], []
+    to_t = lambda x: torch.as_tensor(np.asarray(x), dtype=torch.float32,
+                                     device=device)
+
+    while len(outcomes) < n_episodes:
+        obs = to_t(obs_np)
+        mask = torch.as_tensor(np.asarray(info["action_mask"]),
+                               dtype=torch.bool, device=device)
+        action = policy_dist(actor, obs, mask).sample()
+        obs_np, _r, term, trunc, info = venv.step(
+            action.view(n_envs, n_att, ACTION_HEADS).cpu().numpy())
+        outs, ticks = episode_outcomes(info)
+        outcomes += outs
+        lengths += ticks
+
+    n = len(outcomes)
+    return (sum(o == SUCCESS for o in outcomes) / n,
+            float(np.mean(lengths)) if lengths else float("nan"), n)
+
+
 def policy_dist(actor, obs, mask):
     """obs (N, n_att, obs_dim), mask (N, n_att, ball_actions) -> one
     MultiCategorial over N*n_att flattened agent rows."""
@@ -539,6 +609,10 @@ class TrainResult:
     history: list
     thresholds: object
     constrained: bool
+    # The critic emits normalised values, so its output is meaningless without
+    # these. Leaving them out of the checkpoint made a reloaded critic look
+    # broken when it was only mis-scaled.
+    ret_norm: object = None
 
 
 def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
@@ -605,6 +679,7 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
     horizon = 1.0 / (1.0 - env_cfg.gamma)
     discount_at_T = env_cfg.gamma ** env_cfg.t_max
     credit = 1.0 / (1.0 - env_cfg.gamma * cfg.gae_lambda)
+    cost_gamma = float(getattr(env_cfg, "cost_gamma", env_cfg.gamma))
     print(f"obs {obs_dim} state {state_dim} | horizon {horizon:.0f} ticks "
           f"(gamma {env_cfg.gamma}) vs episode {env_cfg.t_max} ticks")
     print(f"  GAE credit window 1/(1-gamma*lambda) = {credit:.0f} ticks "
@@ -617,6 +692,8 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
         print("  WARNING: discount horizon << episode length, the terminal "
               "bonus is effectively invisible from the start of an episode")
     if constrained:
+        print(f"  cost critics on gamma {cost_gamma} "
+              f"({1.0 / (1.0 - cost_gamma):.0f}-tick horizon)")
         print(f"  constraints ({n_costs}, "
               f"{'shared' if cfg.shared_cost_critic else 'independent'} critics): "
               + "  ".join(f"{n}<={d:.2f}/{u}" for n, d, u in
@@ -633,6 +710,13 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
     def to_t(x, dtype=torch.float32):
         return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
 
+    # A second, untouched vector env at the calibrated gate. The curriculum is
+    # never applied to it, so its success rate means the same thing on every
+    # update of every arm.
+    eval_venv = (make_venv(env_cfg, cfg.eval_envs, seed=cfg.seed + 9973,
+                           asynchronous=asynchronous)
+                 if cfg.eval_every else None)
+
     curriculum.apply(venv)
     obs_np, info = venv.reset(seed=cfg.seed)
     next_obs = to_t(obs_np)
@@ -647,6 +731,7 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
     ep_t = np.zeros(cfg.n_envs, dtype=np.int64)
     recent = deque(maxlen=100) # (outcome, ticks, undiscounted return)
     recent_gate = deque(maxlen=100)
+    eval_success, eval_len, n_eval = float("nan"), float("nan"), 0
 
     for update in range(1, n_updates + 1):
         buf.reset()
@@ -722,14 +807,14 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
 
             cost_adv = cost_ret = None
             if constrained:
-                # One GAE per constraint, at the same gamma and lambda as the
-                # reward. Flattened so the agent and cost axes go through
+                # One GAE per constraint, at the cost critics' own shorter
+                # discount. Flattened so the agent and cost axes go through
                 # compute_gae together, with dones broadcasting over both.
                 next_cv = cost_critics.denormalize(cost_critics(next_state))
                 cost_adv, cost_ret = compute_gae(
                     buf.costs.flatten(2, 3), buf.cost_values.flatten(2, 3),
                     buf.dones, next_cv.flatten(1, 2), next_done,
-                    env_cfg.gamma, cfg.gae_lambda)
+                    cost_gamma, cfg.gae_lambda)
                 cost_adv = cost_adv.view(cfg.n_steps, cfg.n_envs, n_att, n_costs)
                 cost_ret = cost_ret.view(cfg.n_steps, cfg.n_envs, n_att, n_costs)
 
@@ -796,11 +881,17 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
                           else float("nan"))
         mean = lambda xs: float(np.mean(xs)) if xs else float("nan")
 
-        # The curriculum advances on the recent window, because one 128-step
-        # batch holds a handful of episodes and its success rate is mostly noise.
-        advanced = curriculum.maybe_advance(rate(SUCCESS) if w_out else 0.0,
-                                            len(w_out), update)
-        if advanced:
+        # Fixed-gate evaluation. Carried forward between evals so every history
+        # row has a value and a plot has no gaps.
+        if eval_venv is not None and (update % cfg.eval_every == 0 or update == 1):
+            eval_success, eval_len, n_eval = evaluate(
+                actor, eval_venv, cfg.eval_episodes, n_att, device)
+            print(f"  EVAL   calibrated gate: success {eval_success:.3f}  "
+                  f"len {eval_len:.1f}  over {n_eval} episodes")
+
+        # On a schedule, so every arm sits at the same gate at the same step
+        # and every run finishes on the real task.
+        if curriculum.advance_to(global_step / cfg.total_timesteps):
             p_min, x_shift = curriculum.apply(venv)
             print(f"  CURRICULUM -> level {curriculum.level}/{curr_cfg.steps}: "
                   f"shot_p_min {p_min:.3f} ({radius_for_p(p_min):.1f}m from goal)"
@@ -862,13 +953,17 @@ def train(cfg: PPOConfig = None, env_cfg: EnvConfig = None, asynchronous=True,
             explained_var=float(ev), phi_mean=float(phi.mean()),
             curriculum_level=curriculum.level, shot_p_min=float(batch_p_min),
             x_shift=float(batch_x_shift),
+            eval_success=eval_success, eval_ep_len=eval_len,
             gate_pcf=float(gate_mean[0]), gate_p=float(gate_mean[1]),
             gate_clear=float(gate_mean[2]), gate_reachable=reachable))
 
     venv.close()
+    if eval_venv is not None:
+        eval_venv.close()
     return TrainResult(actor=actor, critic=critic, cost_critics=cost_critics,
                        lagrange=lagrange, history=history,
-                       thresholds=thresholds, constrained=constrained)
+                       thresholds=thresholds, constrained=constrained,
+                       ret_norm=ret_norm)
 
 
 if __name__ == "__main__":

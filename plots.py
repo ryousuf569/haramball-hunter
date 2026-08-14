@@ -85,6 +85,14 @@ def plot_task(history, arm, outdir):
                            ("failure", "#e34948", "failure"),
                            ("timeout", "#898781", "timeout")]:
         _line(ax, x, _col(history, key), colr, lbl)
+    # The training success rate is against whatever gate the curriculum has
+    # reached, so it is not comparable across arms. This one always is.
+    if "eval_success" in history[0]:
+        ev = _col(history, "eval_success")
+        ok = np.isfinite(ev)
+        if ok.any():
+            ax.plot(x[ok], ev[ok], color="#2a78d6", lw=2.0, ls="--",
+                    marker="o", ms=3, label="success, calibrated gate")
     ax.set_ylabel("rate (100-episode window)")
     ax.set_title("Episode outcomes")
     ax.set_ylim(0, 1)
@@ -242,12 +250,27 @@ def plot_comparison(runs, outdir):
     {arm: history}."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
 
-    for ax, (key, ylabel) in zip(axes[0], [("success", "success rate"),
+    # The first panel is the calibrated-gate eval where it exists, because the
+    # training success rate describes a different task in every arm.
+    have_eval = all("eval_success" in h[0] and
+                    np.isfinite(_col(h, "eval_success")).any()
+                    for h in runs.values())
+    first = ("eval_success", "success rate, calibrated gate") if have_eval \
+        else ("success", "success rate (per-arm gate, NOT comparable)")
+
+    for ax, (key, ylabel) in zip(axes[0], [first,
                                            ("ep_len", "episode length (ticks)"),
                                            ("ep_return", "undiscounted return")]):
         for arm, hist in runs.items():
-            _line(ax, _col(hist, "step"), _col(hist, key),
-                  ARM_COLORS.get(arm, "#898781"), ARM_LABELS.get(arm, arm))
+            y = _col(hist, key)
+            ok = np.isfinite(y)
+            if key == "eval_success":
+                ax.plot(_col(hist, "step")[ok], y[ok],
+                        color=ARM_COLORS.get(arm, "#898781"), lw=1.8,
+                        marker="o", ms=3, label=ARM_LABELS.get(arm, arm))
+            else:
+                _line(ax, _col(hist, "step"), y,
+                      ARM_COLORS.get(arm, "#898781"), ARM_LABELS.get(arm, arm))
         ax.set_ylabel(ylabel)
         ax.set_title(ylabel)
 

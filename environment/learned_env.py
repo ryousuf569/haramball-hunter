@@ -46,7 +46,10 @@ def load_actor(path, n_att=10, n_def=11, device="cpu"):
     stored, so loading a checkpoint trained on a different n_att/n_def raises
     here instead of silently mis-slicing the observation.
     """
-    ckpt = torch.load(path, map_location=device)
+    # weights_only=False because torch 2.6 flipped the default and rejects the
+    # numpy array older checkpoints stored for the Lagrange multipliers. These
+    # are checkpoints this project wrote, so unpickling them is safe.
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     state = ckpt.get("actor", ckpt) if isinstance(ckpt, dict) else ckpt
 
     actor = Actor(obs_dim(n_att + n_def, n_att), N_DIRECTIONS, N_SPEEDS,

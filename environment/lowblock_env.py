@@ -1047,8 +1047,15 @@ class LowBlockEnv(gym.Env):
         moved into. Pass costs are the exception and use pre-step geometry,
         because a pass is judged on the situation it was played from.
         """
-        cost, attempt = costs.per_tick_costs(self.players, self.ball,
-                                             self.n_att, line)
+        # held_too_long reads the possession as it stands AFTER the step, so a
+        # carrier that has just released is not billed for the carry it ended.
+        post_row = self.holder_row()
+        post_held = (self.tick - self.possession_start
+                     if post_row is not None and self.possession_start is not None
+                     else 0)
+        cost, attempt = costs.per_tick_costs(
+            self.players, self.ball, self.n_att, line,
+            holder_row=post_row, held_ticks=post_held)
 
         target_id = self.intended_target_id(pre_row, ball_idx)
         if target_id is not None:
@@ -1076,7 +1083,6 @@ class LowBlockEnv(gym.Env):
         # Possession bookkeeping for the next tick. A pass that found a
         # team-mate clears the pending row, and one that found a defender was
         # already billed above.
-        post_row = self.holder_row()
         if post_row is not None:
             self.pass_origin_row = None
         if post_row != pre_row:

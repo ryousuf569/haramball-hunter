@@ -115,9 +115,15 @@ term for term. It is continuous where the observation's `is_offside` flag is
 binary, so an attacker well beyond the line has a gradient toward the line
 rather than a cliff at it.
 
-**Both of these are off by default now.** `EnvConfig.agent_alpha` is `0.0` and
-`EnvConfig.offside_in_potential` is `False`; the code and the tests stay, and
-one flag each puts them back.
+**Both of these stay on, with the constraints layered on top.** A first pass at
+the constrained formulation switched them off, on the theory that per-agent
+costs replaced them. That was an overcorrection and it was measured as one:
+an attacker who is onside, near the ball and not carrying gets no per-agent
+cost signal at all, so off-ball movement lost its gradient, and direction-head
+entropy ended a 500k run at 0.47 of uniform without the term against 0.36 with
+it. The offside potential is continuous where the offside constraint is a
+binary cliff. Both terms are potential-based, so neither can bias the optimum;
+removing them bought nothing and cost gradient.
 
 ## What moved out of the reward, and why
 

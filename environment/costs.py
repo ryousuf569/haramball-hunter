@@ -16,15 +16,37 @@ HALFWAY_X = 52.5
 
 COST_SPECS = (
     # (name, threshold d_k, what it is a rate over)
-    ("pass_lost",   0.08, "passes"),        # 26.1% now, 9.9% random
+    # 0.15, not the 0.08 the 500k run used. 0.08 was set from random play's
+    # 9.9%, but random completes passes by playing them short and sideways.
+    # Once the other constraints push the ball forward 16m a pass the risk
+    # goes up, and all three arms drifted to 0.28-0.41 against a 0.08 target
+    # they never approached. 0.15 is 85% completion, which is roughly open-play
+    # football, and is a target the policy can actually climb toward.
+    ("pass_lost",   0.15, "passes"),        # 26.1% on 5M.pt, 9.9% random
     ("cross_field", 0.10, "passes"),        # 46.6% now, 38.0% random
     ("hot_potato",  0.25, "passes"),        # 97.7% now, 100% random
     ("pass_back",   0.25, "passes"),        # 37.5% now, 42.7% random
     ("offside",     0.02, "attacker-ticks"),  # 6.4% now, 1.9% random
     ("far_from_ball", 0.20, "attacker-ticks"),  # 29.4% now, 26.7% random
-    # Deliberately ambitious, because its job is to stay violated and keep
-    # propping up the reward's weight. At 0.85 random play nearly met it.
-    ("no_success",  0.60, "episodes"),
+    # The other half of hot_potato. On its own hot_potato is one-sided, and the
+    # 500k run satisfied it by never releasing at all: 1 pass in 24 episodes,
+    # an attacker on the ball 99.3% of ticks. A quantity with two bad tails
+    # needs an indicator on each.
+    ("held_too_long", 0.10, "carry-ticks"),
+    # The bootstrap constraint, and the one threshold that cannot be copied
+    # straight out of the paper. Theirs are strenuous relative to what their
+    # agents reach: has-reached-goal >= 0.99 in Arena, >= 0.80 in OpenWorld,
+    # and both are met. Success here runs at 4%, so the OpenWorld number lands
+    # as 0.20 and is not strenuous but unreachable, and a bootstrap that never
+    # releases never hands the behaviour constraints any weight back. Simulated
+    # over a 650-update run against measured rates, task weight vs the
+    # behaviour constraints' combined share:
+    #   0.20  0.97 / 0.03   arm B is reward-only wearing a hat
+    #   0.50  0.25 / 0.75   both live the whole run
+    #   0.80  0.00 / 1.00   section 7's collapse, which 0.60 gave us
+    # 0.50 keeps the paper's design, a bound at the edge of what is reachable,
+    # rather than its number. models/081226-500k/analysis has the rates.
+    ("no_success",  0.50, "episodes"),
 )
 
 COST_NAMES = tuple(name for name, _, _ in COST_SPECS)
@@ -49,6 +71,10 @@ BACKWARD_DX = -2.0
 # real one-touch lay-off is not caught by it.
 HOT_POTATO_TICKS = 5
 
+# Four seconds, the upper end of a realistic carry before releasing. Paired
+# with HOT_POTATO_TICKS this brackets possession from both sides.
+HELD_TOO_LONG_TICKS = 40
+
 # The shape constraint. It stops ten attackers sprinting into the final third
 # and leaving every pass a 30m diagonal.
 FAR_FROM_BALL_M = 30.0
@@ -60,10 +86,14 @@ def empty_costs(n_att):
             np.zeros((n_att, N_COSTS), dtype="f4"))
 
 
-def per_tick_costs(players, ball, n_att, line):
+def per_tick_costs(players, ball, n_att, line, holder_row=None,
+                   held_ticks=0):
     """Costs every attacker is assessed on every tick, whatever it did.
 
-    Attempted on every row, so both are a plain per-attacker-tick rate.
+    offside and far_from_ball are attempted on every row, so they are a plain
+    per-attacker-tick rate. held_too_long is attempted only on the carrier's
+    row, making it a rate over carry-ticks: the fraction of the time somebody
+    spends on the ball that is spent holding it too long.
     """
     cost, attempt = empty_costs(n_att)
 
@@ -84,6 +114,11 @@ def per_tick_costs(players, ball, n_att, line):
     cost[:, IDX["far_from_ball"]] = far
     attempt[:, IDX["offside"]] = 1.0
     attempt[:, IDX["far_from_ball"]] = 1.0
+
+    if holder_row is not None:
+        cost[holder_row, IDX["held_too_long"]] = float(
+            held_ticks > HELD_TOO_LONG_TICKS)
+        attempt[holder_row, IDX["held_too_long"]] = 1.0
     return cost, attempt
 
 

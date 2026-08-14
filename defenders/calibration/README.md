@@ -5,11 +5,16 @@ studies below. This file records what was calibrated, how, why, and what came ou
 
 Two different kinds of calibration live here, and they are worth keeping apart:
 
-1. **Data fits.** Parameters measured off real StatsBomb freeze frames. These
-   answer "what do real low blocks actually do". Covered in sections 1 to 6.
+1. **Data fits.** Parameters measured off real football — StatsBomb freeze frames
+   for the shape work, Metrica tracking where a duration or an outcome is needed.
+   These answer "what do real low blocks actually do". Sections 1 to 7, and 10.
 2. **Sim sweeps.** Parameters with no direct real-world counterpart, tuned by
    running the sim itself across a grid and looking at the outcome. These answer
-   "what value makes the model behave". Covered in sections 7 and 8.
+   "what value makes the model behave". Sections 8 and 11.
+
+Section 7 moved from the second category to the first: the duel used to be a
+transferred RoboCup model checked against the sim, and is now fitted to Metrica.
+Section 11 is what that refit did to the environment, which is a separate question.
 
 A note on coordinates. StatsBomb uses a 120x80 pitch with the attacking team
 going left to right, so defenders defend x=0. The sim uses 105x68 with defenders
@@ -219,40 +224,245 @@ mirrors x.
 
 ## 7. Ground duel
 
-**How.** The geometry is transferred from the RoboCup 2D soccer server's tackle
-model rather than fitted. RoboCup uses `tackle_dist=2.0`, `tackle_width=1.25`,
-`tackle_exponent=6`, `tackle_back_dist=0`. Its pitch and timestep are a coarser sim
-than ours, so the transferable parts are the aspect ratio (2.0/1.25 = 1.6) and the
-super-ellipse exponent, not the absolute sizes. Those scale to `DUEL_A = 1.20`,
-`DUEL_B = 0.50` (about A/1.6), and `DUEL_A_BACK = 0.40` for reduced reach behind
-the defender. RoboCup rolls once per command; we test every tick, so the roll is
-converted to a hazard rate and `p_tick = 1 - exp(-lambda * dt)`, which makes the
+**How.** The super-ellipse SHAPE is still transferred from the RoboCup 2D soccer
+server's tackle model: `tackle_exponent=6`, and the axis ratios implied by
+`tackle_dist=2.0`, `tackle_width=1.25`, `tackle_back_dist=0`. Its pitch and
+timestep are a coarser sim than ours, so what transfers is the exponent and the
+ratios, not the absolute sizes. RoboCup rolls once per command; we test every tick,
+so the roll is a hazard rate and `p_tick = 1 - exp(-lambda * dt)`, which makes the
 outcome independent of timestep.
 
-**Why.** There is no freeze-frame data for tackle outcomes, so this parameter
-cannot be fitted the way sections 2 to 6 were. Borrowing a published model with a
-stated calibration is more defensible than inventing a number. `LAM_MAX = 2.1`
-comes from a target: a perfectly positioned defender should win the ball with
-probability 0.65 over half a second, so `lambda = -ln(1 - 0.65) / 0.5 = 2.1`.
+The SCALE and the RATE are no longer transferred. `duel_calibration.py` fits both
+to Metrica Sample_Game_1, which turns out to be able to measure them because its
+event file labels ground duels explicitly — `CHALLENGE` with a `GROUND-*` or
+`TACKLE-*` subtype, plus `THEFT` — while its tracking supplies the carry time
+those duels happened during. That makes the estimate an occupancy MLE,
 
-**Results.** `duel_calibration_summary.csv` records a sim measurement of how often
-the duel geometry actually engages: over 15 episodes of 2000 ticks, the ball was
-held for 8940 ticks and a defender was inside the duel ellipse for only 85 of them,
-0.95 percent of held ticks, spread over 25 separate contact runs. Contacts are
-short: mean 0.34s, median 0.4s, p90 0.6s, max 0.6s. The nearest defender is a median
-16.9m from the ball, dropping to 2.12m at the 5th percentile.
+```
+lambda_hat = (ground-duel losses inside the gate) / (time spent inside the gate)
+```
 
-That short contact duration is the finding that matters. The 0.65-in-0.5s target
-assumed a half-second window, but the median real window is 0.4s and the maximum
-observed is 0.6s, so the fitted `LAM_MAX` that would hit 0.65 over the windows we
-actually see is 3.09 mean / 2.62 median rather than 2.1. At the current 2.1 the
-implied win rate is 0.51, not 0.65. The value was left at 2.1 rather than raised.
-The observed turnover rate of 0.667 per episode was already in a reasonable range,
-and 0.51 per genuine contact is defensible on its own terms, but the gap between
-the stated target and the delivered rate should be stated rather than glossed.
+with both halves built from the same carrier timeline (the one `possession_mask`
+in `dribble_speed_calibration.py` defines, so this fit and DRIBBLE_SPEED describe
+the same population). Won/lost is taken from the tracking — a duel counts as a
+loss only if the next carrier is on the other team — not from the subtype, because
+the mirror-pair rows do not always agree and because the `FAULT` variants must
+*not* count: a foul returns the ball to the attacking side and the sim has no
+fouls.
 
-Caveat: the script that produced these two duel CSVs was not committed, only its
-outputs. The numbers cannot currently be regenerated from the repo.
+**Why.** The previous values were never measured. `DUEL_A = 1.20` was
+`tackle_dist` rescaled by eye, and with exponent 6 the super-ellipse is a near-box,
+so it acted as an on/off switch: 81% chance of losing the ball within one second at
+1.00m and exactly zero at 1.21m. `LAM_MAX = 2.1` came from a target rather than
+data — "a perfect defender wins it with probability 0.65 over 0.5s", so
+`-ln(1-0.65)/0.5 = 2.1` — and nothing ever justified either the 0.65 or the 0.5s.
+
+**Results.** 809 carry spells, 1,682s of carrying with an opponent tracked, 133
+ground-duel events, 103 of them matched to a tracked carry. Of those 103, **only 53
+cost the carrier the ball**: a real carrier survives about half the ground duels he
+is put in, which the old model had no way to represent.
+
+The model-free hazard profile (`duel_hazard_profile.csv`, no super-ellipse and no
+multiplier in it — just exposure and losses per ring) is the core evidence:
+
+| gap | exposure | losses | hazard /s | 95% CI |
+| --- | --- | --- | --- | --- |
+| 0.0–0.4 | 21.6s | 6 | 0.278 | 0.101–0.605 |
+| 0.4–0.8 | 41.0s | 10 | 0.244 | 0.117–0.448 |
+| 0.8–1.2 | 49.2s | 12 | 0.244 | 0.126–0.426 |
+| 1.2–1.6 | 49.6s | 6 | 0.121 | 0.044–0.264 |
+| 1.6–2.0 | 59.1s | 6 | 0.102 | 0.037–0.221 |
+| 2.0–2.4 | 63.8s | 8 | 0.125 | 0.054–0.247 |
+| 2.4–2.8 | 68.4s | 2 | 0.029 | 0.003–0.106 |
+| 2.8–3.2 | 64.4s | 0 | 0.000 | 0.000–0.057 |
+| 3.2–4.0 | 141.0s | 2 | 0.014 | 0.002–0.051 |
+| 4.0–5.0 | 153.5s | 1 | 0.006 | 0.000–0.036 |
+| 5.0–12.0 | 649.9s | 0 | 0.000 | — |
+
+Two things are wrong with the old gate and the table shows both. The hazard is flat
+at about 0.25/s inside 1.2m — an eighth of what `LAM_MAX = 2.1` claims — and it does
+not stop at 1.2m, it halves and runs on to about 2.4m before collapsing. 47% of real
+dispossessions happened with the nearest defender further away than the old gate
+could see.
+
+**The shape, which turned out to matter more than the rate.** The first pass at this
+fit kept RoboCup's axis ratios and fitted only the size. That was wrong, and the sim
+showed it: the defender's win rate in a 1v1 stayed far below what the block was
+expected to deliver. Each semi-axis is now fitted from the coordinate it governs,
+measured at real dispossessions in the defender's own frame:
+
+| axis | median | p75 | **p90** |
+| --- | --- | --- | --- |
+| `dx`, forward (n=27) | 0.83 | 1.74 | **2.05** |
+| `|dx|`, behind (n=26) | 0.34 | 0.70 | **1.42** |
+| `|dy|`, lateral (n=53) | 0.74 | 1.41 | **2.08** |
+
+Forward 2.05m against lateral 2.08m: **a real duel is as wide as it is deep.**
+RoboCup's forward-biased tackle box (A/B = 2.4 as implemented) does not survive
+contact with the data. There *is* a front/back asymmetry — 2.05m ahead against
+1.42m behind — but it is 1.45x, not RoboCup's 3x.
+
+`DUEL_EXP = 6` cuts the corners of the super-ellipse, so three independent p90 axes
+enclose only 79% of the loss points jointly. All three are scaled by a common
+k = 1.15 until the gate encloses 90%, which is what the per-axis anchors were
+trying to express. A reach is a cap, so anchoring high is the same argument
+`ANCHOR_Q` makes in `dribble_speed_calibration.py`.
+
+Two radial readings cross-check the result rather than setting it: the hazard elbow
+at **2.40m** and the p90 defender-to-ball gap at a loss at **2.39m**, both consistent
+with the fitted 2.38m reach.
+
+At the fitted gate the occupancy MLE gives `LAM_MAX = 0.246`, bootstrap 95% CI
+0.171–0.327 over 2000 whole-spell resamples (spells, not frames — frames inside one
+spell are the same contest and are nowhere near independent). The estimate is
+insensitive to gate size, because a wider gate buys proportionally more exposure;
+`duel_gate_scan.csv` has the whole curve. It is also insensitive to the `V_MAX` used
+in the advantage multiplier (0.269 at 5.0, 0.272 at 9.0), which was the obvious
+transfer worry since real players outrun the sim's cap. Split by half it is 0.33 /
+0.21, and by carrying team 0.24 / 0.31.
+
+| constant | was | now | fitted to |
+| --- | --- | --- | --- |
+| `DUEL_A` | 1.20 | **2.38** | p90 forward gap 2.05m, scaled by k=1.15 |
+| `DUEL_B` | 0.50 | **2.38** | p90 lateral gap 2.08m, same k |
+| `DUEL_A_BACK` | 0.40 | **1.64** | p90 gap behind 1.42m, same k |
+| `R_MAX` | 1.20 | **2.38** | = max of the three |
+| `LAM_MAX` | 2.1 | **0.57** | occupancy MLE, 48 covered losses, at the fitted multiplier |
+| `ADV_FLOOR` | 0.5 | **0.14** | hazard vs closing speed; MLE 0.11, 95% CI 0.05–0.31 |
+| `ADV_EXP` | — (linear) | **3** | convexity; unidentified by likelihood, picked on the binned curve |
+
+`DUEL_A` and `DUEL_B` are set equal on purpose. The fit put them 1.5% apart, which
+53 losses cannot resolve into a shape; reporting them as different would be reading
+noise as geometry.
+
+**Why the shape mattered more than the rate.** `ground_duel` is the model's only
+channel for taking the ball off a carrier, so a gate that cannot *see* a
+dispossession cannot produce it at any `LAM_MAX`. Coverage of the 53 real
+ground-duel losses:
+
+| gate | covers |
+| --- | --- |
+| RoboCup, 1.20 / 0.50 / 0.40 | 14 / 53 |
+| rescaled but RoboCup ratios, 2.40 / 1.00 / 0.80 | 28 / 53 |
+| fitted axes, 2.38 / 2.38 / 1.64 | **48 / 53** |
+
+**Everyone in the gate contests, not just the closest.** `ground_duel` used to take
+`argmin` over the defenders in range and roll once, which made being surrounded by
+three defenders exactly as safe as being marked by one — a carrier could walk
+through a block as long as he kept beating whoever happened to be nearest. That is
+a modelling error, not a calibration choice, and it is the one the "dribbles around
+multiple defenders" complaint was actually about.
+
+Independent hazards on the same carrier add, so the tick's total is now
+`LAM_MAX * sum_i p_geom_i * mult_i` over everyone in the gate, and when it fires
+the winner is drawn in proportion to what each contributed. Verified directly:
+with *n* identical defenders at 0.5m the per-tick loss probability measures 0.0175
+/ 0.0350 / 0.0519 / 0.0695 for n = 1 to 4, against `1 - exp(-n·λ·dt)` of 0.0178 /
+0.0354 / 0.0526 / 0.0695, and the winner is uniform across symmetric contestants.
+The 1v1 case is arithmetically unchanged, which is the case the fit measured.
+
+`LAM_MAX` is fitted against exposure summed over **contacts**, not frames, for the
+same reason — otherwise the rate would be set on one denominator and applied to a
+larger one. The correction is small (0.246 → 0.236) because Metrica has a second
+defender in the gate on only 5.3% of contested frames; the sim's low block reaches
+6–8%, so it matters more there than in the source data.
+
+**Engagement: proximity is not contest.** Metrica has **351** moments with an
+opponent inside the fitted gate and only **103** annotated challenges, so two
+thirds of what the model was treating as a duel is a defender running past. What
+separates the two is whether he is actually closing on the ball — and that was
+already in the model as the advantage multiplier, just far too weak. Measured
+inside the gate, with exposure weighted by `p_geometry` so closing is not credited
+with also standing nearer:
+
+| closing (m/s) | exposure | losses | hazard /s | relative |
+| --- | --- | --- | --- | --- |
+| −8 to −1 | 49.6s | 4 | 0.081 | 0.14 |
+| −1 to 0 | 47.7s | 8 | 0.168 | 0.29 |
+| 0 to 1 | 69.4s | 9 | 0.130 | 0.23 |
+| 1 to 2 | 47.4s | 9 | 0.190 | 0.33 |
+| 2 to 3 | 32.6s | 9 | 0.276 | 0.48 |
+| 3+ | 15.7s | 9 | 0.572 | **1.00** |
+
+A spread of about **6x**. The old linear ramp from `ADV_FLOOR = 0.5` to 1.0 allowed
+only 2x, and the data rejects it outright (ΔlogL −4.78).
+
+*The tautology check.* At the instant a tackle lands the defender is arriving at
+the ball by construction, so this gradient could be outcome rather than intent.
+Measuring closing **0.32s before** contact keeps the same ≈0.20 floor-to-peak
+ratio. It is engagement.
+
+`ADV_FLOOR` is identified — MLE 0.11, 95% LR interval **0.05–0.31**. `ADV_EXP` is
+not (2.0–14.6, running to the scan edge, same pathology as `DUEL_EXP` below), so
+it is not taken from the likelihood: **3** is the value inside that interval which
+best reproduces the model-free curve, the same two-criteria structure used for
+`DUEL_A`. The form becomes
+`ADV_FLOOR + (1 − ADV_FLOOR) · u^ADV_EXP`, `u = (clip(closing/V_MAX,−1,1)+1)/2`.
+A linear ramp cannot be flat-and-low to 2 m/s and steep past 3.
+
+| closing | measured | in use (0.14, 3) |
+| --- | --- | --- |
+| −4.5 | 0.14 | 0.14 |
+| −0.5 | 0.29 | 0.22 |
+| +0.5 | 0.23 | 0.28 |
+| +1.5 | 0.33 | 0.38 |
+| +2.5 | 0.48 | 0.50 |
+| +7.5 | 1.00 | 1.00 |
+
+`LAM_MAX` refits to **0.57** alongside it: the same total dispossession volume,
+concentrated into the moments that are real contests instead of smeared over every
+defender who happens to be nearby. In the sim this pulls the mean contact from
+1.10s to **0.90s**, against Metrica's 0.88s on the same gate.
+
+**`DUEL_EXP` was fitted too, and the answer is that it cannot be identified.**
+It sets how sharply the gate falls off at its edge. `fit_exponent` scans it from 1
+to 10 with the gate scale free at every candidate, on an event set trimmed once by
+an exponent-independent rule — both details matter, and getting either wrong
+manufactures a spurious result. Refitting the axes per exponent to hold coverage
+fixed, as a first attempt did, compares (exponent, axes(exponent)) pairs rather
+than exponents, and appeared to pin the value at 2.25 with RoboCup's 6 excluded.
+Done properly:
+
+| exponent | best A | `LAM_MAX` | ΔlogL |
+| --- | --- | --- | --- |
+| 1.0 | 4.02 | 0.347 | −3.02 |
+| 2.0 | 2.87 | 0.283 | −0.53 |
+| 3.5 | 2.50 | 0.253 | **0.00** |
+| 6.0 | 2.38 | 0.229 | −0.29 |
+| 10.0 | 2.30 | 0.218 | −0.61 |
+
+The MLE is 3.5, but the 95% likelihood-ratio interval is **1.50–10.00** — the whole
+scanned range. A soft edge on a large gate and a hard edge on a small one are the
+same hazard field to 53 events, and the exponent trades off against the scale
+almost perfectly.
+
+It also barely matters, which is the more useful half. With the scale refitted
+alongside it, P(ball lost within 1s of continuous pressure):
+
+| exponent | 0.5m | 1.0m | 1.5m | 2.0m | 2.5m |
+| --- | --- | --- | --- | --- | --- |
+| 1.0 | 0.204 | 0.178 | 0.151 | 0.123 | 0.094 |
+| 2.0 | 0.186 | 0.170 | 0.143 | 0.104 | 0.050 |
+| 6.0 | 0.158 | 0.157 | 0.149 | 0.105 | 0.000 |
+| 10.0 | 0.151 | 0.151 | 0.149 | 0.116 | 0.000 |
+
+Only exponent 1 is visibly different — a diamond with a long tail past 3m — and it
+is also the one the likelihood most disfavours. **`DUEL_EXP` stays at 6**, now on
+evidence rather than inheritance. `duel_exponent_profile.csv` has the full curve.
+
+*Historical note.* Section 7 used to claim `DUEL_B` was "about A/1.6" (RoboCup's
+`tackle_dist/tackle_width`) while the code had 1.20/0.50, which is A/2.4. Both are
+now moot: the ratio is fitted, not transferred.
+
+**Superseded.** `duel_calibration_runs.csv` and `duel_calibration_summary.csv` are
+the older sim measurement, kept for the record: over 15 episodes of 2000 ticks the
+ball was held for 8940 ticks and a defender was inside the *old* duel ellipse for
+only 85 of them (0.95%), in 25 contact runs of median 0.4s. That study inferred
+`LAM_MAX` should be 2.6–3.1 rather than 2.1, by assuming the 0.65-in-0.5s target was
+right and only the window was wrong. The Metrica fit says the target itself was
+wrong by roughly an order of magnitude, so those two CSVs are superseded, not
+merely refined. The script that produced them was never committed;
+`duel_calibration.py` replaces it and does regenerate everything in this section.
 
 ---
 
@@ -486,6 +696,57 @@ real data: the press no longer costs shape.
 
 ---
 
+## 11. What the duel refit did to the environment
+
+**How.** `duel_gate_recheck.py` runs 40 episodes per cell through
+`scripts/diag_policy.py`'s episode runner, across the four stages of section 7 and
+two policies, on identical seeds and starting holders — so a difference between two
+rows is the duel gate and nothing else. Four gates rather than two, so the sweep can
+separate what the rate did from what the shape did.
+
+**Matched randomness, which this got wrong once.** `run_episode` draws actions with
+`dist.sample()`, which uses torch's **global** RNG. That is process state, not
+episode state, so under `pool.map` an episode's actions depended on how many
+episodes its worker happened to run first — and the arms were not matched at all.
+An earlier version of this table showed duel losses falling 29 → 15 across the
+gates; that was the harness, not the physics. `worker()` now calls
+`torch.manual_seed(seed)` per episode. **Any duel-gate comparison run before that
+fix should be discarded.**
+
+**Why.** Section 7 says the fit is good. That is not the same claim as "the task is
+now reachable". `random` is the control, for the reason `diag_policy.py` insists on
+it: whatever a uniformly random policy scores is what the environment concedes for
+free.
+
+**Results,** with matched seeds:
+
+| policy | gate | A | LAM | success | duel | intercept | loose | timeout |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| random | robocup | 1.20 | 2.10 | 5.0% | 5 | 22 | 7 | 4 |
+| random | rate_only | 1.20 | 0.27 | 5.0% | 0 | 27 | 7 | 4 |
+| random | scale_only | 2.40 | 0.27 | 2.5% | 3 | 24 | 6 | 6 |
+| random | calibrated | 2.38 | 0.25 | 2.5% | 2 | 25 | 7 | 5 |
+| constrained 500k | robocup | 1.20 | 2.10 | 10.0% | 4 | 20 | 12 | 0 |
+| constrained 500k | rate_only | 1.20 | 0.27 | 12.5% | 0 | 22 | 12 | 1 |
+| constrained 500k | scale_only | 2.40 | 0.27 | 12.5% | 1 | 21 | 12 | 1 |
+| constrained 500k | calibrated | 2.38 | 0.25 | 10.0% | 2 | 21 | 12 | 1 |
+
+**The duel gate is not what decides these episodes.** Duels account for 0–5 of 40
+endings on every gate; interceptions and loose passes account for 30+. Changing the
+duel model by a factor of eight in rate and by a factor of four in area moves the
+success rate by about one episode in forty, which is inside the noise. That is the
+honest headline, and it is a much weaker effect than the pre-fix table claimed.
+
+**The task is reachable.** Both policies score on every gate. Nothing here is an
+unreachable terminal.
+
+**On the 500k arms' 0/150.** This harness scores `constrained.pt` at 10–12.5%, not
+0%, so it is not measuring the same thing `eval_n150.txt` did — different episode
+budget and a fixed rather than curriculum shot gate. The 0/150 is not explained by
+the duel model, and it is not re-measured here either.
+
+---
+
 ## Open gaps
 
 Places where `defenders.py` does not currently match what was fitted. None of these
@@ -496,16 +757,24 @@ are silent, they are listed here so the discrepancy is on the record.
 - **Line separation.** Fitted 15.58m mean, code uses `LINE_SEP = 10`.
 - **Back-line width.** Fitted 30.15m mean, code uses hardcoded offsets spanning a
   fixed 40m, which is about the 94th percentile of observed width.
-- **Duel hazard rate.** `LAM_MAX = 2.1` targets a 0.65 win rate over 0.5s, but
-  measured contact windows are shorter than that, so the delivered rate is 0.51.
-  Section 7.
+- **`DUEL_EXP` is unidentified, not wrong.** Section 7 fits it and finds the 95%
+  interval spans the whole scanned range, because it trades off against the gate
+  scale. 6 is kept. More duel events — a second Metrica match, or StatsBomb
+  challenge frames — would be what settles it, if it ever needs settling.
+- **The block's depth gradient is wrong, and it inverts.** Conditioned on the
+  ball's distance to the defended goal — the only like-for-like comparison, since
+  the sim is a final-third scenario and a Metrica match mostly is not — the sim has
+  a defender inside the duel gate on 69.6% of carry ticks within 15m of goal
+  against Metrica's 40.3%, 44.5% vs 24.7% at 15–25m, 22.9% vs 16.9% at 25–35m, and
+  **7.0% vs 22.5%** at 35–50m. Too compact deep, too sparse further out. `LINE_SEP`
+  = 10 against a fitted 15.58m and a back line hardcoded to span 40m against a
+  fitted 30.15m are the obvious suspects. This is section 10's territory, not
+  `turnover.py`'s, and no change to the duel gate can fix a gradient that is too
+  high in one band and too low in another.
 - **Forward slot.** The lone forward in the 5-4-1 has no calibration data at all.
   Its resting x of 52.0 and its spread are assumptions.
 - **`attacker_positioning` ignores its `gain` argument.** It is called with 0.7 from
   `compute_defender_targets` but hardcodes 0.4 in the body.
-- **Duel calibration script is missing.** Only `duel_calibration_runs.csv` and
-  `duel_calibration_summary.csv` were committed, so section 7's sim measurements
-  cannot be regenerated.
 
 Sample size is 8 matches from a single competition and season. Section 3 shows the
 depth fit holds across those 8 matches, which is the strongest available check, but
@@ -522,6 +791,8 @@ Scripts:
 | `calibration_graphing.py` | Pulls StatsBomb frames and runs sections 1, 2, 4, 5, 6. Needs API access. |
 | `validate_depth_fit.py` | Held-out validation of the depth fit, section 3. Runs offline. |
 | `intercept_calibration.py` | Interception threshold sweep, section 8. Runs the sim. |
+| `duel_calibration.py` | Ground-duel reach and hazard rate, section 7. Offline: reads the Metrica tracking and event data. |
+| `duel_gate_recheck.py` | What the section 7 refit did to the environment, section 11. Runs the sim. |
 | `press_calibration.py` | Press policy, section 10. Offline: reads the committed low-block CSVs and the Metrica tracking data. |
 | `../calibrate_defender_formation.py` | Formation sampler, section 9. Fits when run as main, and is imported by the environment for sampling. |
 
@@ -538,8 +809,17 @@ Data:
 | `per_slot_stagger.csv` | Mean and sd of per-slot x offset from the line mean. |
 | `defender_frame_params.csv` | Frame-level centroid, spread and gap parameters for the sampler. |
 | `defender_slot_params.csv` | Per-slot standardised offset parameters for the sampler. |
-| `duel_calibration_runs.csv` | Per contact-run duration measurements. |
-| `duel_calibration_summary.csv` | Duel engagement rates and the fitted lambda. |
+| `duel_hazard_profile.csv` | Model-free dispossession hazard by defender-to-ball gap, section 7's core evidence. |
+| `duel_loss_events.csv` | One row per matched ground duel, with the geometry `ground_duel` would have seen. |
+| `duel_gate_scan.csv` | `LAM_MAX` re-fitted at each candidate `DUEL_A`, showing the rate is stable in the scale. |
+| `duel_exponent_profile.csv` | `DUEL_EXP` profile likelihood with the scale free — the evidence that it is not identified. |
+| `duel_engagement_profile.csv` | Model-free dispossession hazard by closing speed — the engagement evidence. |
+| `duel_engagement_fit.csv` | `(ADV_FLOOR, ADV_EXP)` likelihood grid. |
+| `duel_survival_params.csv` | Every number in section 7. |
+| `duel_gate_recheck_runs.csv` | One row per episode of the section 11 gate comparison. |
+| `duel_gate_recheck_summary.csv` | Outcome mix per (gate, policy) cell. |
+| `duel_calibration_runs.csv` | **Superseded**, kept for the record. Per contact-run durations against the old 1.2m gate. |
+| `duel_calibration_summary.csv` | **Superseded**, kept for the record. Old duel engagement rates and lambda. |
 | `intercept_calibration_runs.csv` | One row per episode of the threshold sweep. |
 | `intercept_calibration_summary.csv` | Per-threshold outcome mix and the achievable-p ceiling. |
 | `press_frames.csv` | One row per low-block freeze frame with the press geometry, section 10. |
@@ -553,6 +833,7 @@ Figures:
 | `depth_response.png` | Depth against ball only, and predicted against actual for the two-predictor fit. |
 | `shape_diagnostic.png` | Depth, lateral shift, within-line scatter, width, gaps and attacking-line depth. |
 | `intercept_calibration.png` | Outcome mix by threshold, interception rate per pass, and the achievable-p curve. |
+| `duel_calibration_fit.png` | Measured hazard against both model versions, where losses really happen, the gate scan, and survival under a defender. |
 | `defender_shape_fit.png` | Block depth, gap to the attacking line, spread correlation and lateral position. |
 | `defender_slot_scatter.png` | Per-slot standardised offsets, real frames against fitted mean and sd. |
 | `defender_samples.png` | Six sampled 5-4-1 blocks. |
@@ -571,7 +852,14 @@ python defenders/calibration/validate_depth_fit.py       # offline, reads commit
 python defenders/calibration/intercept_calibration.py    # runs the sim, slow
 python defenders/calibrate_defender_formation.py         # offline, reads committed CSVs
 python defenders/calibration/press_calibration.py        # offline, reads committed CSVs + Metrica
+python defenders/calibration/duel_calibration.py         # offline, reads Metrica tracking + events
+python defenders/calibration/duel_gate_recheck.py        # runs the sim, slow
 ```
 
-Only `calibration_graphing.py` needs network access. The other four read CSVs that
-are already committed, or run the sim directly.
+Only `calibration_graphing.py` needs network access. The others read CSVs that are
+already committed, or run the sim directly.
+
+`intercept_calibration.py` currently does **not** run: it drives the environment
+through the scripted baseline attacker, and `attackers/baseline_attacker.py` has
+since been deleted. `duel_gate_recheck.py` goes through `scripts/diag_policy.py`
+and a checkpoint instead, which is why it is written the way it is.

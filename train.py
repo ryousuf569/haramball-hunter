@@ -39,11 +39,23 @@ MISTUNED = {
     "pass_back": 0.05,       # measured 38% / 43%
     "offside": 0.005,        # measured 6.4% / 1.9%
     "far_from_ball": 0.10,   # measured 29% / 27%
-    "no_success": 0.30,      # asks for a 70% success rate; random gets 2.6%
+    "held_too_long": 0.01,   # "never dwell on the ball"
+    # The one threshold arm C makes laxer rather than tighter, because that is
+    # the mistake section 7 warns about: a lax bootstrap "will simply be used to
+    # exit the initialisation point and the other constraints will quickly take
+    # over". This was our own default until the fidelity pass, so arm C now
+    # reruns that mistake against arm B doing it the paper's way.
+    "no_success": 0.60,
 }
 
 
 def mistuned_thresholds():
+    missing = [n for n in costs.COST_NAMES if n not in MISTUNED]
+    if missing:
+        raise KeyError(
+            f"arm C has no mistuned threshold for {missing}. Add one to "
+            f"MISTUNED, deliberately tighter than the measured rate, or arm C "
+            f"stops being the badly-specified arm it is supposed to be.")
     return tuple(MISTUNED[name] for name in costs.COST_NAMES)
 
 
@@ -55,18 +67,20 @@ def arms(steps, seed):
     """
     ppo = PPOConfig(total_timesteps=steps, seed=seed)
     curr = CurriculumConfig()
+    env = EnvConfig()
 
+    # Every arm gets the SAME EnvConfig. An earlier version also switched off
+    # agent_alpha and the offside potential in the constrained arms, which
+    # bundled two reward changes into what is supposed to be a one-variable
+    # comparison. The constraints are layered on top of the reward now, not
+    # swapped in for parts of it.
     return [
-        ("reward_only",
-         ppo, EnvConfig(agent_alpha=0.5, offside_in_potential=True),
-         LagrangeConfig(enabled=False), curr),
+        ("reward_only", ppo, env, LagrangeConfig(enabled=False), curr),
 
-        ("constrained",
-         ppo, EnvConfig(), LagrangeConfig(), curr),
+        ("constrained", ppo, env, LagrangeConfig(), curr),
 
-        ("constrained_mistuned",
-         ppo, EnvConfig(), LagrangeConfig(thresholds=mistuned_thresholds()),
-         curr),
+        ("constrained_mistuned", ppo, env,
+         LagrangeConfig(thresholds=mistuned_thresholds()), curr),
     ]
 
 
@@ -80,12 +94,18 @@ def save(name, result, ckpt_dir, outdir):
     os.makedirs(ckpt_dir, exist_ok=True)
 
     ckpt = {"actor": result.actor.state_dict(),
-            "critic": result.critic.state_dict()}
+            "critic": result.critic.state_dict(),
+            # The critic emits normalised values, so it is unusable without
+            # the statistics that scale them back.
+            "ret_norm": result.ret_norm.state()}
     if result.cost_critics is not None:
         # The multipliers are part of what the run learned, so a resume that
         # restarted them at z_init would throw that away.
         ckpt["cost_critics"] = result.cost_critics.state_dict()
-        ckpt["lagrange_z"] = result.lagrange.z
+        ckpt["cost_norms"] = result.cost_critics.norm_state()
+        # A list, not the numpy array, so torch.load can read the file back
+        # under weights_only=True. numpy objects are rejected there.
+        ckpt["lagrange_z"] = [float(z) for z in result.lagrange.z]
     torch.save(ckpt, os.path.join(ckpt_dir, f"{name}.pt"))
 
     with open(os.path.join(outdir, f"{name}_history.json"), "w") as f:

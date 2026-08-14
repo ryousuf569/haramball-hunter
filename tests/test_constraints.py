@@ -32,6 +32,23 @@ K = costs.N_COSTS
 TOL = 1e-6
 
 
+def _world():
+    """A minimal players array: ten attackers on halfway, eleven defenders deep."""
+    from schema import player_dt
+    p = np.zeros(N_ATT + N_DEF, dtype=player_dt)
+    p["id"] = np.arange(N_ATT + N_DEF)
+    p["team"][:N_ATT] = "attacker"
+    p["team"][N_ATT:] = "defender"
+    p["position"][:N_ATT] = [50.0, 34.0]
+    p["position"][N_ATT:] = [90.0, 34.0]
+    return p
+
+
+def _ball():
+    return {"state": "held", "holder_id": 3, "position": np.array([50.0, 34.0]),
+            "target_id": None}
+
+
 # --- the cost indicators ---------------------------------------------------
 
 def test_every_cost_has_a_threshold_and_a_unit():
@@ -87,6 +104,33 @@ def test_a_constraint_with_no_attempts_reports_itself_satisfied():
     # to contain no passes, a slow leak toward ignoring the constraint.
     r = costs.rates(np.zeros(K), np.zeros(K))
     assert np.allclose(r, costs.COST_THRESHOLDS), r
+
+
+def test_possession_is_bounded_from_both_sides():
+    # hot_potato alone is one-sided, and the 500k run satisfied it by never
+    # releasing: 1 pass in 24 episodes, an attacker on the ball 99.3% of ticks.
+    assert "held_too_long" in costs.IDX, (
+        "hot_potato has no upper counterpart, so it can be met by hoarding")
+    assert costs.HOT_POTATO_TICKS < costs.HELD_TOO_LONG_TICKS, (
+        "the two possession constraints overlap, leaving no legal hold time")
+
+
+def test_held_too_long_bills_only_the_carrier():
+    cost, attempt = costs.per_tick_costs(
+        _world(), _ball(), N_ATT, line=100.0, holder_row=3, held_ticks=999)
+    k = costs.IDX["held_too_long"]
+    assert cost[3, k] == 1.0
+    assert attempt[3, k] == 1.0
+    assert attempt[[r for r in range(N_ATT) if r != 3], k].sum() == 0.0, (
+        "held_too_long is a rate over carry-ticks, so only the carrier is an "
+        "attempt")
+
+
+def test_held_too_long_is_silent_when_nobody_carries():
+    cost, attempt = costs.per_tick_costs(_world(), _ball(), N_ATT, line=100.0,
+                                         holder_row=None, held_ticks=0)
+    k = costs.IDX["held_too_long"]
+    assert cost[:, k].sum() == 0.0 and attempt[:, k].sum() == 0.0
 
 
 def test_bootstrap_constraint_is_failure_not_success():
@@ -201,6 +245,51 @@ def test_lambdas_are_a_simplex():
     lam0, lam = lag.all_lambdas()
     assert abs(lam0 + lam.sum() - 1.0) < TOL
     assert (lam >= 0).all()
+
+
+def test_a_failing_task_hands_the_reward_its_weight_back():
+    # Section 4.3, the whole point of the bootstrap. While the policy is failing
+    # the task and roughly meeting the behaviour constraints, lambda_no_success
+    # runs away and lambda_0 := max(lambda_0, lambda_no_success) follows it, so
+    # the reward ends up with essentially the whole simplex.
+    cfg = LagrangeConfig(warmup_updates=0, lr=0.5)
+    lag = Lagrange(costs.COST_THRESHOLDS, cfg)
+    rates = np.array(costs.COST_THRESHOLDS, dtype=float)
+    rates[costs.BOOTSTRAP_IDX] = 1.0            # never succeeds
+    for _ in range(2000):
+        lam0, lam = lag.update(rates)
+
+    assert lag.reward_weight(lam0, lam) > 0.99, (
+        f"the task held {lag.reward_weight(lam0, lam):.3f} of the simplex while "
+        f"failing outright, so the bootstrap is not carrying it")
+    assert abs(lam0 + lam.sum() - 1.0) < 1e-6, "the multipliers left the simplex"
+
+
+def test_weight_is_ordered_by_how_badly_a_constraint_is_violated():
+    # What the softmax does guarantee, now that nothing clips z. It does not
+    # promise every violated constraint keeps a share: a constraint violated by
+    # a wider margin drifts faster and is meant to take over. What has to hold
+    # is the ordering, since that is what makes a threshold readable.
+    cfg = LagrangeConfig(warmup_updates=0, lr=0.5)
+    lag = Lagrange(costs.COST_THRESHOLDS, cfg)
+    rates = np.array(costs.COST_THRESHOLDS, dtype=float)
+    rates[costs.IDX["hot_potato"]] += 0.30      # badly violated
+    rates[costs.IDX["pass_lost"]] += 0.05       # mildly violated
+    for _ in range(200):
+        lam0, lam = lag.update(rates)
+
+    assert (lam[costs.IDX["hot_potato"]] > lam[costs.IDX["pass_lost"]]
+            > lam[costs.IDX["offside"]]), (
+        "multiplier order did not follow violation order")
+
+
+def test_a_satisfied_policy_gives_the_reward_most_of_the_weight():
+    cfg = LagrangeConfig(warmup_updates=0, lr=0.5)
+    lag = Lagrange(costs.COST_THRESHOLDS, cfg)
+    for _ in range(2000):
+        lam0, lam = lag.update(np.array(costs.COST_THRESHOLDS) - 0.01)
+    assert lam0 > 0.6, (
+        f"every constraint satisfied but the task only holds {lam0:.3f}")
 
 
 def test_a_violated_constraint_gains_weight_and_a_satisfied_one_loses_it():
@@ -354,26 +443,42 @@ def test_curriculum_disabled_is_the_real_task_from_the_first_step():
     assert abs(p - SHOT_P_MIN) < 1e-6 and abs(shift) < TOL
 
 
-def test_curriculum_will_not_advance_on_a_thin_window_or_too_fast():
-    cfg = CurriculumConfig(min_episodes=50, hold_updates=20, advance_at=0.35)
+def test_curriculum_finishes_on_the_real_task():
+    # The 500k run's actual failure: the ramp advanced on success rate, no arm
+    # got past level 4 of 8, and every checkpoint was then scored on a gate it
+    # had never trained against.
+    cfg = CurriculumConfig()
     curr = Curriculum(cfg)
 
-    assert not curr.maybe_advance(1.0, n_episodes=10, update=100), "thin window"
-    assert not curr.maybe_advance(0.10, n_episodes=100, update=100), "below advance_at"
-    assert curr.maybe_advance(0.90, n_episodes=100, update=100)
-    assert not curr.maybe_advance(0.90, n_episodes=100, update=105), (
-        "advanced twice inside hold_updates; the task moved faster than the "
-        "value function can follow")
-    assert curr.maybe_advance(0.90, n_episodes=100, update=130)
+    curr.advance_to(cfg.finish_frac)
+    assert curr.level == cfg.steps, (
+        f"at {cfg.finish_frac:.0%} of training the curriculum is only at level "
+        f"{curr.level}/{cfg.steps}")
+
+    p, shift = curr.values()
+    assert abs(p - SHOT_P_MIN) < 1e-6 and abs(shift) < TOL
+    curr.advance_to(1.0)
+    assert curr.level == cfg.steps, "the ramp overshot past the real task"
+
+
+def test_curriculum_is_the_same_at_the_same_step_for_every_arm():
+    # A success-rate trigger let a better policy tighten its own gate, so two
+    # arms at the same step sat at different gates and their success rates were
+    # not comparable. A schedule cannot do that.
+    a, b = Curriculum(CurriculumConfig()), Curriculum(CurriculumConfig())
+    for progress in np.linspace(0, 1, 40):
+        a.advance_to(progress)
+        b.advance_to(progress)
+        assert a.level == b.level and a.values() == b.values()
 
 
 def test_curriculum_never_reverses():
-    curr = Curriculum(CurriculumConfig(hold_updates=0, min_episodes=0))
-    curr.maybe_advance(1.0, 100, 1)
-    level = curr.level
-    for u in range(2, 20):
-        curr.maybe_advance(0.0, 100, u)
-    assert curr.level == level, "the curriculum handed the easier task back"
+    curr = Curriculum(CurriculumConfig())
+    seen = []
+    for progress in np.linspace(0, 1, 50):
+        curr.advance_to(progress)
+        seen.append(curr.level)
+    assert seen == sorted(seen), "the curriculum handed the easier task back"
 
 
 def test_a_looser_gate_is_actually_easier():
