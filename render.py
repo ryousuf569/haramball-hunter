@@ -1,4 +1,5 @@
 import time
+from collections import Counter
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,15 +10,15 @@ from matplotlib.patches import Arc, Circle, Rectangle
 # interval and the per-tick real-time budget.
 from physics.engine import DT
 
-from environment.lowblock_env import (
+from attackers.random_policy import (
     ATTACKER_LABEL,
     DEFENDER_LABEL,
-    PC_EXTENT,
+    MAX_TICKS,
     make_initial_world,
-    make_ppcf_grid,
     step,
 )
-from environment.reward import build_zone_masks
+from environment.grid import PC_EXTENT, make_ppcf_grid
+from environment.termination import make_zone, success_gate
 
 # --- style -------------------------------------------------------------
 PITCH_COLOR = "#1e5631"
@@ -89,14 +90,12 @@ def _draw_pitch(ax, pitch_length=105.0, pitch_width=68.0):
         spine.set_visible(False)
 
 
-def _draw_reward_zones(ax, pitch_width=68.0):
-    """Optional debug overlay: final-third line and half-space corridors
-    (Sections 4.2 / 4.3 of the spec). Off by default -- this is a reward
-    debugging aid, not part of the base engine render."""
-    ax.axvline(70.0, color="white", linestyle="--", linewidth=1.0, alpha=0.5)
-    for y_lo, y_hi in [(14.0, 27.0), (41.0, 54.0)]:
-        ax.add_patch(Rectangle((70.0, y_lo), 105.0 - 70.0, y_hi - y_lo,
-                                facecolor="white", alpha=0.08, edgecolor=None))
+def _draw_target_zone(ax, zone):
+    """Overlay the success zone from environment/termination.py -- a radius from
+    goal. Arriving inside it is only half the condition; the team also has to
+    control the cells within it, which is what the heatmap underneath shows."""
+    ax.add_patch(Circle(zone.centre, zone.radius, fill=False, edgecolor="white",
+                         linestyle="--", linewidth=1.2, alpha=0.65, zorder=2))
 
 
 def _draw_team(ax, positions, velocities, ids, color, show_ids, show_velocity):
@@ -119,7 +118,7 @@ def _draw_team(ax, positions, velocities, ids, color, show_ids, show_velocity):
 
 
 def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
-                  show_zones=False, pitch_length=105.0, pitch_width=68.0,
+                  zone=None, pitch_length=105.0, pitch_width=68.0,
                   clear=True, title=None, pc_att=None):
     """
     Draw one frame of engine state.
@@ -143,10 +142,9 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
     show_velocity : bool
         Draw a velocity vector for each player (displacement over
         VELOCITY_LOOKAHEAD_S seconds).
-    show_zones : bool
-        Overlay the final-third line and half-space corridors from the
-        reward spec (Section 4.2/4.3). Off by default -- reward debugging,
-        not base rendering.
+    zone : termination.Zone or None
+        Overlay the success radius from environment/termination.py. None
+        skips it.
     clear : bool
         Clear the axes before drawing. Set False if you're managing the
         clear/redraw cycle yourself in an animation loop.
@@ -170,8 +168,8 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
         ax.clear()
 
     _draw_pitch(ax, pitch_length, pitch_width)
-    if show_zones:
-        _draw_reward_zones(ax, pitch_width)
+    if zone is not None:
+        _draw_target_zone(ax, zone)
 
     # Attacker pitch control, under everything else. .T because the field is
     # indexed (x, y) while imshow reads (row, col) = (y, x).
@@ -225,62 +223,48 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # ---------------------------------------------------------------------------
 # Live simulation driver
 # ---------------------------------------------------------------------------
-# Everything below drives the env in environment/lowblock_env.py and animates
-# it. The env exposes make_initial_world/step; the driver's job is to (1) hold
-# the world state it hands back, (2) advance one DT tick, and (3) pass the new
-# state to render_frame.
+# Everything below drives attackers/random_policy.py and animates it. That
+# module exposes make_initial_world/step; the driver's job is to (1) hold the
+# world state it hands back, (2) advance one DT tick, (3) pass the new state to
+# render_frame, and (4) start a fresh episode whenever one ends, so a single
+# window shows many possessions and a running outcome tally.
 
 
 def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=None,
-                   show_zones=False, start_holder=1, show_ppcf=True,
-                   checkpoint=r'models\081326-750k\constrained.pt', deterministic=True, max_ticks=None):
-    """Open a matplotlib window and animate the engine in real time.
+                   show_zone=True, start_holder=1, show_ppcf=True,
+                   max_ticks=MAX_TICKS, pass_prob=None, hold_ticks=8,
+                   zone=None):
+    """Open a matplotlib window and animate random attackers against the
+    calibrated low block, restarting on every terminal outcome.
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
 
-    checkpoint is a path to a train.py .pt file. Given one, the attackers are
-    driven by the learned policy (environment/learned_env.py) instead of the
-    scripted baseline; the defenders stay scripted either way. max_ticks only
-    matters then -- it is the horizon the policy's clock feature was normalised
-    against, so it has to match the training EnvConfig.t_max or the observation
-    is out of distribution. It defaults to None, meaning read EnvConfig.t_max,
-    so the two cannot drift apart; pass an int only to override deliberately.
-    deterministic=False samples the policy instead of taking each head's argmax.
+    pass_prob is handed straight to random_policy.random_actions. None means a
+    uniform draw over the whole ball head, which is the honest control for the
+    probe and releases the ball on roughly (n_att - 1) / n_att of carrying
+    ticks. Pass a float to see the same movement with a calmer ball.
 
     start_holder chooses which attacker kicks off with the ball (attacker row
     index; see make_initial_world). Change it to watch the low block react to
     different starting situations -- e.g. start_holder=0 (deep build-up) vs
     8 (ball already at the central striker).
 
+    hold_ticks is how many frames the terminal state stays on screen before the
+    next episode starts, so an outcome is readable rather than a flicker.
+
+    zone is a termination.Zone; None builds the default. Pass
+    make_zone(x, y, radius) to move or resize it. The title prints the live
+    gate -- whether the ball is inside the disc, and the team's mean control
+    over it -- so you can see which half of the condition is binding while a
+    possession runs, rather than only learning that it failed.
+
     show_ppcf controls whether the pitch-control heatmap is DRAWN. The field is
     computed every tick either way, because the same call caches each player's
     TTI to the ball in players['i_p'] and intercept_pass needs it -- skipping it
     would silently disable pass interceptions rather than just hiding an overlay.
-
-    Timing note: measured here, step+render is ~130ms/tick with the PPCF overlay
-    on vs ~68ms off, against DT=100ms -- so the animation runs at roughly 0.75x
-    real time. PPCF is ~54ms of that, nearly all of it the 200 integration steps
-    (integration_horizon / integration_timestep) in ppcf.PPCF_grid. Since the
-    field is now always computed, show_ppcf=False only saves the draw, not that
-    54ms. If real-time playback matters, coarsen the integration instead.
     """
     if interval_ms is None:
         interval_ms = int(DT * 1000)
-    if max_ticks is None:
-        from config import EnvConfig
-        max_ticks = EnvConfig.t_max
-
-    # Imported lazily: pulling in learned_env drags in torch, which the scripted
-    # render has no use for.
-    actor = None
-    if checkpoint is not None:
-        from environment.learned_env import learned_step, load_actor
-        actor = load_actor(checkpoint, n_att=n_att, n_def=n_def)
-
-    # rng is only used inside make_initial_world (for starting positions); the
-    # step loop is now fully scripted, so we don't thread it through.
-    players, ball, attacker_ids, _rng, defender_state = make_initial_world(
-        n_att, n_def, seed, start_holder=start_holder)
 
     fig, ax = plt.subplots(figsize=(10.5, 6.8))
     fig.patch.set_facecolor(PITCH_COLOR)
@@ -289,71 +273,93 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
     # the same (n_cells, 2) array on every tick. Always built: the PPCF call is
     # what caches players['i_p'] for intercept_pass, so it is no longer optional.
     ppcf_grid = make_ppcf_grid()
+    if zone is None:
+        zone = make_zone()
 
-    # mutable state carried across FuncAnimation frames. step_ms/render_ms
-    # accumulate the per-tick cost split so the running means below aren't
-    # dominated by whichever tick happened to be slow.
-    # Zone masks are a pure function of the grid, so build them once alongside
-    # it. pc_att starts None; learned_step seeds it on the first tick.
-    zone_masks = build_zone_masks(ppcf_grid)
+    # Mutable state carried across FuncAnimation frames. step_ms/render_ms
+    # accumulate the per-tick cost split so the running means aren't dominated
+    # by whichever tick happened to be slow. tally is the whole point of the
+    # auto-reset: it is a live preview of the random-vs-calibrated probe.
+    world = {"episode": 0, "tick": 0, "step_ms": 0.0, "render_ms": 0.0,
+             "ticks": 0, "outcome": None, "freeze": 0, "tally": Counter()}
 
-    world = {"players": players, "ball": ball, "tick": 0,
-             "step_ms": 0.0, "render_ms": 0.0, "pc_att": None}
+    def reset():
+        world["episode"] += 1
+        world["tick"] = 0
+        world["outcome"] = None
+        world["freeze"] = 0
+        # A new seed per episode, so the formation draw and the action stream
+        # both vary; seed alone would replay the same possession forever.
+        (world["players"], world["ball"], world["attacker_ids"],
+         world["rng"], world["defender_state"]) = make_initial_world(
+            n_att, n_def, seed + world["episode"], start_holder=start_holder)
+        world["pc_att"] = None
 
+    reset()
     budget_ms = DT * 1000.0
 
     def update(_frame):
+        # Terminal state lingers for hold_ticks frames so it can be read.
+        if world["outcome"] is not None:
+            world["freeze"] += 1
+            if world["freeze"] >= hold_ticks:
+                reset()
+            return []
+
         world["tick"] += 1
+        world["ticks"] += 1
 
         t_step0 = time.perf_counter()
-        if actor is None:
-            world["players"], world["ball"], pc_att, _own, outcome = step(
-                world["players"], world["ball"], attacker_ids, defender_state,
-                world["tick"], ppcf_grid=ppcf_grid)
-        else:
-            # tick - 1: the env counts ticks already elapsed (0 on the first
-            # step), and that count feeds the observation's clock feature.
-            # pc_att is threaded back in: the policy's observation needs the
-            # surface for the state it is acting in, and that is the one the
-            # previous tick already computed.
-            world["players"], world["ball"], pc_att, outcome = learned_step(
-                world["players"], world["ball"], attacker_ids, defender_state,
-                world["tick"] - 1, actor, ppcf_grid=ppcf_grid,
-                max_ticks=max_ticks, deterministic=deterministic,
-                pc_att=world["pc_att"], zone_masks=zone_masks)
-            world["pc_att"] = pc_att
+        world["players"], world["ball"], pc_att, outcome = step(
+            world["players"], world["ball"], world["attacker_ids"],
+            world["defender_state"], world["tick"], world["rng"],
+            ppcf_grid=ppcf_grid, zone=zone, max_ticks=max_ticks,
+            pass_prob=pass_prob)
         step_ms = (time.perf_counter() - t_step0) * 1000.0
+
+        # An offside turnover returns before the PPCF call, so keep the last
+        # surface rather than blanking the heatmap on the final frame.
+        if pc_att is not None:
+            world["pc_att"] = pc_att
+
+        if outcome is not None:
+            world["outcome"] = outcome
+            world["tally"][outcome] += 1
+            n_done = sum(world["tally"].values())
+            rates = "  ".join(
+                f"{k} {world['tally'][k] / n_done:.0%}"
+                for k in ("success", "failure", "timeout"))
+            print(f"episode {world['episode']:4d}  {outcome.upper():8s} "
+                  f"at tick {world['tick']:4d}  |  over {n_done} eps: {rates}")
 
         t = world["tick"] * DT
         state = world["ball"]["state"]
-        # The animation keeps rolling past a terminal tick; the label is just so
-        # you can see where the episode would have ended.
         ended = f"  |  {outcome.upper()}" if outcome is not None else ""
+
+        # Live gate readout: which half of the success condition is binding.
+        gate = ""
+        if world["pc_att"] is not None:
+            in_zone, control = success_gate(world["players"], world["ball"],
+                                            world["pc_att"], zone)
+            if in_zone is not None:
+                gate = (f"  |  in zone: {'Y' if in_zone else 'n'}  "
+                        f"zone PC: {control:.2f}")
 
         t_render0 = time.perf_counter()
         # pc_att is computed every tick (intercept_pass needs the cache it builds),
         # so show_ppcf gates only whether it reaches the heatmap.
         render_frame(world["players"], world["ball"], ax=ax,
-                     show_zones=show_zones,
-                     pc_att=pc_att if show_ppcf else None,
-                     title=f"tick {world['tick']}  |  t = {t:5.1f}s  |  ball: {state}{ended}")
+                     zone=zone if show_zone else None,
+                     pc_att=world["pc_att"] if show_ppcf else None,
+                     title=f"ep {world['episode']}  |  tick {world['tick']}  |  "
+                           f"t = {t:5.1f}s  |  ball: {state}{gate}{ended}")
         render_ms = (time.perf_counter() - t_render0) * 1000.0
 
         # Note: render_ms covers building the artists, not the canvas blit that
         # matplotlib does after update() returns, so total_ms understates true
         # wall-clock per frame somewhat.
-        total_ms = step_ms + render_ms
         world["step_ms"] += step_ms
         world["render_ms"] += render_ms
-        n = world["tick"]
-        mean_ms = (world["step_ms"] + world["render_ms"]) / n
-
-        # Flag ticks that blow the real-time budget -- with PPCF on this is the
-        # common case, so it's a marker rather than a warning.
-        over = "  OVER" if total_ms > budget_ms else ""
-        print(f"tick {n:5d}  step {step_ms:6.1f}ms  render {render_ms:6.1f}ms  "
-              f"total {total_ms:6.1f}ms  (mean {mean_ms:6.1f}ms / "
-              f"budget {budget_ms:.0f}ms){over}")
         return []
 
     # cache_frame_data=False -> don't buffer every frame (state is live/mutating)
@@ -363,6 +369,15 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
     fig._anim = anim
 
     plt.show()
+
+    n_done = sum(world["tally"].values())
+    if n_done:
+        print(f"\n{n_done} episodes, mean {world['ticks'] / n_done:.0f} ticks")
+        for k in ("success", "failure", "timeout"):
+            print(f"  {k:8s} {world['tally'][k]:4d}  "
+                  f"{world['tally'][k] / n_done:6.1%}")
+        mean_ms = (world["step_ms"] + world["render_ms"]) / max(world["ticks"], 1)
+        print(f"  mean {mean_ms:.1f}ms/tick against a {budget_ms:.0f}ms budget")
     return anim
 
 
