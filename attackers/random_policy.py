@@ -85,14 +85,17 @@ def random_actions(n_att, rng, pass_prob=None):
 
 def step(players, ball, attacker_ids, defender_state, tick, rng,
          ppcf_grid=None, zone=None, max_ticks=MAX_TICKS, pass_prob=None,
-         pc_min=ZONE_PC_MIN):
+         pc_min=ZONE_PC_MIN, actions=None):
     n_att = len(attacker_ids)
     if ppcf_grid is None:
         ppcf_grid = make_ppcf_grid()
     if zone is None:
         zone = make_zone()
 
-    direction_idx, speed_idx, ball_idx = random_actions(n_att, rng, pass_prob)
+    # actions is (direction_idx, speed_idx, ball_idx); None draws them randomly.
+    if actions is None:
+        actions = random_actions(n_att, rng, pass_prob)
+    direction_idx, speed_idx, ball_idx = actions
     att_targets = action_decoding(direction_idx, speed_idx)
 
     holder_id = ball.get("holder_id")
@@ -146,7 +149,10 @@ def step(players, ball, attacker_ids, defender_state, tick, rng,
 
 def run_episode(n_att=10, n_def=11, seed=0, start_holder=0,
                 max_ticks=MAX_TICKS, pass_prob=None, ppcf_grid=None, zone=None,
-                pc_min=ZONE_PC_MIN):
+                pc_min=ZONE_PC_MIN, policy=None):
+    # policy is a callable (players, ball, attacker_ids) -> actions, or None for
+    # random. Scripted policies carry per-episode state, so build a fresh one
+    # per call -- see scripted_policy.make_policy.
     players, ball, attacker_ids, rng, defender_state = make_initial_world(
         n_att, n_def, seed, start_holder=start_holder)
     if ppcf_grid is None:
@@ -155,10 +161,11 @@ def run_episode(n_att=10, n_def=11, seed=0, start_holder=0,
         zone = make_zone()
 
     for tick in range(1, max_ticks + 1):
+        actions = None if policy is None else policy(players, ball, attacker_ids)
         players, ball, _pc, outcome = step(
             players, ball, attacker_ids, defender_state, tick, rng,
             ppcf_grid=ppcf_grid, zone=zone, max_ticks=max_ticks,
-            pass_prob=pass_prob, pc_min=pc_min)
+            pass_prob=pass_prob, pc_min=pc_min, actions=actions)
         if outcome is not None:
             return outcome, tick
     return TIMEOUT, max_ticks

@@ -17,8 +17,11 @@ from attackers.random_policy import (
     make_initial_world,
     step,
 )
+from attackers.scripted_policy import make_policy
 from environment.grid import PC_EXTENT, make_ppcf_grid
 from environment.termination import make_zone, success_gate
+
+POLICIES = ("random", "scripted")
 
 # --- style -------------------------------------------------------------
 PITCH_COLOR = "#1e5631"
@@ -223,26 +226,37 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # ---------------------------------------------------------------------------
 # Live simulation driver
 # ---------------------------------------------------------------------------
-# Everything below drives attackers/random_policy.py and animates it. That
-# module exposes make_initial_world/step; the driver's job is to (1) hold the
-# world state it hands back, (2) advance one DT tick, (3) pass the new state to
-# render_frame, and (4) start a fresh episode whenever one ends, so a single
-# window shows many possessions and a running outcome tally.
+# Everything below drives one of the fixed policies in attackers/ and animates
+# it. random_policy exposes make_initial_world/step; the driver's job is to (1)
+# hold the world state it hands back, (2) advance one DT tick, (3) pass the new
+# state to render_frame, and (4) start a fresh episode whenever one ends, so a
+# single window shows many possessions and a running outcome tally.
 
 
 def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=None,
                    show_zone=True, start_holder=1, show_ppcf=True,
                    max_ticks=MAX_TICKS, pass_prob=None, hold_ticks=8,
-                   zone=None):
-    """Open a matplotlib window and animate random attackers against the
+                   zone=None, policy="scripted", hold_shape=True):
+    """Open a matplotlib window and animate the attackers against the
     calibrated low block, restarting on every terminal outcome.
+
+    policy picks who drives them: "random" for the uniform control, "scripted"
+    for attackers/scripted_policy.py. Measured over 25 episodes, random scores
+    ~16% and scripted ~84%, so expect the scripted window to look like football
+    and resolve in about a third of the ticks.
+
+    hold_shape is passed to the scripted policy and ignored by random. True
+    keeps each attacker on its kickoff offset from the centroid so the unit
+    advances in shape; False sends all ten at the disc, which is the degenerate
+    control for whether the success gate can be farmed by crowding.
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
 
-    pass_prob is handed straight to random_policy.random_actions. None means a
-    uniform draw over the whole ball head, which is the honest control for the
-    probe and releases the ball on roughly (n_att - 1) / n_att of carrying
-    ticks. Pass a float to see the same movement with a calmer ball.
+    pass_prob is handed straight to random_policy.random_actions and ignored by
+    the scripted policy. None means a uniform draw over the whole ball head,
+    which is the honest control for the probe and releases the ball on roughly
+    (n_att - 1) / n_att of carrying ticks. Pass a float to see the same
+    movement with a calmer ball.
 
     start_holder chooses which attacker kicks off with the ball (attacker row
     index; see make_initial_world). Change it to watch the low block react to
@@ -263,6 +277,8 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
     TTI to the ball in players['i_p'] and intercept_pass needs it -- skipping it
     would silently disable pass interceptions rather than just hiding an overlay.
     """
+    if policy not in POLICIES:
+        raise ValueError(f"policy must be one of {POLICIES}, got {policy!r}")
     if interval_ms is None:
         interval_ms = int(DT * 1000)
 
@@ -294,9 +310,16 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
          world["rng"], world["defender_state"]) = make_initial_world(
             n_att, n_def, seed + world["episode"], start_holder=start_holder)
         world["pc_att"] = None
+        # Fresh policy per episode: the scripted one captures its slots from the
+        # formation draw, so reusing an instance would run the new episode
+        # against the previous episode's shape.
+        world["policy"] = (make_policy(zone, hold_shape)
+                           if policy == "scripted" else None)
 
     reset()
     budget_ms = DT * 1000.0
+    label = policy if policy != "scripted" else (
+        f"scripted{'' if hold_shape else ' (crowding)'}")
 
     def update(_frame):
         # Terminal state lingers for hold_ticks frames so it can be read.
@@ -310,11 +333,14 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
         world["ticks"] += 1
 
         t_step0 = time.perf_counter()
+        actions = (None if world["policy"] is None else
+                   world["policy"](world["players"], world["ball"],
+                                   world["attacker_ids"]))
         world["players"], world["ball"], pc_att, outcome = step(
             world["players"], world["ball"], world["attacker_ids"],
             world["defender_state"], world["tick"], world["rng"],
             ppcf_grid=ppcf_grid, zone=zone, max_ticks=max_ticks,
-            pass_prob=pass_prob)
+            pass_prob=pass_prob, actions=actions)
         step_ms = (time.perf_counter() - t_step0) * 1000.0
 
         # An offside turnover returns before the PPCF call, so keep the last
@@ -351,8 +377,9 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
         render_frame(world["players"], world["ball"], ax=ax,
                      zone=zone if show_zone else None,
                      pc_att=world["pc_att"] if show_ppcf else None,
-                     title=f"ep {world['episode']}  |  tick {world['tick']}  |  "
-                           f"t = {t:5.1f}s  |  ball: {state}{gate}{ended}")
+                     title=f"{label}  |  ep {world['episode']}  |  "
+                           f"tick {world['tick']}  |  t = {t:5.1f}s  |  "
+                           f"ball: {state}{gate}{ended}")
         render_ms = (time.perf_counter() - t_render0) * 1000.0
 
         # Note: render_ms covers building the artists, not the canvas blit that
@@ -372,7 +399,8 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
 
     n_done = sum(world["tally"].values())
     if n_done:
-        print(f"\n{n_done} episodes, mean {world['ticks'] / n_done:.0f} ticks")
+        print(f"\n{label}: {n_done} episodes, "
+              f"mean {world['ticks'] / n_done:.0f} ticks")
         for k in ("success", "failure", "timeout"):
             print(f"  {k:8s} {world['tally'][k]:4d}  "
                   f"{world['tally'][k] / n_done:6.1%}")

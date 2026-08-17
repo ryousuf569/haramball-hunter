@@ -87,9 +87,9 @@ def p_for_radius(r):
 # 76-84 and radii 10-15), peaking near 0.5. A quarter of the space is simply
 # what attackers own in the final third against a compact block, so the
 # threshold sits above that mean rather than at a half.
-ZONE_X = 80.0
+ZONE_X = 88.0
 ZONE_Y = 34.0
-ZONE_RADIUS = 12.0
+ZONE_RADIUS = 8.0
 ZONE_PC_MIN = 0.40 # mean attacker control over the zone's cells
 
 Zone = namedtuple("Zone", ("centre", "radius", "mask", "n_cells"))
