@@ -10,15 +10,15 @@ from matplotlib.patches import Arc, Circle, Rectangle
 # interval and the per-tick real-time budget.
 from physics.engine import DT
 
-from attackers.random_policy import (
+from attackers.scripted_policy import make_policy
+from environment.grid import PC_EXTENT, make_ppcf_grid
+from environment.lowblock_env import (
     ATTACKER_LABEL,
     DEFENDER_LABEL,
     MAX_TICKS,
     make_initial_world,
     step,
 )
-from attackers.scripted_policy import make_policy
-from environment.grid import PC_EXTENT, make_ppcf_grid
 from environment.termination import make_zone, success_gate
 
 POLICIES = ("random", "scripted")
@@ -227,10 +227,11 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # Live simulation driver
 # ---------------------------------------------------------------------------
 # Everything below drives one of the fixed policies in attackers/ and animates
-# it. random_policy exposes make_initial_world/step; the driver's job is to (1)
-# hold the world state it hands back, (2) advance one DT tick, (3) pass the new
-# state to render_frame, and (4) start a fresh episode whenever one ends, so a
-# single window shows many possessions and a running outcome tally.
+# it. environment/lowblock_env.py owns the world (make_initial_world/step); the
+# driver's job is to (1) hold the world state it hands back, (2) advance one DT
+# tick, (3) pass the new state to render_frame, and (4) start a fresh episode
+# whenever one ends, so a single window shows many possessions and a running
+# outcome tally.
 
 
 def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=None,
@@ -252,8 +253,8 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
 
-    pass_prob is handed straight to random_policy.random_actions and ignored by
-    the scripted policy. None means a uniform draw over the whole ball head,
+    pass_prob is handed through step() to random_policy.random_actions and
+    ignored by the scripted policy. None means a uniform draw over the whole ball head,
     which is the honest control for the probe and releases the ball on roughly
     (n_att - 1) / n_att of carrying ticks. Pass a float to see the same
     movement with a calmer ball.

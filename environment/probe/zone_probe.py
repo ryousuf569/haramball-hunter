@@ -9,10 +9,10 @@ import numpy as np
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from attackers.random_policy import (MAX_TICKS, make_initial_world,  # noqa: E402
-                                     step)
 from attackers.scripted_policy import make_policy                    # noqa: E402
 from environment.grid import make_ppcf_grid                          # noqa: E402
+from environment.lowblock_env import (MAX_TICKS, make_initial_world,  # noqa: E402
+                                      step)
 from environment.termination import (ball_in_zone, make_zone,        # noqa: E402
                                      zone_control)
 
