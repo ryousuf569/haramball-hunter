@@ -1,4 +1,7 @@
 import numpy as np
+from functools import partial
+import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 
 from physics.engine import (
     DRIBBLE_V_MAX,
@@ -59,6 +62,7 @@ def make_initial_world(n_att=10, n_def=11, seed=0, start_holder=0):
         "state": "held",
         "holder_id": int(attacker_ids[start_holder]),
         "position": players["position"][start_holder].copy(),
+        "velocity": np.zeros(2, dtype="f4"),
         "target_id": None,
         "flight_start": np.zeros(2, dtype="f4"),
         "flight_target": np.zeros(2, dtype="f4"),
@@ -152,3 +156,18 @@ def run_episode(n_att=10, n_def=11, seed=0, start_holder=0,
         if outcome is not None:
             return outcome, tick
     return TIMEOUT, max_ticks
+
+world_step = step
+
+class LowBlockEnv(gym.Env):
+    pass
+
+def make_vector_env(n_envs=6, asynchronous=False, seed=None,
+                    autoreset_mode=None, **env_kwargs):
+    fns = [partial(LowBlockEnv, **env_kwargs) for _ in range(n_envs)]
+    cls = AsyncVectorEnv if asynchronous else SyncVectorEnv
+    kwargs = {} if autoreset_mode is None else {"autoreset_mode": autoreset_mode}
+    venv = cls(fns, **kwargs)
+    if seed is not None:
+        venv.reset(seed=seed)
+    return venv

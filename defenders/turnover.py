@@ -285,4 +285,6 @@ def apply_turnover(ball, defender_id):
     ball["holder_id"] = defender_id
     ball["target_id"] = None
     ball["position"] = np.asarray(ball["position"], dtype="f4")
+    # Possession changed hands, so the flight velocity it was carrying is stale
+    ball["velocity"] = np.zeros(2, dtype="f4")
     return ball

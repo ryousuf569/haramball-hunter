@@ -65,6 +65,7 @@ ball = {
     'state': str,
     'holder_id': int | None,
     'position': list[int],
+    'velocity': list[float],
     'target_id': int | None,
     'flight_start': list[int],
     'flight_target': list[int],
@@ -124,6 +125,10 @@ def ball_action(ball_idx, holder_id, player_ids):
 def ball_mechanics(ball, players, pass_decision, rng=None):
     holder_id, is_pass, target_id = pass_decision
     ball = dict(ball)  # copy, don't mutate caller's dict
+    # Finite difference, set at the bottom. Spikes to ~30 m/s on the tick a fresh
+    # receiver releases: reception snaps the ball to flight_target, up to
+    # RECEPTION_RADIUS from his feet, and the release resyncs it onto them.
+    prev_position = np.asarray(ball['position'], dtype=float).copy()
 
     if ball['state'] == 'held':
         if is_pass:
@@ -166,6 +171,8 @@ def ball_mechanics(ball, players, pass_decision, rng=None):
             direction = remaining_vector / remaining_distance
             ball['position'] = ball['position'] + direction * step_distance
 
+    ball['velocity'] = ((np.asarray(ball['position'], dtype=float)
+                         - prev_position) / DT).astype('f4')
     return ball
 
 def kinematics_integrator(players, target_velocities):
