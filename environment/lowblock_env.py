@@ -4,12 +4,17 @@ import gymnasium as gym
 from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 
 from physics.engine import (
-    DRIBBLE_V_MAX,
+    V_MAX,
+    DRIBBLE_V_MAX, 
+    PITCH_X, 
+    PITCH_Y,
     action_decoding,
     ball_action,
     ball_mechanics,
     cap_speed,
     kinematics_integrator,
+    direction_lookup,
+    speed_lookup
 )
 from physics.ppcf import PPCF_grid
 from schema import player_dt
@@ -29,7 +34,9 @@ from defenders.turnover import (
     nearest_defender_to,
 )
 from environment.grid import PC_NX, PC_NY, make_ppcf_grid
-from environment.termination import ZONE_PC_MIN, check_success, make_zone
+from environment.termination import (ZONE_PC_MIN, check_success, make_zone,
+                                     zone_control)
+from defenders.turnover import HALFWAY_X, offside_line
 
 ATTACKER_LABEL = "attacker"
 DEFENDER_LABEL = "defender"
@@ -39,6 +46,25 @@ FAILURE = "failure"
 TIMEOUT = "timeout"
 
 MAX_TICKS = 250
+
+N_CONSTRAINTS = 4 # reserved slots, zeros until the Lagrangian layer exists
+REL_SCALE = 30.0 # metres, for relative positions
+DIST_SCALE = 50.0 # metres, for scalar distances
+BALL_SPEED_CAP = 15.0  # reception resync can spike ball speed to ~30
+OFFSIDE_MARGIN_SCALE = 20.0
+POS_SCALE = np.array([PITCH_X, PITCH_Y], dtype="f4")
+
+
+def obs_dim(n_att, n_def):
+    return (2 + 2 # own position, own velocity
+            + 5 * (n_att - 1) # teammates: rel pos, rel vel, is-carrier
+            + 4 * n_def # defenders: rel pos, rel vel, fixed roster order
+            + 7 # ball block
+            + 2 # zone: distance, zone control
+            + 3 # offside block
+            + 1 # clock
+            + N_CONSTRAINTS # reserved constraint rates
+            + n_att) # agent one-hot
 
 
 def make_initial_world(n_att=10, n_def=11, seed=0, start_holder=0):
@@ -160,7 +186,94 @@ def run_episode(n_att=10, n_def=11, seed=0, start_holder=0,
 world_step = step
 
 class LowBlockEnv(gym.Env):
-    pass
+
+    def __init__(self, n_att=10, n_def=11, max_tick=200):
+        super().__init__()
+        self.n_att, self.n_def = n_att, n_def
+        self.max_ticks = max_tick
+        self.obs_dim = obs_dim(n_att, n_def)
+
+        nvec = np.tile([len(direction_lookup), len(speed_lookup), n_att], (n_att, 1))
+        self.action_space = gym.spaces.MultiDiscrete(nvec)
+        self.observation_space = gym.spaces.Box(
+            low=-3.0, high=3.0, shape=(n_att, self.obs_dim), dtype=np.float32)
+
+        self.ppcf_grid = make_ppcf_grid()
+        self.zone = make_zone()
+        self.zone_centre = np.asarray(self.zone.centre, dtype="f4")
+        self.eye = np.eye(n_att, dtype="f4")
+
+        self.players = None
+        self.ball = None
+        self.attacker_ids = None
+        self.defender_state = None
+        self.rng = None
+        self.pc_att = None
+        self.tick = 0
+
+    def obs(self):
+        n = self.n_att
+        pos = np.asarray(self.players["position"], dtype="f4")
+        vel = np.asarray(self.players["velocity"], dtype="f4")
+        att_p, att_v = pos[:n], vel[:n]
+        def_p, def_v = pos[n:], vel[n:]
+
+        holder_id = self.ball.get("holder_id")
+        is_carrier = (np.zeros(n, dtype="f4") if holder_id is None else
+                      (self.players["id"][:n] == holder_id).astype("f4"))
+        keep = ~np.eye(n, dtype=bool)
+        rel_p = (att_p[None, :, :] - att_p[:, None, :])[keep].reshape(n, n - 1, 2)
+        rel_v = (att_v[None, :, :] - att_v[:, None, :])[keep].reshape(n, n - 1, 2)
+        mate_carrier = np.broadcast_to(is_carrier[None, :], (n, n))[keep].reshape(n, n - 1, 1)
+        mates = np.concatenate(
+            [rel_p / REL_SCALE, rel_v / V_MAX, mate_carrier], axis=2)
+
+        dp = def_p[None, :, :] - att_p[:, None, :]
+        dv = def_v[None, :, :] - att_v[:, None, :]
+        defs = np.concatenate([dp / REL_SCALE, dv / V_MAX], axis=2)
+
+        b_p = np.asarray(self.ball["position"], dtype="f4")
+        b_v = cap_speed(np.asarray(self.ball["velocity"], dtype="f4"), BALL_SPEED_CAP)
+        rel_b = b_p[None, :] - att_p
+        ball_blk = np.concatenate([
+            rel_b / REL_SCALE,
+            np.linalg.norm(rel_b, axis=1, keepdims=True) / DIST_SCALE,
+            np.broadcast_to(b_v / BALL_SPEED_CAP, (n, 2)),
+            np.full((n, 1), float(self.ball["state"] == "in_flight"), dtype="f4"),
+            is_carrier[:, None],
+        ], axis=1)
+
+        # Distance only, no direction: the zone centre never moves, so its
+        # bearing is recoverable from own position, which is already in here.
+        rel_z = self.zone_centre[None, :] - att_p
+        zone_blk = np.concatenate([
+            np.linalg.norm(rel_z, axis=1, keepdims=True) / DIST_SCALE,
+            np.full((n, 1), zone_control(self.pc_att, self.zone), dtype="f4"),
+        ], axis=1)
+
+        line = offside_line(self.players)
+        margin = att_p[:, 0] - line # positive = beyond the line
+        off_blk = np.stack([
+            np.full(n, line / PITCH_X, dtype="f4"),
+            np.clip(margin / OFFSIDE_MARGIN_SCALE, -1.0, 1.0),
+            ((margin > 0.0) & (att_p[:, 0] > HALFWAY_X)).astype("f4"),
+        ], axis=1)
+
+        out = np.concatenate([
+            att_p / POS_SCALE,
+            att_v / V_MAX,
+            mates.reshape(n, -1),
+            defs.reshape(n, -1),
+            ball_blk,
+            zone_blk,
+            off_blk,
+            np.full((n, 1), self.tick / self.max_ticks, dtype="f4"),
+            np.zeros((n, N_CONSTRAINTS), dtype="f4"), # reserved
+            self.eye,
+        ], axis=1).astype("f4")
+
+        assert out.shape == (n, self.obs_dim), (out.shape, self.obs_dim)
+        return out
 
 def make_vector_env(n_envs=6, asynchronous=False, seed=None,
                     autoreset_mode=None, **env_kwargs):
