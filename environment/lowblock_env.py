@@ -48,6 +48,7 @@ TIMEOUT = "timeout"
 MAX_TICKS = 200
 W = 0.03
 GAMMA = 0.99
+TERMINAL_REWARD = {SUCCESS: 1.0, FAILURE: -0.3, TIMEOUT: -0.5}
 
 N_CONSTRAINTS = 4 # reserved slots, zeros until the Lagrangian layer exists
 REL_SCALE = 30.0 # metres, for relative positions
@@ -198,10 +199,11 @@ world_step = step
 
 class LowBlockEnv(gym.Env):
 
-    def __init__(self, n_att=10, n_def=11, max_tick=MAX_TICKS):
+    def __init__(self, n_att=10, n_def=11, max_tick=MAX_TICKS, start_holder=None):
         super().__init__()
         self.n_att, self.n_def = n_att, n_def
         self.max_ticks = max_tick
+        self.start_holder = start_holder
         self.obs_dim = obs_dim(n_att, n_def)
 
         nvec = np.tile([len(direction_lookup), len(speed_lookup), n_att], (n_att, 1))
@@ -293,8 +295,9 @@ class LowBlockEnv(gym.Env):
 
         super().reset(seed=seed)
 
-        ep_seed = int(self.np_random.integers(0, 2 ** 31 - 1))
-        holder = int(self.np_random.integers(0, self.n_att))
+        ep_seed = self.ep_seed = int(self.np_random.integers(0, 2 ** 31 - 1))
+        holder = (int(self.np_random.integers(0, self.n_att))
+                  if self.start_holder is None else self.start_holder)
         self.players, self.ball, self.attacker_ids, self.rng, self.defender_state = \
         make_initial_world(self.n_att, self.n_def, seed=ep_seed, start_holder=holder)
                            
@@ -303,6 +306,50 @@ class LowBlockEnv(gym.Env):
         self.tick = 0
 
         return self.obs(), {}
+
+    def step(self, action):
+        a = np.asarray(action).reshape(self.n_att, 3)
+        self.tick += 1
+        self.players, self.ball, pc_att, outcome = world_step(
+            self.players, self.ball, self.attacker_ids, self.defender_state,
+            self.tick, self.rng, ppcf_grid=self.ppcf_grid, zone=self.zone,
+            max_ticks=self.max_ticks, actions=(a[:, 0], a[:, 1], a[:, 2]))
+        if pc_att is not None:
+            self.pc_att = pc_att
+
+        terminated = outcome is not None
+        # Zeroing phi at the terminal to make shaping telescope
+        phi = 0.0 if terminated else self.phi()
+        shaping = GAMMA * phi - self.prev_phi
+        self.prev_phi = phi
+        reward = shaping + TERMINAL_REWARD.get(outcome, 0.0)
+
+        return self.obs(), reward, terminated, False, self.info(outcome, shaping)
+
+    def info(self, outcome, shaping):
+        n = self.n_att
+        att_p = np.asarray(self.players["position"], dtype="f4")[:n]
+        att_v = np.asarray(self.players["velocity"], dtype="f4")[:n]
+        b_p = np.asarray(self.ball["position"], dtype="f4")
+
+        holder_id = self.ball.get("holder_id")
+        # only the carrier's ball head does anything; we mask the rest to hold so
+        # nine agents do not take gradient on a head that had no effect
+        mask = np.zeros((n, n), dtype=bool)
+        mask[:, 0] = True
+        if holder_id is not None and np.any(self.attacker_ids == holder_id):
+            mask[int(np.flatnonzero(self.attacker_ids == holder_id)[0])] = True
+
+        # raw quantities
+        line = offside_line(self.players)
+        return {
+            "outcome": outcome,
+            "shaping": shaping,
+            "ball_mask": mask,
+            "dist_to_ball": np.linalg.norm(att_p - b_p[None, :], axis=1),
+            "speed": np.linalg.norm(att_v, axis=1),
+            "offside_margin": att_p[:, 0] - line,
+        }
 
 def make_vector_env(n_envs=6, asynchronous=False, seed=None,
                     autoreset_mode=None, **env_kwargs):
