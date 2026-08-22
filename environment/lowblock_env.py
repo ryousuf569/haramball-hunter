@@ -45,7 +45,9 @@ SUCCESS = "success"
 FAILURE = "failure"
 TIMEOUT = "timeout"
 
-MAX_TICKS = 250
+MAX_TICKS = 200
+W = 0.03
+GAMMA = 0.99
 
 N_CONSTRAINTS = 4 # reserved slots, zeros until the Lagrangian layer exists
 REL_SCALE = 30.0 # metres, for relative positions
@@ -66,6 +68,15 @@ def obs_dim(n_att, n_def):
             + N_CONSTRAINTS # reserved constraint rates
             + n_att) # agent one-hot
 
+def compute_attacker_ppcf(players, ppcf_grid, ball_pos, per_attacker=False):
+
+    result = PPCF_grid(ppcf_grid, players, ball_pos)  # (n_cells, n_players)
+    is_att = players["team"] == ATTACKER_LABEL
+    att = result[:, is_att]
+    pc_att = att.sum(axis=1).reshape(PC_NX, PC_NY)
+    if not per_attacker:
+        return pc_att
+    return pc_att, att.reshape(PC_NX, PC_NY, -1)
 
 def make_initial_world(n_att=10, n_def=11, seed=0, start_holder=0):
     rng = np.random.default_rng(seed)
@@ -187,7 +198,7 @@ world_step = step
 
 class LowBlockEnv(gym.Env):
 
-    def __init__(self, n_att=10, n_def=11, max_tick=200):
+    def __init__(self, n_att=10, n_def=11, max_tick=MAX_TICKS):
         super().__init__()
         self.n_att, self.n_def = n_att, n_def
         self.max_ticks = max_tick
@@ -243,8 +254,6 @@ class LowBlockEnv(gym.Env):
             is_carrier[:, None],
         ], axis=1)
 
-        # Distance only, no direction: the zone centre never moves, so its
-        # bearing is recoverable from own position, which is already in here.
         rel_z = self.zone_centre[None, :] - att_p
         zone_blk = np.concatenate([
             np.linalg.norm(rel_z, axis=1, keepdims=True) / DIST_SCALE,
@@ -274,6 +283,26 @@ class LowBlockEnv(gym.Env):
 
         assert out.shape == (n, self.obs_dim), (out.shape, self.obs_dim)
         return out
+
+    # much simpler reward, dense shaping on ball progress toward the zone
+    def phi(self):
+        d = np.linalg.norm(np.asarray(self.ball["position"], float) - self.zone_centre)
+        return -W * float(d)    
+
+    def reset(self, *, seed=None, options=None):
+
+        super().reset(seed=seed)
+
+        ep_seed = int(self.np_random.integers(0, 2 ** 31 - 1))
+        holder = int(self.np_random.integers(0, self.n_att))
+        self.players, self.ball, self.attacker_ids, self.rng, self.defender_state = \
+        make_initial_world(self.n_att, self.n_def, seed=ep_seed, start_holder=holder)
+                           
+        self.pc_att = compute_attacker_ppcf(self.players, self.ppcf_grid, self.ball["position"])
+        self.prev_phi = self.phi()
+        self.tick = 0
+
+        return self.obs(), {}
 
 def make_vector_env(n_envs=6, asynchronous=False, seed=None,
                     autoreset_mode=None, **env_kwargs):
