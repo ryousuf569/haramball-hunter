@@ -39,7 +39,9 @@ from environment.termination import (ZONE_PC_MIN, check_success, make_zone,
 from defenders.turnover import HALFWAY_X, offside_line
 
 ATTACKER_LABEL = "attacker"
-IS_CARRIER = 99
+IS_CARRIER = 99 # obs[..., IS_CARRIER]              is-carrier flag
+OWN_POS = 0 # obs[..., OWN_POS:OWN_POS+2]       own position / POS_SCALE
+REL_BALL = 93 # obs[..., REL_BALL:REL_BALL+2]     (ball - own) / REL_SCALE
 DEFENDER_LABEL = "defender"
 
 SUCCESS = "success"
@@ -200,12 +202,13 @@ world_step = step
 
 class LowBlockEnv(gym.Env):
 
-    def __init__(self, n_att=10, n_def=11, max_tick=MAX_TICKS, start_holder=None):
+    def __init__(self, n_att=10, n_def=11, max_tick=MAX_TICKS, start_holder=None, fixed_seed=None):
         super().__init__()
         self.n_att, self.n_def = n_att, n_def
         self.max_ticks = max_tick
         self.start_holder = start_holder
         self.obs_dim = obs_dim(n_att, n_def)
+        self.fixed_seed = fixed_seed
 
         nvec = np.tile([len(direction_lookup), len(speed_lookup), n_att], (n_att, 1))
         self.action_space = gym.spaces.MultiDiscrete(nvec)
@@ -296,7 +299,7 @@ class LowBlockEnv(gym.Env):
 
         super().reset(seed=seed)
 
-        ep_seed = self.ep_seed = int(self.np_random.integers(0, 2 ** 31 - 1))
+        ep_seed = self.ep_seed = (self.fixed_seed if self.fixed_seed is not None else int(self.np_random.integers(0, 2 ** 31 - 1)))
         holder = (int(self.np_random.integers(0, self.n_att))
                   if self.start_holder is None else self.start_holder)
         self.players, self.ball, self.attacker_ids, self.rng, self.defender_state = \
