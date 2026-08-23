@@ -1,3 +1,4 @@
+import os
 import time
 from collections import Counter
 
@@ -10,6 +11,7 @@ from matplotlib.patches import Arc, Circle, Rectangle
 # interval and the per-tick real-time budget.
 from physics.engine import DT
 
+from attackers.ppo_policy import make_ppo_policy
 from attackers.scripted_policy import make_policy
 from environment.grid import PC_EXTENT, make_ppcf_grid
 from environment.lowblock_env import (
@@ -19,9 +21,9 @@ from environment.lowblock_env import (
     make_initial_world,
     step,
 )
-from environment.termination import make_zone, success_gate
+from environment.termination import ZONE_PC_MIN, make_zone, success_gate
 
-POLICIES = ("random", "scripted")
+POLICIES = ("random", "scripted")  # plus: a path to a trained .pt checkpoint
 
 # --- style -------------------------------------------------------------
 PITCH_COLOR = "#1e5631"
@@ -237,14 +239,23 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=None,
                    show_zone=True, start_holder=1, show_ppcf=True,
                    max_ticks=MAX_TICKS, pass_prob=None, hold_ticks=8,
-                   zone=None, policy="scripted", hold_shape=True):
+                   zone=None, policy="runs/ppo_500k_s0", hold_shape=True,
+                   deterministic=False, pc_min=None):
     """Open a matplotlib window and animate the attackers against the
     calibrated low block, restarting on every terminal outcome.
 
     policy picks who drives them: "random" for the uniform control, "scripted"
-    for attackers/scripted_policy.py. Measured over 25 episodes, random scores
-    ~16% and scripted ~84%, so expect the scripted window to look like football
-    and resolve in about a third of the ticks.
+    for attackers/scripted_policy.py, or a path to a .pt checkpoint written by
+    model/ppo.py (e.g. "runs/ppo_500k_s0/best.pt") to watch a trained agent
+    play. Measured over 25 episodes, random scores ~16% and scripted ~84%, so
+    expect the scripted window to look like football and resolve in about a
+    third of the ticks; a checkpoint lands wherever its training got to, which
+    the title bar names so windows are not confusable.
+
+    deterministic applies to checkpoints only. False (default) samples the
+    policy, which is how it behaved during training; True takes the argmax of
+    every action head, which reads its intent more cleanly but is off the
+    distribution it was trained on.
 
     hold_shape is passed to the scripted policy and ignored by random. True
     keeps each attacker on its kickoff offset from the centroid so the unit
@@ -267,6 +278,11 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
     hold_ticks is how many frames the terminal state stays on screen before the
     next episode starts, so an outcome is readable rather than a flicker.
 
+    zone is a termination.Zone; None builds the default -- except when policy
+    is a checkpoint, where None takes the gate the checkpoint was trained on
+    (zone and pc_min both), so a curriculum run is not judged against a gate it
+    never saw. pc_min=None follows the same rule. Pass either to override.
+
     zone is a termination.Zone; None builds the default. Pass
     make_zone(x, y, radius) to move or resize it. The title prints the live
     gate -- whether the ball is inside the disc, and the team's mean control
@@ -278,8 +294,13 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
     TTI to the ball in players['i_p'] and intercept_pass needs it -- skipping it
     would silently disable pass interceptions rather than just hiding an overlay.
     """
+    ppo = None
     if policy not in POLICIES:
-        raise ValueError(f"policy must be one of {POLICIES}, got {policy!r}")
+        if not (str(policy).endswith(".pt") or os.path.isdir(policy)):
+            raise ValueError(f"policy must be one of {POLICIES}, a .pt "
+                             f"checkpoint, or a run directory, got {policy!r}")
+        if not os.path.exists(policy):
+            raise FileNotFoundError(f"no checkpoint at {policy!r}")
     if interval_ms is None:
         interval_ms = int(DT * 1000)
 
@@ -290,8 +311,23 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
     # the same (n_cells, 2) array on every tick. Always built: the PPCF call is
     # what caches players['i_p'] for intercept_pass, so it is no longer optional.
     ppcf_grid = make_ppcf_grid()
+
+    # Loaded once and reused across episodes -- unlike the scripted policy it
+    # carries no per-episode shape, only a clock that reset() rewinds. It needs
+    # the same zone and tick budget the driver runs, since both feed features
+    # the agent was trained on, so the gate is resolved from it rather than the
+    # other way round.
+    if policy not in POLICIES:
+        ppo = make_ppo_policy(policy, zone=zone, n_att=n_att, n_def=n_def,
+                              max_ticks=max_ticks, deterministic=deterministic,
+                              seed=seed)
+        zone = ppo.zone
+        if pc_min is None:
+            pc_min = ppo.pc_min
     if zone is None:
         zone = make_zone()
+    if pc_min is None:
+        pc_min = ZONE_PC_MIN
 
     # Mutable state carried across FuncAnimation frames. step_ms/render_ms
     # accumulate the per-tick cost split so the running means aren't dominated
@@ -314,13 +350,24 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
         # Fresh policy per episode: the scripted one captures its slots from the
         # formation draw, so reusing an instance would run the new episode
         # against the previous episode's shape.
-        world["policy"] = (make_policy(zone, hold_shape)
-                           if policy == "scripted" else None)
+        if ppo is not None:
+            ppo.reset()
+            world["policy"] = ppo
+        else:
+            world["policy"] = (make_policy(zone, hold_shape)
+                               if policy == "scripted" else None)
 
     reset()
     budget_ms = DT * 1000.0
-    label = policy if policy != "scripted" else (
-        f"scripted{'' if hold_shape else ' (crowding)'}")
+    if ppo is not None:
+        label = ppo.label()
+        print(f"loaded {ppo.ckpt_path} | step {ppo.step} | "
+              f"training success {100 * ppo.stats.get('success', float('nan')):.1f}%")
+        print(f"gate {ppo.gate()}")
+    elif policy == "scripted":
+        label = f"scripted{'' if hold_shape else ' (crowding)'}"
+    else:
+        label = policy
 
     def update(_frame):
         # Terminal state lingers for hold_ticks frames so it can be read.
@@ -334,14 +381,23 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
         world["ticks"] += 1
 
         t_step0 = time.perf_counter()
-        actions = (None if world["policy"] is None else
-                   world["policy"](world["players"], world["ball"],
-                                   world["attacker_ids"]))
+        pol = world["policy"]
+        if pol is None:
+            actions = None
+        elif pol is ppo:
+            # Hand over last tick's field so the agent's observation costs no
+            # extra PPCF pass. None on an episode's first tick; PPOPolicy
+            # computes it itself there.
+            actions = pol(world["players"], world["ball"],
+                          world["attacker_ids"], pc_att=world["pc_att"])
+        else:
+            actions = pol(world["players"], world["ball"],
+                          world["attacker_ids"])
         world["players"], world["ball"], pc_att, outcome = step(
             world["players"], world["ball"], world["attacker_ids"],
             world["defender_state"], world["tick"], world["rng"],
             ppcf_grid=ppcf_grid, zone=zone, max_ticks=max_ticks,
-            pass_prob=pass_prob, actions=actions)
+            pass_prob=pass_prob, pc_min=pc_min, actions=actions)
         step_ms = (time.perf_counter() - t_step0) * 1000.0
 
         # An offside turnover returns before the PPCF call, so keep the last
@@ -411,4 +467,19 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
 
 
 if __name__ == "__main__":
-    run_simulation(start_holder=6)
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--policy", default="scripted",
+                    help='"random", "scripted", or a path to a .pt checkpoint')
+    ap.add_argument("--start-holder", type=int, default=6)
+    ap.add_argument("--seed", type=int, default=245365)
+    ap.add_argument("--deterministic", action="store_true",
+                    help="checkpoints only: argmax every head instead of sampling")
+    ap.add_argument("--no-ppcf", action="store_true",
+                    help="hide the pitch-control heatmap (still computed)")
+    args = ap.parse_args()
+
+    run_simulation(policy=args.policy, start_holder=args.start_holder,
+                   seed=args.seed, deterministic=args.deterministic,
+                   show_ppcf=not args.no_ppcf)

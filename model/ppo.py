@@ -301,6 +301,22 @@ def append_csv(path, row):
         w.writerow(row)
 
 
+PROBE_SUMMARY = os.path.join(REPO_ROOT, "environment", "probe",
+                             "zone_probe_summary.csv")
+
+def probe_baselines(x, y, radius, pc_min):
+    try:
+        with io.open(PROBE_SUMMARY, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError:
+        return None
+    key = (float(x), float(y), float(radius), float(pc_min))
+    hit = {r["policy"]: float(r["success_rate"]) for r in rows
+           if (float(r["x"]), float(r["y"]), float(r["radius"]),
+               float(r["theta"])) == key}
+    return hit or None
+
+
 def banner(cfg, n_updates, obs_d):
     steps_per_update = cfg.rollout * cfg.n_envs
     print("obs %d | act [9, 3, 10] | %d async envs x %d ticks = %d steps/update"
@@ -312,8 +328,14 @@ def banner(cfg, n_updates, obs_d):
     print("gate (%.0f, %.0f) r=%.0f pc_min=%.2f | gamma %.3f | start_holder %s"
           % (cfg.zone_x, cfg.zone_y, cfg.zone_radius, cfg.pc_min, cfg.gamma,
              "random" if cfg.start_holder < 0 else cfg.start_holder))
-    print("baselines at this gate (probe, start_holder=0): "
-          "random 12%  scripted 94%")
+    base = probe_baselines(cfg.zone_x, cfg.zone_y, cfg.zone_radius, cfg.pc_min)
+    if base is None:
+        print("probe baselines: this gate is not in "
+              "environment/probe/zone_probe_summary.csv")
+    else:
+        print("probe baselines here (start_holder=0): random floor %.1f%% | "
+              "scripted %.1f%%" % (100 * base.get("random", float("nan")),
+                                   100 * base.get("scripted", float("nan"))))
     print("spawning workers, first line after update 1 ...", flush=True)
 
 
