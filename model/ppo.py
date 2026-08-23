@@ -35,14 +35,6 @@ class Config:
     def batch(self):
         return self.rollout * self.n_envs * 10
 
-T, N, A, D = Config.rollout, Config.n_envs, 10, 120
-obs_buf  = torch.zeros(T, N, A, D)
-act_buf  = torch.zeros(T, N, A, 3, dtype=torch.long)
-logp_buf = torch.zeros(T, N, A)
-val_buf  = torch.zeros(T, N, A)
-rew_buf  = torch.zeros(T, N)
-done_buf = torch.zeros(T, N)
-
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -109,6 +101,91 @@ class ActorCritic(nn.Module):
         values = self.value(features)
         return values.squeeze(-1)   
 
+class RolloutBuffer:
+    def __init__(self, T, N, A, D):
+        self.T, self.N, self.A, self.D = T, N, A, D
+        self.obs = torch.zeros(T, N, A, D)
+        self.act = torch.zeros(T, N, A, 3, dtype=torch.long)
+        self.logp = torch.zeros(T, N, A)
+        self.val = torch.zeros(T, N, A)
+        self.rew = torch.zeros(T, N)
+        self.done = torch.zeros(T, N)
+
+    def flat(self, adv, ret):
+        B = self.T * self.N * self.A
+        return {
+            "obs": self.obs.reshape(B, self.D),
+            "act": self.act.reshape(B, 3),
+            "logp": self.logp.reshape(B),
+            "adv": adv.reshape(B),
+            "ret": ret.reshape(B),
+        }
+
+
+@dataclass
+class LoopState:
+    next_obs: torch.Tensor
+    next_done: torch.Tensor
+    ep_ret: np.ndarray
+    ep_len: np.ndarray
+
+
+def init_state(venv, seed, n_envs):
+    obs, _ = venv.reset(seed=seed)
+    return LoopState(torch.as_tensor(obs), torch.zeros(n_envs),
+                     np.zeros(n_envs), np.zeros(n_envs, dtype=np.int64))
+
+
+class EpisodeTracker:
+    def __init__(self, maxlen=100):
+        self.success = deque(maxlen=maxlen)
+        self.ret = deque(maxlen=maxlen)
+        self.len = deque(maxlen=maxlen)
+        self.n_eps = 0
+
+    def record(self, done_np, info, ep_ret, ep_len):
+        if not done_np.any():
+            return
+        outcomes = info["final_info"]["outcome"]
+        for i in np.flatnonzero(done_np):
+            self.success.append(outcomes[i] == SUCCESS)
+            self.ret.append(float(ep_ret[i]))
+            self.len.append(int(ep_len[i]))
+            self.n_eps += 1
+        ep_ret[done_np] = 0.0 # in place; these are LoopState's own arrays
+        ep_len[done_np] = 0
+
+    def stats(self):
+        if not self.success:
+            return {"success": float("nan"), "ret": float("nan"),
+                    "len": float("nan"), "n_eps": 0}
+        return {"success": float(np.mean(self.success)),
+                "ret": float(np.mean(self.ret)),
+                "len": float(np.mean(self.len)),
+                "n_eps": self.n_eps}
+
+
+@torch.no_grad()
+def collect_rollout(agent, venv, buf, state, tracker):
+    for t in range(buf.T):
+        buf.obs[t] = state.next_obs
+        buf.done[t] = state.next_done
+
+        act, logp, val = agent.act(state.next_obs)
+        buf.act[t], buf.logp[t], buf.val[t] = act, logp, val
+
+        obs, rew, term, trunc, info = venv.step(act.numpy())
+        buf.rew[t] = torch.as_tensor(rew, dtype=torch.float32)
+
+        state.ep_ret += rew
+        state.ep_len += 1
+        done_np = term | trunc
+        tracker.record(done_np, info, state.ep_ret, state.ep_len)
+
+        state.next_obs = torch.as_tensor(obs)
+        state.next_done = torch.as_tensor(done_np, dtype=torch.float32)
+    return state
+
 
 def phi_r2(phi, returns):
     """r^2 of the best linear predictor of the return from Phi alone"""
@@ -118,7 +195,6 @@ def phi_r2(phi, returns):
     p = p - p.mean()
     r = returns - returns.mean()
     return float((p @ r) ** 2 / ((p @ p) * (r @ r)))
-
 
 def explained_variance(values, returns):
     var_returns = returns.var()
