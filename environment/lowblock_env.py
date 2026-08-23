@@ -34,8 +34,8 @@ from defenders.turnover import (
     nearest_defender_to,
 )
 from environment.grid import PC_NX, PC_NY, make_ppcf_grid
-from environment.termination import (ZONE_PC_MIN, check_success, make_zone,
-                                     zone_control)
+from environment.termination import (ZONE_PC_MIN, ZONE_RADIUS, ZONE_X, ZONE_Y,
+                                     check_success, make_zone, zone_control)
 from defenders.turnover import HALFWAY_X, offside_line
 
 ATTACKER_LABEL = "attacker"
@@ -50,7 +50,7 @@ TIMEOUT = "timeout"
 
 MAX_TICKS = 200
 W = 0.03
-GAMMA = 0.99
+GAMMA = 1.0
 TERMINAL_REWARD = {SUCCESS: 1.0, FAILURE: -0.3, TIMEOUT: -0.5}
 
 N_CONSTRAINTS = 4 # reserved slots, zeros until the Lagrangian layer exists
@@ -202,7 +202,9 @@ world_step = step
 
 class LowBlockEnv(gym.Env):
 
-    def __init__(self, n_att=10, n_def=11, max_tick=MAX_TICKS, start_holder=None, fixed_seed=None):
+    def __init__(self, n_att=10, n_def=11, max_tick=MAX_TICKS, start_holder=None,
+                 fixed_seed=None, zone_x=ZONE_X, zone_y=ZONE_Y,
+                 zone_radius=ZONE_RADIUS, pc_min=ZONE_PC_MIN):
         super().__init__()
         self.n_att, self.n_def = n_att, n_def
         self.max_ticks = max_tick
@@ -216,7 +218,11 @@ class LowBlockEnv(gym.Env):
             low=-3.0, high=3.0, shape=(n_att, self.obs_dim), dtype=np.float32)
 
         self.ppcf_grid = make_ppcf_grid()
-        self.zone = make_zone()
+        # The gate is per-env so a run can be trained on a reachable one and
+        # tightened later; environment/probe/zone_probe_summary.csv is the map
+        # of what each (centre, radius, pc_min) is worth to random and scripted.
+        self.zone = make_zone(zone_x, zone_y, zone_radius)
+        self.pc_min = float(pc_min)
         self.zone_centre = np.asarray(self.zone.centre, dtype="f4")
         self.eye = np.eye(n_att, dtype="f4")
 
@@ -317,7 +323,8 @@ class LowBlockEnv(gym.Env):
         self.players, self.ball, pc_att, outcome = world_step(
             self.players, self.ball, self.attacker_ids, self.defender_state,
             self.tick, self.rng, ppcf_grid=self.ppcf_grid, zone=self.zone,
-            max_ticks=self.max_ticks, actions=(a[:, 0], a[:, 1], a[:, 2]))
+            max_ticks=self.max_ticks, pc_min=self.pc_min,
+            actions=(a[:, 0], a[:, 1], a[:, 2]))
         if pc_att is not None:
             self.pc_att = pc_att
 

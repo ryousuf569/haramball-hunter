@@ -40,6 +40,11 @@ class Config:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     hidden: int = 256
+    zone_x: float = 82.0
+    zone_y: float = 34.0
+    zone_radius: float = 12.0
+    pc_min: float = 0.30
+    start_holder: int = 0
     seed: int = 1
     log_every: int = 10
     save_every: int = 100
@@ -277,7 +282,7 @@ def set_seed(seed):
     torch.manual_seed(seed)
 
 HEADER = (" upd     step |  succ     ret   len   eps |      kl   clip    ent |"
-           "     ev  phir2 |   pg_loss    v_loss |       lr |  sps")
+           "     ev  phir2  evres |   pg_loss    v_loss |       lr |  sps")
 
 
 def save(run_dir, name, agent, cfg, step, stats):
@@ -304,6 +309,11 @@ def banner(cfg, n_updates, obs_d):
     print("%d updates -> %d steps | lr %.1e (%s) | seed %d | logging every %d"
           % (n_updates, n_updates * steps_per_update, cfg.lr,
              "annealed" if cfg.anneal_lr else "constant", cfg.seed, cfg.log_every))
+    print("gate (%.0f, %.0f) r=%.0f pc_min=%.2f | gamma %.3f | start_holder %s"
+          % (cfg.zone_x, cfg.zone_y, cfg.zone_radius, cfg.pc_min, cfg.gamma,
+             "random" if cfg.start_holder < 0 else cfg.start_holder))
+    print("baselines at this gate (probe, start_holder=0): "
+          "random 12%  scripted 94%")
     print("spawning workers, first line after update 1 ...", flush=True)
 
 
@@ -316,11 +326,11 @@ def log(update, global_step, metrics, stats, t0, lr=float("nan")):
     sps = global_step / max(time.perf_counter() - t0, 1e-9)
     g = metrics.get
     print("%4d %8d | %5.1f%% %7.3f %5.0f %5d | %7.4f %6.3f %6.3f |"
-          " %6.3f %6.3f | %9.5f %9.5f | %8.2e | %4.0f"
+          " %6.3f %6.3f %6.3f | %9.5f %9.5f | %8.2e | %4.0f"
           % (update, global_step,
              100.0 * stats["success"], stats["ret"], stats["len"], stats["n_eps"],
              g("approx_kl", nan), g("clipfrac", nan), g("entropy", nan),
-             g("ev", nan), g("phi_r2", nan),
+             g("ev", nan), g("phi_r2", nan), g("ev_resid", nan),
              g("pg_loss", nan), g("v_loss", nan),
              lr, sps), flush=True)
     return sps
@@ -331,7 +341,11 @@ def train(cfg):
     set_seed(cfg.seed)
     A, D = 10, obs_dim(10, 11)
     venv = make_vector_env(n_envs=cfg.n_envs, asynchronous=True,
-                           autoreset_mode=AutoresetMode.SAME_STEP)
+                           autoreset_mode=AutoresetMode.SAME_STEP,
+                           zone_x=cfg.zone_x, zone_y=cfg.zone_y,
+                           zone_radius=cfg.zone_radius, pc_min=cfg.pc_min,
+                           start_holder=(None if cfg.start_holder < 0
+                                         else cfg.start_holder))
     agent = ActorCritic(obs_dim=D, hidden=cfg.hidden)
     opt = torch.optim.Adam(agent.parameters(), lr=cfg.lr, eps=1e-5)
 
@@ -340,7 +354,9 @@ def train(cfg):
     tracker = EpisodeTracker(maxlen=100)
 
     n_updates = cfg.total_steps // (cfg.rollout * cfg.n_envs)
-    zone_centre = torch.as_tensor(make_zone().centre, dtype=torch.float32)
+    zone_centre = torch.as_tensor(
+        make_zone(cfg.zone_x, cfg.zone_y, cfg.zone_radius).centre,
+        dtype=torch.float32)
 
     run_name = cfg.run_name or time.strftime("ppo_%Y%m%d_%H%M%S")
     run_dir = os.path.join(REPO_ROOT, "runs", run_name)
@@ -366,8 +382,11 @@ def train(cfg):
                                state.next_done, cfg.gamma, cfg.gae_lambda)
 
         metrics = ppo_update(agent, opt, buf.flat(adv, ret), cfg)
+        phi = phi_from_obs(buf.obs, zone_centre)
         metrics["ev"] = explained_variance(buf.val.reshape(-1), ret.reshape(-1))
-        metrics["phi_r2"] = phi_r2(phi_from_obs(buf.obs, zone_centre), ret)
+        metrics["phi_r2"] = phi_r2(phi, ret)
+        metrics["ev_resid"] = explained_variance(
+            (buf.val + phi).reshape(-1), (ret + phi).reshape(-1))
 
         global_step = update * cfg.rollout * cfg.n_envs
         stats = tracker.stats()
@@ -403,9 +422,19 @@ if __name__ == "__main__":
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--save-every", type=int, default=100)
     ap.add_argument("--run-name", type=str, default="")
+    ap.add_argument("--zone-x", type=float, default=Config.zone_x)
+    ap.add_argument("--zone-y", type=float, default=Config.zone_y)
+    ap.add_argument("--zone-radius", type=float, default=Config.zone_radius)
+    ap.add_argument("--pc-min", type=float, default=Config.pc_min)
+    ap.add_argument("--start-holder", type=int, default=Config.start_holder,
+                    help="attacker row that kicks off with the ball; "
+                         "-1 draws a new one each episode")
     args = ap.parse_args()
     train(Config(n_envs=args.n_envs, rollout=args.rollout, lr=args.lr,
                  total_steps=args.total_steps, seed=args.seed,
                  log_every=args.log_every, save_every=args.save_every,
                  run_name=args.run_name,
+                 zone_x=args.zone_x, zone_y=args.zone_y,
+                 zone_radius=args.zone_radius, pc_min=args.pc_min,
+                 start_holder=args.start_holder,
                  anneal_lr=not args.no_anneal))
