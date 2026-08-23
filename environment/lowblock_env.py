@@ -39,6 +39,7 @@ from environment.termination import (ZONE_PC_MIN, check_success, make_zone,
 from defenders.turnover import HALFWAY_X, offside_line
 
 ATTACKER_LABEL = "attacker"
+IS_CARRIER = 99
 DEFENDER_LABEL = "defender"
 
 SUCCESS = "success"
