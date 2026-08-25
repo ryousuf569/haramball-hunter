@@ -1,0 +1,25 @@
+case,n_states,n_players,verdict,deterministic,max_abs,max_rel,cells_over_tol,cells_at_cutoff,pc_att_max_abs,zone_ctrl_max_abs,ip_max_abs,status
+initial_formations,8,21,ok,True,6.305e-07,7.698e-06,0,0,6.481e-07,4.294e-08,9.537e-07,ok
+zero_velocity,1,21,ok,True,4.212e-07,6.118e-06,0,0,3.674e-07,5.383e-09,9.537e-07,ok
+tiny_velocity,1,21,ok,True,4.230e-07,6.115e-06,0,0,3.668e-07,4.955e-09,9.537e-07,ok
+player_on_cell_centre,1,21,ok,True,4.286e-07,6.351e-06,0,0,3.533e-07,1.838e-08,9.537e-07,ok
+all_on_cell_centres,1,21,ok,True,3.571e-07,2.299e-06,0,0,2.848e-07,1.636e-10,9.537e-07,ok
+ball_on_player,1,21,ok,True,4.212e-07,6.118e-06,0,0,3.674e-07,5.383e-09,9.537e-07,ok
+near_zero_distance,5,21,ok,True,4.206e-07,6.358e-06,0,0,3.674e-07,1.834e-08,4.768e-07,ok
+clustered_outfield,1,21,ok,True,7.776e-07,5.727e-06,0,0,6.142e-07,7.585e-09,4.768e-07,ok
+stacked_on_ball,1,21,ok,True,6.897e-08,4.530e-06,0,0,4.140e-07,2.091e-08,0.000e+00,ok
+out_of_bounds,1,21,ok,True,7.958e-07,6.975e-06,0,0,6.820e-07,3.724e-08,1.526e-05,ok
+moving_away,1,21,ok,True,6.863e-07,7.082e-06,0,0,4.133e-07,4.086e-08,9.537e-07,ok
+moving_toward,1,21,ok,True,5.330e-07,7.186e-06,0,0,4.602e-07,5.002e-09,9.537e-07,ok
+above_v_max,1,21,ok,True,7.661e-07,1.025e-05,0,0,7.426e-07,1.537e-08,3.815e-06,ok
+tie_distance,1,4,ok,True,9.751e-07,6.676e-06,0,0,8.287e-07,1.098e-08,0.000e+00,ok
+far_corners,1,4,ok,True,9.154e-07,5.653e-06,0,0,8.109e-07,2.263e-09,0.000e+00,ok
+single_player,1,1,ok,True,9.815e-07,3.815e-06,0,0,9.815e-07,5.863e-08,0.000e+00,ok
+all_attackers,1,21,ok,True,4.117e-07,6.330e-06,0,0,2.805e-07,7.443e-09,9.537e-07,ok
+all_defenders,1,21,ok,True,5.084e-07,5.995e-06,0,0,0.000e+00,0.000e+00,9.537e-07,ok
+duplicate_positions,1,21,ok,True,4.232e-07,6.110e-06,0,0,3.881e-07,3.845e-08,9.537e-07,ok
+many_players_92,1,92,ok,True,4.527e-07,4.121e-06,0,0,2.950e-07,8.154e-10,1.907e-06,ok
+over_shared_cap_128,0,0,ERROR,,,,,,,,,CUDADriverError: CUDA_ERROR_INVALID_VALUE: invalid argument
+no_ball_pos,8,21,ok,True,6.305e-07,7.698e-06,0,0,6.481e-07,4.294e-08,0.000e+00,ok
+random_rollout,200,21,cutoff_boundary,True,5.002e-03,2.127e-02,1,1,4.329e-06,1.419e-09,1.907e-06,ok
+fuzz_500,500,23,DIFFER,True,3.369e-03,4.779e-02,3,3,4.668e-03,1.094e-07,7.629e-06,ok
