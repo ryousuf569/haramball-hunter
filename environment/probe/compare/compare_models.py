@@ -80,6 +80,34 @@ def model_episode(ppo):
     return start
 
 
+def hybrid_episode(ppo):
+    def start(env):
+        ppo.reset()
+        policy = make_policy(env.zone)
+
+        def act(env):
+            d, s, _ = policy(env.players, env.ball, env.attacker_ids)
+            _, _, b = ppo(env.players, env.ball, env.attacker_ids,
+                          pc_att=env.pc_att)
+            return np.stack([d, s, b], axis=1)
+        return act
+    return start
+
+
+def hybrid_movement_episode(ppo):
+    def start(env):
+        ppo.reset()
+        policy = make_policy(env.zone)
+
+        def act(env):
+            _, _, b = policy(env.players, env.ball, env.attacker_ids)
+            d, s, _ = ppo(env.players, env.ball, env.attacker_ids,
+                          pc_att=env.pc_att)
+            return np.stack([d, s, b], axis=1)
+        return act
+    return start
+
+
 def evaluate(env, start_episode, n_episodes, base_seed):
     outcomes, ticks = [], []
     for e in range(n_episodes):
@@ -163,6 +191,7 @@ def main():
     ap.add_argument("--start-holder", type=int, default=0)
     ap.add_argument("--max-ticks", type=int, default=MAX_TICKS)
     ap.add_argument("--deterministic", action="store_true")
+    ap.add_argument("--hybrid", action="store_true")
     ap.add_argument("--zone-x", type=float, default=None)
     ap.add_argument("--zone-y", type=float, default=None)
     ap.add_argument("--zone-radius", type=float, default=None)
@@ -191,15 +220,21 @@ def main():
         ppo = make_ppo_policy(path, zone=zone, max_ticks=args.max_ticks,
                               deterministic=args.deterministic, seed=args.seed)
         runs.append((ppo.label(), model_episode(ppo)))
+        if args.hybrid:
+            runs.append((ppo.label() + "\n+ scripted movement",
+                         hybrid_episode(ppo)))
+            runs.append((ppo.label() + "\n+ scripted passing",
+                         hybrid_movement_episode(ppo)))
 
     results = []
     for name, start_episode in runs:
         outcomes, ticks = evaluate(env, start_episode, args.episodes, args.seed)
         results.append(summarise(name, outcomes, ticks))
         r = results[-1]
-        print("%-32s success %5.1f%%  [%4.1f, %4.1f]  failure %5.1f%%  "
+        print("%-46s success %5.1f%%  [%4.1f, %4.1f]  failure %5.1f%%  "
               "timeout %5.1f%%  mean %5.0f ticks"
-              % (name, 100 * r["success"], 100 * r["lo"], 100 * r["hi"],
+              % (name.replace("\n", " "),
+                 100 * r["success"], 100 * r["lo"], 100 * r["hi"],
                  100 * r["counts"][FAILURE] / r["n"],
                  100 * r["counts"][TIMEOUT] / r["n"], r["mean_ticks"]),
               flush=True)

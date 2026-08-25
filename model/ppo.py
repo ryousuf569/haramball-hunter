@@ -221,6 +221,23 @@ def phi_r2(phi, returns):
     r = r - r.mean()
     return float((p @ r) ** 2 / ((p @ p) * (r @ r)))
 
+@torch.no_grad()
+def head_entropy_metrics(agent, obs, obs_dim):
+    flat = obs.reshape(-1, obs_dim)
+    h = agent.trunk(flat)
+    dist = MultiCategorical(agent.head(h), agent.nvec,
+                            ball_mask_from_obs(flat, agent.n_att))
+    heads = torch.stack(dist.head_entropies(), dim=1)
+    carrier = flat[:, IS_CARRIER] > 0.5
+    out = {}
+    for i, name in enumerate(("dir", "spd", "ball")):
+        for tag, rows in (("car", carrier), ("off", ~carrier)):
+            out["h_%s_%s" % (name, tag)] = (
+                float(heads[rows, i].mean()) if bool(rows.any())
+                else float("nan"))
+    return out
+
+
 def explained_variance(values, returns):
     var_returns = returns.var()
     if var_returns == 0:
@@ -282,7 +299,8 @@ def set_seed(seed):
     torch.manual_seed(seed)
 
 HEADER = (" upd     step |  succ     ret   len   eps |      kl   clip    ent |"
-           "     ev  phir2  evres |   pg_loss    v_loss |       lr |  sps")
+           "  hdir_c hdir_o hball_c |     ev  phir2  evres |"
+           "   pg_loss    v_loss |       lr |  sps")
 
 
 def save(run_dir, name, agent, cfg, step, stats):
@@ -348,10 +366,12 @@ def log(update, global_step, metrics, stats, t0, lr=float("nan")):
     sps = global_step / max(time.perf_counter() - t0, 1e-9)
     g = metrics.get
     print("%4d %8d | %5.1f%% %7.3f %5.0f %5d | %7.4f %6.3f %6.3f |"
-          " %6.3f %6.3f %6.3f | %9.5f %9.5f | %8.2e | %4.0f"
+          " %7.3f %6.3f %7.3f | %6.3f %6.3f %6.3f | %9.5f %9.5f |"
+          " %8.2e | %4.0f"
           % (update, global_step,
              100.0 * stats["success"], stats["ret"], stats["len"], stats["n_eps"],
              g("approx_kl", nan), g("clipfrac", nan), g("entropy", nan),
+             g("h_dir_car", nan), g("h_dir_off", nan), g("h_ball_car", nan),
              g("ev", nan), g("phi_r2", nan), g("ev_resid", nan),
              g("pg_loss", nan), g("v_loss", nan),
              lr, sps), flush=True)
@@ -409,6 +429,7 @@ def train(cfg):
         metrics["phi_r2"] = phi_r2(phi, ret)
         metrics["ev_resid"] = explained_variance(
             (buf.val + phi).reshape(-1), (ret + phi).reshape(-1))
+        metrics.update(head_entropy_metrics(agent, buf.obs, buf.obs.shape[-1]))
 
         global_step = update * cfg.rollout * cfg.n_envs
         stats = tracker.stats()
