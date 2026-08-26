@@ -1,8 +1,9 @@
 import os
 import time
-from collections import Counter
+from collections import Counter, deque
 
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Arc, Circle, Rectangle
@@ -12,14 +13,15 @@ from matplotlib.patches import Arc, Circle, Rectangle
 from physics.engine import DT
 
 from attackers.ppo_policy import make_ppo_policy
+from attackers.random_policy import random_actions
 from attackers.scripted_policy import make_policy
-from environment.grid import PC_EXTENT, make_ppcf_grid
+from environment.grid import PC_EXTENT
 from environment.lowblock_env import (
     ATTACKER_LABEL,
     DEFENDER_LABEL,
     MAX_TICKS,
-    make_initial_world,
-    step,
+    LowBlockEnv,
+    make_vector_env,
 )
 from environment.termination import ZONE_PC_MIN, make_zone, success_gate
 
@@ -37,6 +39,11 @@ FLIGHT_LINE_COLOR = "#ffffff"
 
 PLAYER_RADIUS = 1.1          # m, marker footprint on pitch
 VELOCITY_LOOKAHEAD_S = 1.0   # arrow length = displacement over this many seconds
+
+# Ticks averaged for the live steps/s readout. Short enough to react when a
+# backend hits a slow patch, long enough that one outlier tick doesn't make the
+# number jump around unreadably.
+STEP_RATE_WINDOW = 30
 
 
 def _draw_pitch(ax, pitch_length=105.0, pitch_width=68.0):
@@ -229,20 +236,131 @@ def render_frame(players, ball, ax=None, show_ids=True, show_velocity=True,
 # Live simulation driver
 # ---------------------------------------------------------------------------
 # Everything below drives one of the fixed policies in attackers/ and animates
-# it. environment/lowblock_env.py owns the world (make_initial_world/step); the
-# driver's job is to (1) hold the world state it hands back, (2) advance one DT
-# tick, (3) pass the new state to render_frame, and (4) start a fresh episode
-# whenever one ends, so a single window shows many possessions and a running
-# outcome tally.
+# it. The world lives in environment/lowblock_env.py's LowBlockEnv -- the same
+# gym env model/ppo.py trains against, not a parallel copy of the loop -- so the
+# window shows the reward, the shaping and the observation the agent actually
+# sees. The driver's job is to (1) pick actions, (2) call env.step, (3) draw the
+# env's state, and (4) start a fresh episode whenever one ends, so a single
+# window shows many possessions and a running outcome tally.
+
+
+def _stack_actions(actions):
+    """Policy triple (direction, speed, ball) -> the env's (n_att, 3) action."""
+    return np.stack(actions, axis=1).astype(np.int64)
+
+
+def _agent_actions(agent, obs, deterministic):
+    """Batched observation (n_envs, n_att, obs_dim) -> (n_envs, n_att, 3).
+
+    Mirrors PPOPolicy.__call__ but takes the observation the env already built
+    rather than rebuilding it, which also means no second PPCF pass per tick.
+    """
+    obs_t = torch.as_tensor(np.asarray(obs, dtype="f4"))
+    with torch.no_grad():
+        if deterministic:
+            n_env, n_att, dim = obs_t.shape
+            dist, _ = agent._dist_and_value(obs_t.reshape(n_env * n_att, dim))
+            act = dist.mode().reshape(n_env, n_att, 3)
+        else:
+            act, _logp, _val = agent.act(obs_t)
+    return act.numpy()
+
+
+class _EnvDriver:
+    """One LowBlockEnv, or n of them under a vector env, behind one interface.
+
+    n_envs=1 is the path to read: reset/step map straight onto the gym API and
+    the driver owns the episode boundary. n_envs>1 goes through make_vector_env
+    so the window can show a training-shaped batch stepping in lockstep -- every
+    env advances, one of them is drawn, and the outcome tally fills n times
+    faster.
+
+    The vector env is synchronous on purpose: AsyncVectorEnv keeps its sub-envs
+    in subprocesses, where players/ball live in another address space and there
+    is nothing here to draw. Autoreset is left at gymnasium's NEXT_STEP default,
+    which returns the terminal observation and only resets on the following
+    step -- that is what lets a finished possession stay on screen while the
+    driver holds off calling step.
+    """
+
+    def __init__(self, n_envs, **env_kwargs):
+        self.n_envs = n_envs
+        if n_envs == 1:
+            self.venv = None
+            self.envs = [LowBlockEnv(**env_kwargs)]
+        else:
+            self.venv = make_vector_env(n_envs=n_envs, asynchronous=False,
+                                        **env_kwargs)
+            self.envs = list(self.venv.envs)
+        self.obs = None
+
+    def reset(self, seed=None):
+        if self.venv is None:
+            # A bare LowBlockEnv observes (n_att, obs_dim); everything
+            # downstream wants the vector env's leading env axis, so add it.
+            obs, _info = self.envs[0].reset(seed=seed)
+            self.obs = obs[None]
+        else:
+            self.obs, _info = self.venv.reset(seed=seed)
+        return self.obs
+
+    def reset_one(self, i):
+        """Restart sub-env i. Single-env only -- the vector env autoresets."""
+        assert self.venv is None
+        obs, _info = self.envs[i].reset()
+        self.obs = obs[None]
+        return self.obs
+
+    def step(self, actions):
+        """actions is (n_envs, n_att, 3). Returns (rewards, outcomes)."""
+        if self.venv is None:
+            obs, reward, _term, _trunc, info = self.envs[0].step(actions[0])
+            self.obs = obs[None]
+            return np.array([reward], dtype=float), [info.get("outcome")]
+
+        self.obs, reward, _term, _trunc, info = self.venv.step(actions)
+        return np.asarray(reward, dtype=float), self._outcomes(info)
+
+    def _outcomes(self, info):
+        # The vector env stacks each sub-env's info key into one object array
+        # (None where that env did not terminate). Read it defensively: the key
+        # is absent entirely on a step where every env autoreset.
+        raw = info.get("outcome")
+        outcomes = [None] * self.n_envs
+        if raw is None:
+            return outcomes
+        for i in range(self.n_envs):
+            value = raw[i]
+            if isinstance(value, str):
+                outcomes[i] = value
+        return outcomes
+
+    def close(self):
+        if self.venv is not None:
+            self.venv.close()
 
 
 def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=None,
                    show_zone=True, start_holder=1, show_ppcf=True,
                    max_ticks=MAX_TICKS, pass_prob=None, hold_ticks=8,
                    zone=None, policy="runs/ppo_500k_s0", hold_shape=True,
-                   deterministic=False, pc_min=None):
+                   deterministic=False, pc_min=None, n_envs=1, render_env=0):
     """Open a matplotlib window and animate the attackers against the
     calibrated low block, restarting on every terminal outcome.
+
+    The world is a LowBlockEnv from environment/lowblock_env.py -- the env
+    model/ppo.py trains on -- so what the window shows is what the agent gets:
+    the title carries the per-episode return and the last tick's shaping term
+    alongside the gate readout.
+
+    n_envs > 1 puts that env behind make_vector_env (synchronous; see
+    _EnvDriver) and steps a whole batch per frame, drawing sub-env render_env
+    and tallying outcomes from all of them. The tally then fills n_envs times
+    faster per wall-clock second, and the steps/s readout becomes the batch's
+    throughput -- which is the number to compare across PPCF backends. Set
+    PPCF_BACKEND=cuda in the environment to run the kernel from physics/ppcf.cu
+    instead of physics/ppcf.py; it is read at import time, so set it before
+    launching rather than from inside the process.
 
     policy picks who drives them: "random" for the uniform control, "scripted"
     for attackers/scripted_policy.py, or a path to a .pt checkpoint written by
@@ -264,16 +382,17 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
 
     interval_ms defaults to DT * 1000 so wall-clock ~= sim-clock (real time).
 
-    pass_prob is handed through step() to random_policy.random_actions and
-    ignored by the scripted policy. None means a uniform draw over the whole ball head,
-    which is the honest control for the probe and releases the ball on roughly
-    (n_att - 1) / n_att of carrying ticks. Pass a float to see the same
-    movement with a calmer ball.
+    pass_prob goes to random_policy.random_actions and is ignored by the
+    scripted policy and by checkpoints. None means a uniform draw over the whole
+    ball head, which is the honest control for the probe and releases the ball
+    on roughly (n_att - 1) / n_att of carrying ticks. Pass a float to see the
+    same movement with a calmer ball.
 
     start_holder chooses which attacker kicks off with the ball (attacker row
     index; see make_initial_world). Change it to watch the low block react to
     different starting situations -- e.g. start_holder=0 (deep build-up) vs
-    8 (ball already at the central striker).
+    8 (ball already at the central striker). Negative draws a fresh holder per
+    episode, which is what LowBlockEnv's start_holder=None does.
 
     hold_ticks is how many frames the terminal state stays on screen before the
     next episode starts, so an outcome is readable rather than a flicker.
@@ -307,16 +426,12 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
     fig, ax = plt.subplots(figsize=(10.5, 6.8))
     fig.patch.set_facecolor(PITCH_COLOR)
 
-    # Cell centres are fixed for the whole run, so build the grid once and reuse
-    # the same (n_cells, 2) array on every tick. Always built: the PPCF call is
-    # what caches players['i_p'] for intercept_pass, so it is no longer optional.
-    ppcf_grid = make_ppcf_grid()
-
-    # Loaded once and reused across episodes -- unlike the scripted policy it
-    # carries no per-episode shape, only a clock that reset() rewinds. It needs
-    # the same zone and tick budget the driver runs, since both feed features
-    # the agent was trained on, so the gate is resolved from it rather than the
-    # other way round.
+    # Loaded once and reused across episodes. The checkpoint carries the gate it
+    # was trained on, so zone/pc_min are resolved from it rather than the other
+    # way round -- a curriculum run judged against a gate it never saw reads as
+    # a far worse agent than it is. Only the agent and that metadata are used
+    # from here: actions come off the env's own observation, so PPOPolicy's
+    # observation shell and clock go unused (see _agent_actions).
     if policy not in POLICIES:
         ppo = make_ppo_policy(policy, zone=zone, n_att=n_att, n_def=n_def,
                               max_ticks=max_ticks, deterministic=deterministic,
@@ -328,36 +443,67 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
         zone = make_zone()
     if pc_min is None:
         pc_min = ZONE_PC_MIN
+    if not 0 <= render_env < n_envs:
+        raise ValueError(f"render_env {render_env} is out of range for "
+                         f"{n_envs} env(s)")
+
+    # LowBlockEnv rebuilds the zone from its centre/radius, so hand it those
+    # numbers rather than the object -- make_zone is deterministic, so the gate
+    # the env checks is the one resolved above. A negative start_holder means
+    # "draw one per episode", matching the convention model/ppo.py's cfg uses.
+    driver = _EnvDriver(
+        n_envs, n_att=n_att, n_def=n_def, max_tick=max_ticks,
+        start_holder=(None if start_holder is not None and start_holder < 0
+                      else start_holder),
+        zone_x=float(zone.centre[0]), zone_y=float(zone.centre[1]),
+        zone_radius=float(zone.radius), pc_min=float(pc_min))
+    # One seed for the whole run: the env draws a fresh episode seed from its
+    # own generator on every reset, so possessions vary without the driver
+    # having to feed it seed + episode by hand.
+    driver.reset(seed=seed)
+    shown = driver.envs[render_env]
+
+    # The random policy needs its own stream. Each env's rng drives the engine's
+    # stochasticity -- duels, interceptions, pass noise -- not the action draw.
+    rng = np.random.default_rng(seed)
 
     # Mutable state carried across FuncAnimation frames. step_ms/render_ms
-    # accumulate the per-tick cost split so the running means aren't dominated
-    # by whichever tick happened to be slow. tally is the whole point of the
-    # auto-reset: it is a live preview of the random-vs-calibrated probe.
-    world = {"episode": 0, "tick": 0, "step_ms": 0.0, "render_ms": 0.0,
-             "ticks": 0, "outcome": None, "freeze": 0, "tally": Counter()}
+    # accumulate the per-frame cost split so the running means aren't dominated
+    # by whichever frame happened to be slow. recent_step_ms is the sliding
+    # window behind the live steps/s readout -- engine cost only, so the number
+    # compares backends rather than matplotlib. tally is the whole point of the
+    # auto-reset: it is a live preview of the random-vs-calibrated probe, and
+    # ret/returns put the env's own reward next to it.
+    world = {"ep": np.ones(n_envs, dtype=int), "step_ms": 0.0, "render_ms": 0.0,
+             "ticks": 0, "outcome": None, "freeze": 0, "tally": Counter(),
+             "recent_step_ms": deque(maxlen=STEP_RATE_WINDOW), "frames": 0,
+             "ret": np.zeros(n_envs), "returns": []}
 
-    def reset():
-        world["episode"] += 1
-        world["tick"] = 0
-        world["outcome"] = None
-        world["freeze"] = 0
-        # A new seed per episode, so the formation draw and the action stream
-        # both vary; seed alone would replay the same possession forever.
-        (world["players"], world["ball"], world["attacker_ids"],
-         world["rng"], world["defender_state"]) = make_initial_world(
-            n_att, n_def, seed + world["episode"], start_holder=start_holder)
-        world["pc_att"] = None
-        # Fresh policy per episode: the scripted one captures its slots from the
-        # formation draw, so reusing an instance would run the new episode
-        # against the previous episode's shape.
+    # One scripted policy per env, rebuilt at every episode boundary: it
+    # captures its slots from the formation draw on the first tick, so an
+    # instance outliving its episode would play the new one against the
+    # previous episode's shape. None means the random control.
+    policies = [None] * n_envs
+
+    def new_policy(i):
+        policies[i] = (make_policy(zone, hold_shape)
+                       if policy == "scripted" else None)
+
+    for i in range(n_envs):
+        new_policy(i)
+
+    def actions_for():
+        """(n_envs, n_att, 3) actions for the observation the envs just gave."""
         if ppo is not None:
-            ppo.reset()
-            world["policy"] = ppo
-        else:
-            world["policy"] = (make_policy(zone, hold_shape)
-                               if policy == "scripted" else None)
+            return _agent_actions(ppo.agent, driver.obs, deterministic)
+        out = np.empty((n_envs, n_att, 3), dtype=np.int64)
+        for i, env in enumerate(driver.envs):
+            pol = policies[i]
+            out[i] = _stack_actions(
+                random_actions(n_att, rng, pass_prob) if pol is None
+                else pol(env.players, env.ball, env.attacker_ids))
+        return out
 
-    reset()
     budget_ms = DT * 1000.0
     if ppo is not None:
         label = ppo.label()
@@ -370,73 +516,96 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
         label = policy
 
     def update(_frame):
-        # Terminal state lingers for hold_ticks frames so it can be read.
+        # Terminal state lingers for hold_ticks frames so it can be read. In
+        # vector mode the whole batch waits with it, and the shown env's
+        # autoreset fires on the first step after the freeze.
         if world["outcome"] is not None:
             world["freeze"] += 1
             if world["freeze"] >= hold_ticks:
-                reset()
+                if driver.venv is None:
+                    driver.reset_one(render_env)
+                world["ep"][render_env] += 1
+                world["outcome"] = None
+                world["freeze"] = 0
             return []
 
-        world["tick"] += 1
-        world["ticks"] += 1
+        # ticks counts env-steps (n_envs per frame); frames counts the timed
+        # calls, so the two costs below stay in their own units.
+        world["ticks"] += n_envs
+        world["frames"] += 1
 
         t_step0 = time.perf_counter()
-        pol = world["policy"]
-        if pol is None:
-            actions = None
-        elif pol is ppo:
-            # Hand over last tick's field so the agent's observation costs no
-            # extra PPCF pass. None on an episode's first tick; PPOPolicy
-            # computes it itself there.
-            actions = pol(world["players"], world["ball"],
-                          world["attacker_ids"], pc_att=world["pc_att"])
-        else:
-            actions = pol(world["players"], world["ball"],
-                          world["attacker_ids"])
-        world["players"], world["ball"], pc_att, outcome = step(
-            world["players"], world["ball"], world["attacker_ids"],
-            world["defender_state"], world["tick"], world["rng"],
-            ppcf_grid=ppcf_grid, zone=zone, max_ticks=max_ticks,
-            pass_prob=pass_prob, pc_min=pc_min, actions=actions)
+        rewards, outcomes = driver.step(actions_for())
         step_ms = (time.perf_counter() - t_step0) * 1000.0
+        world["recent_step_ms"].append(step_ms)
+        world["ret"] += rewards
 
-        # An offside turnover returns before the PPCF call, so keep the last
-        # surface rather than blanking the heatmap on the final frame.
-        if pc_att is not None:
-            world["pc_att"] = pc_att
-
-        if outcome is not None:
-            world["outcome"] = outcome
-            world["tally"][outcome] += 1
+        outcome = outcomes[render_env]
+        # Read before the loop below zeroes it, so a terminal frame shows the
+        # return the episode actually finished on rather than the next one's 0.
+        ep_return = float(world["ret"][render_env])
+        for i, ep_outcome in enumerate(outcomes):
+            if ep_outcome is None:
+                continue
+            world["tally"][ep_outcome] += 1
+            world["returns"].append(float(world["ret"][i]))
             n_done = sum(world["tally"].values())
             rates = "  ".join(
                 f"{k} {world['tally'][k] / n_done:.0%}"
                 for k in ("success", "failure", "timeout"))
-            print(f"episode {world['episode']:4d}  {outcome.upper():8s} "
-                  f"at tick {world['tick']:4d}  |  over {n_done} eps: {rates}")
+            env_tag = "" if n_envs == 1 else f"env {i}  "
+            print(f"{env_tag}episode {world['ep'][i]:4d}  "
+                  f"{ep_outcome.upper():8s} at tick {driver.envs[i].tick:4d}  "
+                  f"|  return {world['ret'][i]:+6.2f}  "
+                  f"|  over {n_done} eps: {rates}")
+            world["ret"][i] = 0.0
+            # The scripted policy is stale from here: whichever reset comes
+            # next -- ours after the freeze, or the vector env's on the next
+            # step -- draws a new formation for it to key off.
+            new_policy(i)
+            if i != render_env:
+                world["ep"][i] += 1
+        if outcome is not None:
+            world["outcome"] = outcome  # ep bumped when the freeze expires
 
-        t = world["tick"] * DT
-        state = world["ball"]["state"]
+        t = shown.tick * DT
+        state = shown.ball["state"]
         ended = f"  |  {outcome.upper()}" if outcome is not None else ""
+
+        # Engine throughput over the last STEP_RATE_WINDOW frames: what the
+        # backend could sustain, not what the window is showing -- FuncAnimation
+        # holds playback at 1/DT frames/s regardless of how fast step() returns.
+        # In vector mode a frame is n_envs env-steps, so this is the batch rate,
+        # comparable to what benchmarks/vs_ppcf.py reports.
+        window = world["recent_step_ms"]
+        mean_step_ms = sum(window) / len(window)
+        per_env = "" if n_envs == 1 else f", {n_envs} envs"
+        rate = (f"  |  {n_envs * 1000.0 / mean_step_ms:6.1f} steps/s "
+                f"({mean_step_ms:.1f}ms/frame{per_env})" if mean_step_ms > 0
+                else "")
 
         # Live gate readout: which half of the success condition is binding.
         gate = ""
-        if world["pc_att"] is not None:
-            in_zone, control = success_gate(world["players"], world["ball"],
-                                            world["pc_att"], zone)
+        if shown.pc_att is not None:
+            in_zone, control = success_gate(shown.players, shown.ball,
+                                            shown.pc_att, zone)
             if in_zone is not None:
                 gate = (f"  |  in zone: {'Y' if in_zone else 'n'}  "
                         f"zone PC: {control:.2f}")
 
         t_render0 = time.perf_counter()
-        # pc_att is computed every tick (intercept_pass needs the cache it builds),
-        # so show_ppcf gates only whether it reaches the heatmap.
-        render_frame(world["players"], world["ball"], ax=ax,
+        # The env keeps its last pc_att (an offside turnover returns before the
+        # PPCF call), and computes one every tick regardless because
+        # intercept_pass needs the TTI cache that call builds -- so show_ppcf
+        # gates only whether the field reaches the heatmap.
+        env_tag = "" if n_envs == 1 else f"env {render_env}/{n_envs}  |  "
+        render_frame(shown.players, shown.ball, ax=ax,
                      zone=zone if show_zone else None,
-                     pc_att=world["pc_att"] if show_ppcf else None,
-                     title=f"{label}  |  ep {world['episode']}  |  "
-                           f"tick {world['tick']}  |  t = {t:5.1f}s  |  "
-                           f"ball: {state}{gate}{ended}")
+                     pc_att=shown.pc_att if show_ppcf else None,
+                     title=f"{label}  |  {env_tag}ep {world['ep'][render_env]}"
+                           f"  |  tick {shown.tick}  |  t = {t:5.1f}s  |  "
+                           f"ball: {state}  |  R {ep_return:+5.2f}"
+                           f"{rate}{gate}{ended}")
         render_ms = (time.perf_counter() - t_render0) * 1000.0
 
         # Note: render_ms covers building the artists, not the canvas blit that
@@ -453,16 +622,29 @@ def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=No
     fig._anim = anim
 
     plt.show()
+    driver.close()
 
     n_done = sum(world["tally"].values())
     if n_done:
-        print(f"\n{label}: {n_done} episodes, "
+        print(f"\n{label}: {n_done} episodes over {n_envs} env(s), "
               f"mean {world['ticks'] / n_done:.0f} ticks")
         for k in ("success", "failure", "timeout"):
             print(f"  {k:8s} {world['tally'][k]:4d}  "
                   f"{world['tally'][k] / n_done:6.1%}")
-        mean_ms = (world["step_ms"] + world["render_ms"]) / max(world["ticks"], 1)
-        print(f"  mean {mean_ms:.1f}ms/tick against a {budget_ms:.0f}ms budget")
+        if world["returns"]:
+            print(f"  mean return {np.mean(world['returns']):+.3f}")
+        frames = max(world["frames"], 1)
+        mean_ms = (world["step_ms"] + world["render_ms"]) / frames
+        print(f"  mean {mean_ms:.1f}ms/frame against a {budget_ms:.0f}ms budget")
+        # Engine-only rate over the whole run -- the number to quote when
+        # comparing backends. Render cost sits alongside it so a slow window
+        # isn't mistaken for a slow backend.
+        step_s = world["step_ms"] / 1000.0
+        if step_s > 0:
+            print(f"  step {world['step_ms'] / frames:.2f}ms/frame -> "
+                  f"{world['ticks'] / step_s:.1f} steps/s  "
+                  f"(render {world['render_ms'] / frames:.1f}ms/frame, "
+                  f"excluded)")
     return anim
 
 
@@ -472,14 +654,23 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--policy", default="scripted",
                     help='"random", "scripted", or a path to a .pt checkpoint')
-    ap.add_argument("--start-holder", type=int, default=6)
+    ap.add_argument("--start-holder", type=int, default=6,
+                    help="attacker row that kicks off with the ball; "
+                         "negative draws one per episode")
     ap.add_argument("--seed", type=int, default=245365)
     ap.add_argument("--deterministic", action="store_true",
                     help="checkpoints only: argmax every head instead of sampling")
     ap.add_argument("--no-ppcf", action="store_true",
                     help="hide the pitch-control heatmap (still computed)")
+    ap.add_argument("--n-envs", type=int, default=1,
+                    help="LowBlockEnvs to step per frame, under a sync vector "
+                         "env; >1 fills the tally faster and makes the steps/s "
+                         "readout the batch rate")
+    ap.add_argument("--render-env", type=int, default=0,
+                    help="which sub-env to draw when --n-envs > 1")
     args = ap.parse_args()
 
     run_simulation(policy=args.policy, start_holder=args.start_holder,
                    seed=args.seed, deterministic=args.deterministic,
-                   show_ppcf=not args.no_ppcf)
+                   show_ppcf=not args.no_ppcf, n_envs=args.n_envs,
+                   render_env=args.render_env)

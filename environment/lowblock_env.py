@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from functools import partial
 import gymnasium as gym
@@ -16,7 +17,13 @@ from physics.engine import (
     direction_lookup,
     speed_lookup
 )
-from physics.ppcf import PPCF_grid
+# PPCF_BACKEND=cuda swaps in the kernel from physics/ppcf.cu. Read from the
+# environment rather than hardcoded so subprocess workers inherit the choice and
+# CPU-only callers never have to import cupy.
+if os.environ.get("PPCF_BACKEND", "numpy") == "cuda":
+    from physics.ppcf_kernel import PPCF_grid
+else:
+    from physics.ppcf import PPCF_grid
 from schema import player_dt
 from attackers.calibrate_attacker_formation import sample_attacker_formation
 from attackers.random_policy import random_actions
