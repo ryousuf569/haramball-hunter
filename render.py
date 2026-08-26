@@ -343,7 +343,7 @@ class _EnvDriver:
 def run_simulation(n_att=10, n_def=11, seed=245365, n_ticks=2500, interval_ms=None,
                    show_zone=True, start_holder=1, show_ppcf=True,
                    max_ticks=MAX_TICKS, pass_prob=None, hold_ticks=8,
-                   zone=None, policy="runs/ppo_500k_s0", hold_shape=True,
+                   zone=None, policy="runs/vanilla_10m_cuda_rung2", hold_shape=True,
                    deterministic=False, pc_min=None, n_envs=1, render_env=0):
     """Open a matplotlib window and animate the attackers against the
     calibrated low block, restarting on every terminal outcome.

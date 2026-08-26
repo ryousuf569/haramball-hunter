@@ -40,10 +40,10 @@ class Config:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     hidden: int = 256
-    zone_x: float = 82.0
+    zone_x: float = 86.0
     zone_y: float = 34.0
-    zone_radius: float = 12.0
-    pc_min: float = 0.30
+    zone_radius: float = 8.0
+    pc_min: float = 0.40
     start_holder: int = 0
     seed: int = 1
     log_every: int = 10

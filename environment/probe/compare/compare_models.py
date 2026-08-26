@@ -133,7 +133,17 @@ def summarise(name, outcomes, ticks):
             "mean_ticks": float(np.mean(ticks))}
 
 
-def plot(results, gate, n_episodes, start_holder, out_path):
+def print_row(r, prefix=""):
+    print("%s%-46s success %5.1f%%  [%4.1f, %4.1f]  failure %5.1f%%  "
+          "timeout %5.1f%%  mean %5.0f ticks"
+          % (prefix, r["name"].replace("\n", " "),
+             100 * r["success"], 100 * r["lo"], 100 * r["hi"],
+             100 * r["counts"][FAILURE] / r["n"],
+             100 * r["counts"][TIMEOUT] / r["n"], r["mean_ticks"]),
+          flush=True)
+
+
+def plot(results, gate, n_episodes, n_seeds, start_holder, out_path):
     names = [r["name"] for r in results]
     x = np.arange(len(results))
     fig, (ax1, ax2) = plt.subplots(
@@ -177,17 +187,40 @@ def plot(results, gate, n_episodes, start_holder, out_path):
                ncol=3, frameon=False, fontsize=9)
 
     fig.suptitle("gate (%.0f, %.0f) r=%.0f pc_min=%.2f | start_holder %d"
-                 % (gate[0], gate[1], gate[2], gate[3], start_holder))
+                 " | %d seed%s"
+                 % (gate[0], gate[1], gate[2], gate[3], start_holder,
+                    n_seeds, "" if n_seeds == 1 else "s"))
     fig.tight_layout()
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
     return out_path
 
 
+def build_runs(args, zone, seed):
+    """Policies for one evaluation seed; `seed` drives every stochastic source."""
+    runs = [("random", random_episode(np.random.default_rng(seed))),
+            ("scripted", scripted_episode)]
+    for path in args.models:
+        ppo = make_ppo_policy(path, zone=zone, max_ticks=args.max_ticks,
+                              deterministic=args.deterministic, seed=seed)
+        runs.append((ppo.label(), model_episode(ppo)))
+        if args.hybrid:
+            runs.append((ppo.label() + "\n+ scripted movement",
+                         hybrid_episode(ppo)))
+            runs.append((ppo.label() + "\n+ scripted passing",
+                         hybrid_movement_episode(ppo)))
+    return runs
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("models", nargs="*")
-    ap.add_argument("--episodes", type=int, default=200)
+    ap.add_argument("--episodes", type=int, default=200,
+                    help="episodes per seed")
     ap.add_argument("--seed", type=int, default=10_000)
+    ap.add_argument("--seeds", type=int, default=1,
+                    help="number of evaluation seeds; results are pooled")
+    ap.add_argument("--seed-stride", type=int, default=100_000,
+                    help="spacing between seeds (must exceed --episodes)")
     ap.add_argument("--start-holder", type=int, default=0)
     ap.add_argument("--max-ticks", type=int, default=MAX_TICKS)
     ap.add_argument("--deterministic", action="store_true")
@@ -199,6 +232,13 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT)
     args = ap.parse_args()
 
+    if args.seeds < 1:
+        ap.error("--seeds must be at least 1")
+    if args.seeds > 1 and args.seed_stride < args.episodes:
+        ap.error("--seed-stride (%d) must be >= --episodes (%d) so seeds do "
+                 "not replay the same episodes"
+                 % (args.seed_stride, args.episodes))
+
     gate = gate_from_ckpt(args.models[0]) if args.models else (
         ZONE_X, ZONE_Y, ZONE_RADIUS, ZONE_PC_MIN)
     override = (args.zone_x, args.zone_y, args.zone_radius, args.pc_min)
@@ -209,37 +249,35 @@ def main():
                       zone_x=gate[0], zone_y=gate[1], zone_radius=gate[2],
                       pc_min=gate[3])
 
+    seeds = [args.seed + k * args.seed_stride for k in range(args.seeds)]
+    total = args.episodes * args.seeds
+
     print("gate (%.0f, %.0f) r=%.0f pc_min=%.2f | start_holder %d | "
-          "%d episodes | seeds %d..%d"
+          "%d episodes x %d seed%s = %d | base seeds %s"
           % (gate[0], gate[1], gate[2], gate[3], args.start_holder,
-             args.episodes, args.seed, args.seed + args.episodes - 1))
+             args.episodes, args.seeds, "" if args.seeds == 1 else "s", total,
+             ", ".join(str(s) for s in seeds)))
 
-    runs = [("random", random_episode(np.random.default_rng(args.seed))),
-            ("scripted", scripted_episode)]
-    for path in args.models:
-        ppo = make_ppo_policy(path, zone=zone, max_ticks=args.max_ticks,
-                              deterministic=args.deterministic, seed=args.seed)
-        runs.append((ppo.label(), model_episode(ppo)))
-        if args.hybrid:
-            runs.append((ppo.label() + "\n+ scripted movement",
-                         hybrid_episode(ppo)))
-            runs.append((ppo.label() + "\n+ scripted passing",
-                         hybrid_movement_episode(ppo)))
+    pooled = {}
+    for seed in seeds:
+        if args.seeds > 1:
+            print("\nseed %d (episodes %d..%d)"
+                  % (seed, seed, seed + args.episodes - 1), flush=True)
+        for name, start_episode in build_runs(args, zone, seed):
+            outcomes, ticks = evaluate(env, start_episode, args.episodes, seed)
+            o, t = pooled.setdefault(name, ([], []))
+            o.extend(outcomes)
+            t.extend(ticks)
+            print_row(summarise(name, outcomes, ticks),
+                      prefix="  " if args.seeds > 1 else "")
 
-    results = []
-    for name, start_episode in runs:
-        outcomes, ticks = evaluate(env, start_episode, args.episodes, args.seed)
-        results.append(summarise(name, outcomes, ticks))
-        r = results[-1]
-        print("%-46s success %5.1f%%  [%4.1f, %4.1f]  failure %5.1f%%  "
-              "timeout %5.1f%%  mean %5.0f ticks"
-              % (name.replace("\n", " "),
-                 100 * r["success"], 100 * r["lo"], 100 * r["hi"],
-                 100 * r["counts"][FAILURE] / r["n"],
-                 100 * r["counts"][TIMEOUT] / r["n"], r["mean_ticks"]),
-              flush=True)
+    results = [summarise(name, o, t) for name, (o, t) in pooled.items()]
+    if args.seeds > 1:
+        print("\npooled over %d seeds (n=%d each)" % (args.seeds, total))
+        for r in results:
+            print_row(r)
 
-    print("wrote %s" % plot(results, gate, args.episodes,
+    print("wrote %s" % plot(results, gate, total, args.seeds,
                             args.start_holder, args.out))
 
 
