@@ -31,7 +31,13 @@ def load_agent(ckpt_path, n_att=10, n_def=11):
     hidden = int(ckpt.get("cfg", {}).get("hidden", 256))
     nvec = (len(direction_lookup), len(speed_lookup), n_att)
     agent = ActorCritic(obs_dim=obs_dim(n_att, n_def), nvec=nvec, hidden=hidden)
-    agent.load_state_dict(ckpt["model"])
+    # Constrained checkpoints carry cost_value.* heads the plain critic has no
+    # use for at inference; anything else missing or extra is a real mismatch.
+    missing, unexpected = agent.load_state_dict(ckpt["model"], strict=False)
+    unexpected = [k for k in unexpected if not k.startswith("cost_value.")]
+    if missing or unexpected:
+        raise RuntimeError("checkpoint does not match ActorCritic: "
+                           "missing %s, unexpected %s" % (missing, unexpected))
     agent.eval()
     return agent, ckpt
 
@@ -109,12 +115,12 @@ class PPOPolicy:
         obs = torch.as_tensor(self.observe(players, ball, pc_att))
         with torch.no_grad():
             if self.deterministic:
-                dist, _ = self.agent._dist_and_value(obs)
-                act = dist.mode()
+                # index rather than unpack: the constrained critic returns an
+                # extra cost-value tensor
+                act = self.agent._dist_and_value(obs)[0].mode()
             else:
                 # act() wants a batch of envs: (1, n_att, obs_dim)
-                act, _logp, _val = self.agent.act(obs[None])
-                act = act[0]
+                act = self.agent.act(obs[None])[0][0]
         self.tick += 1
         a = act.numpy()
         return a[:, 0], a[:, 1], a[:, 2]

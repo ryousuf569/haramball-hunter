@@ -24,6 +24,7 @@ from environment.lowblock_env import (FAILURE, MAX_TICKS, SUCCESS, TIMEOUT,
                                       LowBlockEnv)
 from environment.termination import (ZONE_PC_MIN, ZONE_RADIUS, ZONE_X, ZONE_Y,
                                      zone_control)
+from model.ppo_constrained import SPEED_LIMIT
 from render import render_frame
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,9 +35,9 @@ PRESS_RADIUS = 3.0
 STALL_LAG = 10
 STALL_EPS = 0.5
 
-INDICATORS = ("crowd_disc", "crowd_near", "tight", "zone_dwell", "press",
-              "offside", "stall")
-BAR_COLOR = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728")
+INDICATORS = ("slow", "crowd_disc", "crowd_near", "tight", "zone_dwell",
+              "press", "offside", "stall")
+BAR_COLOR = ("#8c8c8c", "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728")
 
 
 def gate_from_ckpt(path):
@@ -101,6 +102,7 @@ def tick_stats(env, prev_ball):
             "n_offside": int(offside.sum()),
             "max_offside": float(margin.max()),
             "mean_speed": float(np.linalg.norm(vel, axis=1).mean()),
+            "slow_frac": float((np.linalg.norm(vel, axis=1) < SPEED_LIMIT).mean()),
             "pass_started": int(started),
             "pass_len": pass_len}
 
@@ -175,6 +177,7 @@ def episode_summary(outcome, rows, seed):
             "carrier_clear_mean": nanmean(col["carrier_clear"]),
             "speed_mean": float(col["mean_speed"].mean()),
             "possession_rate": float(held.mean()),
+            "slow": float(col["slow_frac"].mean()),
             "crowd_disc": float((col["n_in_disc"] >= CROWD_MIN).mean()),
             "crowd_near": float((col["n_near"] >= CROWD_MIN).mean()),
             "tight": float((col["spread"] < TIGHT_SPREAD).mean()),
@@ -264,7 +267,7 @@ def scripted_start(env):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("ckpt")
+    ap.add_argument("ckpts", nargs="+")
     ap.add_argument("--episodes", type=int, default=100)
     ap.add_argument("--seed", type=int, default=10_000)
     ap.add_argument("--start-holder", type=int, default=0)
@@ -280,19 +283,19 @@ def main():
     ap.add_argument("--out-dir", default=OUT_DIR)
     args = ap.parse_args()
 
-    gate = gate_from_ckpt(args.ckpt)
+    gate = gate_from_ckpt(args.ckpts[0])
     override = (args.zone_x, args.zone_y, args.zone_radius, args.pc_min)
     gate = tuple(g if o is None else o for g, o in zip(gate, override))
 
     env = LowBlockEnv(max_tick=args.max_ticks, start_holder=args.start_holder,
                       zone_x=gate[0], zone_y=gate[1], zone_radius=gate[2],
                       pc_min=gate[3])
-    ppo = make_ppo_policy(args.ckpt, zone=env.zone, max_ticks=args.max_ticks,
-                          deterministic=args.deterministic, seed=args.seed)
 
-    runs = [(ppo.label(), ppo_start(ppo))]
-    if args.scripted:
-        runs.append(("scripted", scripted_start))
+    runs = [("scripted", scripted_start)] if args.scripted else []
+    for path in args.ckpts:
+        ppo = make_ppo_policy(path, zone=env.zone, max_ticks=args.max_ticks,
+                              deterministic=args.deterministic, seed=args.seed)
+        runs.append((ppo.label(), ppo_start(ppo)))
 
     print("gate (%.0f, %.0f) r=%.0f pc_min=%.2f | start_holder %d | "
           "%d episodes | seeds %d..%d"
