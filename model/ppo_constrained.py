@@ -65,7 +65,7 @@ class Constraint:
 
 OWN_VEL = 2
 SPEED_LIMIT = 2.0
-CONSTRAINTS = [Constraint("slow",0.75), Constraint("success", 0.60, lower=True)]
+CONSTRAINTS = [Constraint("slow", 0.75), Constraint("success", 0.40, lower=True)]
 N_COSTS = len(CONSTRAINTS)
 
 def slow_indicator(obs):
@@ -304,11 +304,34 @@ def standardise(x):
     return (x - x.mean()) / (x.std() + 1e-8)
 
 
-def combine_advantages(adv, cost_adv, lam0, lam):
-    """Algorithm 1's policy objective, expressed at the advantage level:
+class Multipliers(nn.Module):
+    # logits = [a_0, z_1..z_{K+1}]; the dummy a_0 is pinned to 0 so that
+    # lam_0 = 1 - sum_k lam_k falls out of the same softmax. Paper 4.2.
+    def __init__(self, constraints, z_init=0.02):
+        super().__init__()
+        self.z = nn.Parameter(torch.full((len(constraints),), z_init))
+        self.register_buffer("d", torch.tensor([c.threshold for c in constraints]))
+        self.register_buffer("lower", torch.tensor([c.lower for c in constraints]))
 
-        max(lam0, lam_boot) * A_R  +  lam_boot * A_boot  -  sum_k lam_k * A_k
-    """
+    def forward(self):
+        lam = torch.softmax(torch.cat([self.z.new_zeros(1), self.z]), dim=0)
+        return lam[0], lam[1:]
+
+    def violation(self, J):
+        # > 0 exactly when violated, whichever way the bound points
+        return torch.where(self.lower, self.d - J, J - self.d)
+
+    def loss(self, J):
+        # descent on -lam*violation raises lam when violated; covers both of
+        # Algorithm 1's cases in one expression
+        _, lam = self()
+        return -(lam * self.violation(J.detach())).sum()
+
+
+# max(lam0, lam_boot)*A_R + lam_boot*A_boot - sum_k lam_k*A_k, at the advantage
+# level. Components are standardised so lam is a real relative weight -- the
+# paper's SAC Q-values carry their own scale, so this is a stated deviation.
+def combine_advantages(adv, cost_adv, lam0, lam):
     lam0_tilde = torch.max(lam0, lam[-1]) # paper 4.3; bootstrap is last
     total = lam0_tilde * standardise(adv)
     for k, c in enumerate(CONSTRAINTS):
@@ -317,8 +340,10 @@ def combine_advantages(adv, cost_adv, lam0, lam):
     return total
 
 
+# GAE per cost channel at cost_gamma, not the reward's gamma. The (1-gamma_k)
+# scale keeps the critic target a rate in [0,1] instead of a sum near 55, which
+# would swamp the reward critic; the multiplier still reads raw buf.cost.
 def cost_gae(buf, next_cost_value, next_done, cfg):
-    """GAE per cost channel, at cost_gamma rather than the reward's gamma."""
     scale = 1.0 - cfg.cost_gamma
     cost_adv, cost_ret = torch.zeros_like(buf.cost), torch.zeros_like(buf.cost)
     for k in range(N_COSTS):
@@ -372,6 +397,7 @@ def set_seed(seed):
     torch.manual_seed(seed)
 
 HEADER = (" upd     step |    succ   len   eps | c_slow   spd |"
+           "   lam0 lam_slw lam_suc boot |"
            "     ev ev_slw ev_suc |      kl   clip    ent |"
            "  v_loss  c_loss |   sps")
 
@@ -429,7 +455,8 @@ def banner(cfg, n_updates, obs_d):
                                    100 * base.get("scripted", float("nan"))))
     spec = " | ".join("%s %s %.2f" % (c.name, ">=" if c.lower else "<=", c.threshold)
                       for c in CONSTRAINTS)
-    print("constraints (indicators only, multipliers OFF): %s" % spec)
+    print("constraints: %s | cost_gamma %.3f | mult_lr %.3g | z_init %.3g"
+          % (spec, cfg.cost_gamma, cfg.mult_lr, cfg.z_init))
     print("slow fires when own speed < %.1f m/s, per attacker-tick "
           "(speed_lookup = %.1f / %.1f / %.1f m/s)"
           % (SPEED_LIMIT, 0.3 * V_MAX, 0.6 * V_MAX, V_MAX))
@@ -449,11 +476,13 @@ def log(update, global_step, metrics, stats, t0, lr=float("nan")):
     log.prev_step, log.prev_t = global_step, now
     g = metrics.get
     print("%4d %8d | %6.1f%% %5.0f %5d | %6.3f %5.2f |"
+          " %6.3f %7.3f %7.3f %4.0f |"
           " %6.3f %6.3f %6.3f | %7.4f %6.3f %6.3f |"
           " %7.4f %7.4f | %5.0f"
           % (update, global_step,
              100.0 * stats["success"], stats["len"], stats["n_eps"],
              g("c_slow", nan), g("speed", nan),
+             g("lam0", nan), g("lam_slow", nan), g("lam_succ", nan), g("boot", nan),
              g("ev", nan), g("ev_slow", nan), g("ev_success", nan),
              g("approx_kl", nan), g("clipfrac", nan), g("entropy", nan),
              g("v_loss", nan), g("c_loss", nan),
@@ -475,6 +504,8 @@ def train(cfg):
                                          else cfg.start_holder))
     agent = ActorCritic(obs_dim=D, hidden=cfg.hidden)
     opt = torch.optim.Adam(agent.parameters(), lr=cfg.lr, eps=1e-5)
+    mult = Multipliers(CONSTRAINTS, cfg.z_init)
+    mopt = torch.optim.Adam(mult.parameters(), lr=cfg.mult_lr)
 
     buf = RolloutBuffer(cfg.rollout, cfg.n_envs, A, D)
     state = init_state(venv, cfg.seed, cfg.n_envs)
@@ -508,19 +539,37 @@ def train(cfg):
         adv, ret = compute_gae(buf.rew, buf.done, buf.val, next_value,
                                state.next_done, cfg.gamma, cfg.gae_lambda)
         cost_adv, cost_ret = cost_gae(buf, next_cost_value, state.next_done, cfg)
-        lam0 = torch.tensor(1.0)
-        lam = torch.zeros(N_COSTS)
+
+        lam0, lam = mult()
+        lam0, lam = lam0.detach(), lam.detach() # lam is frozen to the policy step
         adv_total = combine_advantages(adv, cost_adv, lam0, lam)
 
         metrics = ppo_update(agent, opt, buf.flat(adv_total, ret, cost_ret), cfg)
+
+        global_step = update * cfg.rollout * cfg.n_envs
+        stats = tracker.stats()
+
+        # multiplier step last, per Algorithm 1. slow is an exact batch mean over
+        # every attacker-tick; success can only come off the 100-episode window,
+        # since a rollout holds ~9 episodes and may hold none at all.
+        if not np.isnan(stats["success"]):
+            J = torch.tensor([float(buf.cost[..., 0].mean()),
+                              float(stats["success"])])
+            mopt.zero_grad()
+            mult.loss(J).backward()
+            mopt.step()
+
         metrics["ev"] = explained_variance(buf.val.reshape(-1), ret.reshape(-1))
         for k, c in enumerate(CONSTRAINTS):
             metrics["ev_" + c.name] = explained_variance(
                 buf.cost_val[..., k].reshape(-1), cost_ret[..., k].reshape(-1))
         metrics.update(constraint_metrics(buf))
-
-        global_step = update * cfg.rollout * cfg.n_envs
-        stats = tracker.stats()
+        with torch.no_grad():
+            l0, lk = mult()
+            metrics["lam0"] = float(l0)
+            metrics["lam_slow"] = float(lk[0])
+            metrics["lam_succ"] = float(lk[1])
+            metrics["boot"] = float(lk[1] > l0) # 1 while the bootstrap carries R
         lr = opt.param_groups[0]["lr"]
         if update == 1 or update % cfg.log_every == 0:
             sps = log(update, global_step, metrics, stats, t0, lr)
