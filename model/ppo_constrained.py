@@ -49,6 +49,9 @@ class Config:
     log_every: int = 10
     save_every: int = 100
     run_name: str = ""
+    cost_gamma: float = 0.99 # paper §4.1: gamma_k < 1, never the reward's gamma (yours is 1.0)
+    mult_lr: float = 0.03 # paper Table 1, Arena
+    z_init: float = 0.02 # paper Table 1
 
     @property
     def batch(self):
@@ -62,7 +65,7 @@ class Constraint:
 
 OWN_VEL = 2
 SPEED_LIMIT = 2.0
-CONSTRAINTS = [Constraint("slow",0.50), Constraint("success", 0.70, lower=True)]
+CONSTRAINTS = [Constraint("slow",0.75), Constraint("success", 0.60, lower=True)]
 N_COSTS = len(CONSTRAINTS)
 
 def slow_indicator(obs):
@@ -114,26 +117,26 @@ class ActorCritic(nn.Module):
             layer_init(nn.Linear(hidden, hidden)), nn.Tanh())
         self.head = layer_init(nn.Linear(hidden, sum(nvec)), std=0.01)
         self.value = layer_init(nn.Linear(hidden, 1), std=1.0)
+        self.cost_value = layer_init(nn.Linear(hidden, N_COSTS), std=1.0)
 
     def _dist_and_value(self, obs_flat):
         h = self.trunk(obs_flat)
         dist = MultiCategorical(self.head(h), self.nvec, ball_mask_from_obs(obs_flat, self.n_att))
-        return dist, self.value(h).squeeze(-1)
+        return dist, self.value(h).squeeze(-1), self.cost_value(h)
 
-    def act(self, obs): 
+    def act(self, obs):
         n, a, d = obs.shape
-        dist, v = self._dist_and_value(obs.reshape(n * a, d))
+        dist, v, cv = self._dist_and_value(obs.reshape(n * a, d))
         act = dist.sample()
-        return (act.reshape(n, a, 3), dist.log_prob(act).reshape(n, a), v.reshape(n, a))
+        return (act.reshape(n, a, 3), dist.log_prob(act).reshape(n, a), v.reshape(n, a), cv.reshape(n, a, N_COSTS))
 
     def evaluate(self, obs_flat, act_flat):
-        dist, v = self._dist_and_value(obs_flat)
-        return dist.log_prob(act_flat), dist.entropy(), v
+        dist, v, cv = self._dist_and_value(obs_flat)
+        return dist.log_prob(act_flat), dist.entropy(), v, cv
 
     def value_of(self, obs):
-        features = self.trunk(obs) 
-        values = self.value(features)
-        return values.squeeze(-1)   
+        h = self.trunk(obs)
+        return self.value(h).squeeze(-1), self.cost_value(h) 
 
 class RolloutBuffer:
     def __init__(self, T, N, A, D):
@@ -145,8 +148,9 @@ class RolloutBuffer:
         self.rew = torch.zeros(T, N)
         self.done = torch.zeros(T, N)
         self.cost = torch.zeros(T, N, A, N_COSTS)
+        self.cost_val = torch.zeros(T, N, A, N_COSTS)
 
-    def flat(self, adv, ret):
+    def flat(self, adv, ret, cost_ret):
         B = self.T * self.N * self.A
         return {
             "obs": self.obs.reshape(B, self.D),
@@ -154,6 +158,7 @@ class RolloutBuffer:
             "logp": self.logp.reshape(B),
             "adv": adv.reshape(B),
             "ret": ret.reshape(B),
+            "cost_ret": cost_ret.reshape(B, N_COSTS),
         }
 
 
@@ -209,8 +214,8 @@ def collect_rollout(agent, venv, buf, state, tracker):
         buf.obs[t] = state.next_obs
         buf.done[t] = state.next_done
 
-        act, logp, val = agent.act(state.next_obs)
-        buf.act[t], buf.logp[t], buf.val[t] = act, logp, val
+        act, logp, val, cval = agent.act(state.next_obs)
+        buf.act[t], buf.logp[t], buf.val[t], buf.cost_val[t] = act, logp, val, cval
 
         obs, rew, term, trunc, info = venv.step(act.numpy())
         buf.rew[t] = torch.as_tensor(rew, dtype=torch.float32)
@@ -282,16 +287,46 @@ def compute_gae(rew, done, val, next_value, next_done, gamma, lam):
     T, N, A = val.shape
     adv = torch.zeros_like(val)
     lastgaelam = torch.zeros(N, A)
+    per_agent = rew.dim() == 3
     for t in reversed(range(T)):
         if t == T - 1:
             nextnonterm, nextvalues = 1.0 - next_done, next_value
         else:
             nextnonterm, nextvalues = 1.0 - done[t + 1], val[t + 1]
         nextnonterm = nextnonterm[:, None] # (N,) -> (N,1)
-        delta = rew[t][:, None] + gamma * nextvalues * nextnonterm - val[t]
+        r = rew[t] if per_agent else rew[t][:, None]
+        delta = r + gamma * nextvalues * nextnonterm - val[t]
         lastgaelam = delta + gamma * lam * nextnonterm * lastgaelam
         adv[t] = lastgaelam
     return adv, adv + val
+
+def standardise(x):
+    return (x - x.mean()) / (x.std() + 1e-8)
+
+
+def combine_advantages(adv, cost_adv, lam0, lam):
+    """Algorithm 1's policy objective, expressed at the advantage level:
+
+        max(lam0, lam_boot) * A_R  +  lam_boot * A_boot  -  sum_k lam_k * A_k
+    """
+    lam0_tilde = torch.max(lam0, lam[-1]) # paper 4.3; bootstrap is last
+    total = lam0_tilde * standardise(adv)
+    for k, c in enumerate(CONSTRAINTS):
+        sign = 1.0 if c.lower else -1.0
+        total = total + sign * lam[k] * standardise(cost_adv[..., k])
+    return total
+
+
+def cost_gae(buf, next_cost_value, next_done, cfg):
+    """GAE per cost channel, at cost_gamma rather than the reward's gamma."""
+    scale = 1.0 - cfg.cost_gamma
+    cost_adv, cost_ret = torch.zeros_like(buf.cost), torch.zeros_like(buf.cost)
+    for k in range(N_COSTS):
+        cost_adv[..., k], cost_ret[..., k] = compute_gae(
+            scale * buf.cost[..., k], buf.done, buf.cost_val[..., k],
+            next_cost_value[..., k], next_done, cfg.cost_gamma, cfg.gae_lambda)
+    return cost_adv, cost_ret
+
 
 def ppo_update(agent, opt, flat, cfg):
     B = flat["obs"].shape[0]
@@ -300,7 +335,8 @@ def ppo_update(agent, opt, flat, cfg):
         idx = torch.randperm(B)
         for start in range(0, B, cfg.minibatch):
             mb = idx[start:start + cfg.minibatch]
-            newlogp, entropy, newval = agent.evaluate(flat["obs"][mb], flat["act"][mb])
+            newlogp, entropy, newval, newcval = agent.evaluate(flat["obs"][mb],
+                                                               flat["act"][mb])
 
             logratio = newlogp - flat["logp"][mb]
             ratio = logratio.exp()
@@ -311,7 +347,9 @@ def ppo_update(agent, opt, flat, cfg):
             pg_loss = torch.max(-mb_adv * ratio,
                                 -mb_adv * ratio.clamp(1 - cfg.clip, 1 + cfg.clip)).mean()
             v_loss  = 0.5 * ((newval - flat["ret"][mb]) ** 2).mean()
-            loss = pg_loss - cfg.ent_coef * entropy.mean() + cfg.vf_coef * v_loss
+            c_loss = 0.5 * ((newcval - flat["cost_ret"][mb]) ** 2).mean(0).sum()
+            loss = (pg_loss - cfg.ent_coef * entropy.mean()
+                    + cfg.vf_coef * (v_loss + c_loss))
 
             opt.zero_grad()
             loss.backward()
@@ -321,6 +359,7 @@ def ppo_update(agent, opt, flat, cfg):
             with torch.no_grad():
                 metrics["pg_loss"].append(float(pg_loss))
                 metrics["v_loss"].append(float(v_loss))
+                metrics["c_loss"].append(float(c_loss))
                 metrics["entropy"].append(float(entropy.mean()))
                 metrics["approx_kl"].append(float(((ratio - 1) - logratio).mean()))
                 metrics["clipfrac"].append(float(((ratio - 1).abs() > cfg.clip).float().mean()))
@@ -332,10 +371,9 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-HEADER = (" upd     step |  succ     ret   len   eps |"
-           " c_slow c_team   spd nsuc |      kl   clip    ent |"
-           "  hdir_c hdir_o hball_c |     ev  phir2  evres |"
-           "   pg_loss    v_loss |       lr |  sps")
+HEADER = (" upd     step |    succ   len   eps | c_slow   spd |"
+           "     ev ev_slw ev_suc |      kl   clip    ent |"
+           "  v_loss  c_loss |   sps")
 
 
 def save(run_dir, name, agent, cfg, step, stats):
@@ -404,23 +442,27 @@ def log(update, global_step, metrics, stats, t0, lr=float("nan")):
         print(HEADER)
     log.n += 1
     nan = float("nan")
-    sps = global_step / max(time.perf_counter() - t0, 1e-9)
+    now = time.perf_counter()
+    if log.prev_t is None:
+        log.prev_t = t0
+    sps = (global_step - log.prev_step) / max(now - log.prev_t, 1e-9)
+    log.prev_step, log.prev_t = global_step, now
     g = metrics.get
-    print("%4d %8d | %5.1f%% %7.3f %5.0f %5d |"
-          " %6.3f %6.3f %5.2f %4.0f | %7.4f %6.3f %6.3f |"
-          " %7.3f %6.3f %7.3f | %6.3f %6.3f %6.3f | %9.5f %9.5f |"
-          " %8.2e | %4.0f"
+    print("%4d %8d | %6.1f%% %5.0f %5d | %6.3f %5.2f |"
+          " %6.3f %6.3f %6.3f | %7.4f %6.3f %6.3f |"
+          " %7.4f %7.4f | %5.0f"
           % (update, global_step,
-             100.0 * stats["success"], stats["ret"], stats["len"], stats["n_eps"],
-             g("c_slow", nan), g("c_team", nan), g("speed", nan), g("n_succ", nan),
+             100.0 * stats["success"], stats["len"], stats["n_eps"],
+             g("c_slow", nan), g("speed", nan),
+             g("ev", nan), g("ev_slow", nan), g("ev_success", nan),
              g("approx_kl", nan), g("clipfrac", nan), g("entropy", nan),
-             g("h_dir_car", nan), g("h_dir_off", nan), g("h_ball_car", nan),
-             g("ev", nan), g("phi_r2", nan), g("ev_resid", nan),
-             g("pg_loss", nan), g("v_loss", nan),
-             lr, sps), flush=True)
+             g("v_loss", nan), g("c_loss", nan),
+             sps), flush=True)
     return sps
-    
+
 log.n = 0
+log.prev_step = 0
+log.prev_t = None
 
 def train(cfg):
     set_seed(cfg.seed)
@@ -462,17 +504,19 @@ def train(cfg):
         state = collect_rollout(agent, venv, buf, state, tracker)
 
         with torch.no_grad():
-            next_value = agent.value_of(state.next_obs) # (N, A)
+            next_value, next_cost_value = agent.value_of(state.next_obs)
         adv, ret = compute_gae(buf.rew, buf.done, buf.val, next_value,
                                state.next_done, cfg.gamma, cfg.gae_lambda)
+        cost_adv, cost_ret = cost_gae(buf, next_cost_value, state.next_done, cfg)
+        lam0 = torch.tensor(1.0)
+        lam = torch.zeros(N_COSTS)
+        adv_total = combine_advantages(adv, cost_adv, lam0, lam)
 
-        metrics = ppo_update(agent, opt, buf.flat(adv, ret), cfg)
-        phi = phi_from_obs(buf.obs, zone_centre)
+        metrics = ppo_update(agent, opt, buf.flat(adv_total, ret, cost_ret), cfg)
         metrics["ev"] = explained_variance(buf.val.reshape(-1), ret.reshape(-1))
-        metrics["phi_r2"] = phi_r2(phi, ret)
-        metrics["ev_resid"] = explained_variance(
-            (buf.val + phi).reshape(-1), (ret + phi).reshape(-1))
-        metrics.update(head_entropy_metrics(agent, buf.obs, buf.obs.shape[-1]))
+        for k, c in enumerate(CONSTRAINTS):
+            metrics["ev_" + c.name] = explained_variance(
+                buf.cost_val[..., k].reshape(-1), cost_ret[..., k].reshape(-1))
         metrics.update(constraint_metrics(buf))
 
         global_step = update * cfg.rollout * cfg.n_envs
