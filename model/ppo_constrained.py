@@ -49,6 +49,8 @@ class Config:
     log_every: int = 10
     save_every: int = 100
     run_name: str = ""
+    slow_d: float = 0.75
+    succ_d: float = 0.40
     cost_gamma: float = 0.99 # paper §4.1: gamma_k < 1, never the reward's gamma (yours is 1.0)
     mult_lr: float = 0.03 # paper Table 1, Arena
     z_init: float = 0.02 # paper Table 1
@@ -67,6 +69,10 @@ OWN_VEL = 2
 SPEED_LIMIT = 2.0
 CONSTRAINTS = [Constraint("slow", 0.75), Constraint("success", 0.40, lower=True)]
 N_COSTS = len(CONSTRAINTS)
+
+def constraints_from(cfg):
+    return [Constraint("slow", cfg.slow_d),
+            Constraint("success", cfg.succ_d, lower=True)]
 
 def slow_indicator(obs):
     speed = torch.linalg.norm(obs[..., OWN_VEL:OWN_VEL + 2], dim=-1) * V_MAX
@@ -454,7 +460,7 @@ def banner(cfg, n_updates, obs_d):
               "scripted %.1f%%" % (100 * base.get("random", float("nan")),
                                    100 * base.get("scripted", float("nan"))))
     spec = " | ".join("%s %s %.2f" % (c.name, ">=" if c.lower else "<=", c.threshold)
-                      for c in CONSTRAINTS)
+                      for c in constraints_from(cfg))
     print("constraints: %s | cost_gamma %.3f | mult_lr %.3g | z_init %.3g"
           % (spec, cfg.cost_gamma, cfg.mult_lr, cfg.z_init))
     print("slow fires when own speed < %.1f m/s, per attacker-tick "
@@ -504,7 +510,7 @@ def train(cfg):
                                          else cfg.start_holder))
     agent = ActorCritic(obs_dim=D, hidden=cfg.hidden)
     opt = torch.optim.Adam(agent.parameters(), lr=cfg.lr, eps=1e-5)
-    mult = Multipliers(CONSTRAINTS, cfg.z_init)
+    mult = Multipliers(constraints_from(cfg), cfg.z_init)
     mopt = torch.optim.Adam(mult.parameters(), lr=cfg.mult_lr)
 
     buf = RolloutBuffer(cfg.rollout, cfg.n_envs, A, D)
@@ -606,6 +612,8 @@ if __name__ == "__main__":
     ap.add_argument("--zone-y", type=float, default=Config.zone_y)
     ap.add_argument("--zone-radius", type=float, default=Config.zone_radius)
     ap.add_argument("--pc-min", type=float, default=Config.pc_min)
+    ap.add_argument("--slow-d", type=float, default=Config.slow_d)
+    ap.add_argument("--succ-d", type=float, default=Config.succ_d)
     ap.add_argument("--start-holder", type=int, default=Config.start_holder,
                     help="attacker row that kicks off with the ball; "
                          "-1 draws a new one each episode")
@@ -617,4 +625,5 @@ if __name__ == "__main__":
                  zone_x=args.zone_x, zone_y=args.zone_y,
                  zone_radius=args.zone_radius, pc_min=args.pc_min,
                  start_holder=args.start_holder,
+                 slow_d=args.slow_d, succ_d=args.succ_d,
                  anneal_lr=not args.no_anneal))
