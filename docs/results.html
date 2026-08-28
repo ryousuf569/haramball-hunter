@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Results: Threshold Calibration Sweep</title>
+<meta name="description" content="Does the threshold dial deliver the behaviour rate you ask for? Five targets, three seeds, 2.5M steps each, measured on frozen policies.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400..600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/site.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="bar">
+    <div class="wordmark">Haramball Hunter</div>
+    <nav class="site-nav">
+      <a href="index.html">Simulation</a>
+      <a href="results.html" aria-current="page">Results</a>
+      <a href="writeup.html">Write-up</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<div class="column">
+
+  <div class="stat-row">
+    <div class="stat">
+      <span class="value">4.4<span class="unit">pp</span></span>
+      <span class="label">Mean tracking error</span>
+    </div>
+    <div class="stat">
+      <span class="value">0.93</span>
+      <span class="label">Calibration slope</span>
+    </div>
+    <div class="stat">
+      <span class="value">0.86</span>
+      <span class="label">R² against requested</span>
+    </div>
+    <div class="stat">
+      <span class="value">9<span class="unit of">/15</span></span>
+      <span class="label">Runs inside threshold</span>
+    </div>
+  </div>
+
+  <p class="caption muted">
+    These come from <code>assets/speed_probe.csv</code>. Each run's final weights,
+    replayed for 150,000 attacker-ticks with learning switched off. Bias is
+    −0.0066, so the sweep isn't pulling in one direction; what's left is scatter.
+    Everything below uses these rather than the training logs, for reasons I get
+    to in a moment.
+  </p>
+
+  <figure>
+    <div class="frame"><img src="assets/speed_probe.png" alt="Left: achieved rate against requested rate, five targets with three seeds each, sitting close to the identity line. Right: cumulative distribution of attacker speed for each target, shifting left as the target rises, crossing the 2.0 m/s limit at the requested rate."></div>
+    <figcaption>
+      <b>Fig 1. The dial works.</b> Achieved against requested on the left, and
+      the speed distribution behind it on the right. The right panel is the one I
+      keep looking at. The whole distribution slides sideways until the mass below
+      2.0&nbsp;m/s is whatever fraction I asked for. Slope 0.93 over a 39-point
+      span.
+    </figcaption>
+  </figure>
+
+  <h2 class="headline-md">Two measurements, and they disagree</h2>
+
+  <p>
+    Read the same sweep off the training logs instead and you get MAE 0.0241,
+    slope 0.8882, R² 0.9606, 11 of 15 inside threshold. Better on every count. I
+    don't think it means much. A tail mean averages over updates where the policy
+    was still moving, so it smooths away the exact error the measurement exists to
+    catch. Both are in the table below so you can see how far apart they land.
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Measurement</th>
+          <th class="num">MAE</th>
+          <th class="num">Slope</th>
+          <th class="num">R²</th>
+          <th class="num">Feasible</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Frozen policy, 150k attacker-ticks</td>
+          <td class="num">0.0442</td>
+          <td class="num">0.9300</td>
+          <td class="num">0.8618</td>
+          <td class="num">9 / 15</td>
+        </tr>
+        <tr>
+          <td class="dim">Training-log tail mean</td>
+          <td class="num dim">0.0241</td>
+          <td class="num dim">0.8882</td>
+          <td class="num dim">0.9606</td>
+          <td class="num dim">11 / 15</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="table-note">
+      Frozen numbers from <code>assets/speed_probe.csv</code>. Tail means from
+      <code>assets/constraint_runs.csv</code>, via
+      <code>model/constrained_analysis.py</code>.
+    </p>
+  </div>
+
+  <h2 class="headline-md">The constraint made it learn faster</h2>
+
+  <p>
+    I expected the constraint to cost something. Tie one hand behind the agent's
+    back and it should get worse at the actual task. Instead the constrained
+    policy at 2.5M steps beat an unconstrained baseline I'd trained out to 10M.
+    Four times the samples, worse result. I went looking for the bug for a good
+    while before I accepted there wasn't one.
+  </p>
+
+  <figure>
+    <div class="frame"><img src="assets/compare_models.png" alt="Bar chart of success rate with 95 percent Wilson intervals over 900 episodes: random 2.0 percent, scripted 54.1 percent, constrained 81.0 percent, unconstrained 71.0 percent. Below, outcome shares split into success, failure and timeout."></div>
+    <figcaption>
+      <b>Fig 2. Success to termination, with Wilson intervals.</b> Constrained at
+      2.5M gets 81.0% [78.3, 83.5]. Unconstrained at 10M gets 71.0% [67.9, 73.9].
+      n = 900 each over three seeds, and every episode runs until it actually
+      ends rather than being cut off at a window. That's why I quote these and
+      never the probe's success column. For scale: a scripted policy gets 54.1%,
+      a random one gets 2.0%.
+    </figcaption>
+  </figure>
+
+  <figure>
+    <div class="frame"><img src="assets/success_rate.png" alt="Success rate against training steps: the constrained run climbs to about 85 percent by 2.5 million steps while the unconstrained baseline is still oscillating below 60 percent."></div>
+    <figcaption>
+      <b>Fig 3. The gap opens early.</b> Constrained PPO is ahead from about 0.3M
+      steps and never hands the lead back. My reading is that pinning the speed
+      distribution stops the early policy collapsing into ten players sprinting at
+      a packed defence, which is a state you learn nothing from.
+    </figcaption>
+  </figure>
+
+  <h2 class="headline-md">The price of the constraint is non-monotone</h2>
+
+  <p>
+    If the constraint were purely a cost, success should fall off as the
+    threshold tightens. It doesn't. The peak sits at d&nbsp;=&nbsp;0.55, well
+    inside the range, and loosening past that makes things worse rather than
+    better. Tightening costs as well: 0.85 gives up around 20 points against the
+    peak. There's a sweet spot in there, and I didn't put it there.
+  </p>
+
+  <figure>
+    <div class="frame"><img src="assets/constraint_analysis.png" alt="Four panels. Calibration: achieved against requested, close to the diagonal, with the unconstrained baseline at 0.885 marked. Price of the constraint: success peaking at 0.55 and falling either side. Multiplier at convergence falling as the threshold loosens. Bootstrap handover step against requested rate."></div>
+    <figcaption>
+      <b>Fig 4. The sweep, four ways.</b> Top left is calibration, with the
+      unconstrained baseline of 0.885 marked. Top right is the price curve, peak
+      at 0.55. Bottom left, λ<sub>slow</sub> at convergence falls as the threshold
+      loosens, which is the multiplier doing what it should: strict costs
+      pressure, loose costs less. Bottom right is the step where λ₀ overtakes
+      λ<sub>boot</sub> and the task reward starts carrying itself. All four panels
+      use training-log aggregates.
+    </figcaption>
+  </figure>
+
+  <h2 class="headline-md">Reproducibility degrades as the constraint tightens</h2>
+
+  <p>
+    This is the part that bothers me. At d&nbsp;=&nbsp;0.65 the three seeds land
+    within a standard deviation of 0.010, about as tight as I could ask for. At
+    d&nbsp;=&nbsp;0.45 they land on 0.368, 0.577 and 0.488. That's sd 0.105, a
+    spread wider than the gap between two neighbouring targets in the sweep.
+    Averaged over seeds the dial reads true; on any single run it might not. The
+    tight end is where the optimiser has least room to move and it clearly feels
+    it.
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Target d</th>
+          <th class="num">Seed 1</th>
+          <th class="num">Seed 2</th>
+          <th class="num">Seed 3</th>
+          <th class="num">Mean</th>
+          <th class="num">SD</th>
+          <th class="num">Range</th>
+        </tr>
+      </thead>
+      <tbody id="seed-rows"></tbody>
+    </table>
+    <p class="table-note">Achieved rate per seed, measured on frozen policies.</p>
+  </div>
+
+  <h2 class="headline-md">Every run</h2>
+
+  <p>
+    Fifteen runs. Five targets, three seeds each, 2.5M steps apiece, bootstrap
+    success constraint pinned at 0.40 the whole way. The six greyed rows finished
+    above their threshold.
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Run</th>
+          <th class="num">Seed</th>
+          <th class="num">Requested</th>
+          <th class="num">Achieved</th>
+          <th class="num">Error</th>
+          <th class="num">Speed m/s</th>
+          <th class="num">Feasible</th>
+        </tr>
+      </thead>
+      <tbody id="probe-rows"></tbody>
+    </table>
+    <p class="table-note">
+      From <code>assets/speed_probe.csv</code>, frozen policies, 150,000
+      attacker-ticks each. Feasible here means the achieved rate landed at or
+      below the threshold it was given.
+    </p>
+  </div>
+
+  <h2 class="headline-md">Per-target aggregates</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>d</th>
+          <th class="num">n</th>
+          <th class="num">Achieved</th>
+          <th class="num">SD</th>
+          <th class="num">Success</th>
+          <th class="num">SD</th>
+          <th class="num">Speed</th>
+          <th class="num">Ep. len</th>
+        </tr>
+      </thead>
+      <tbody id="target-rows"></tbody>
+    </table>
+    <p class="table-note">
+      From <code>assets/constraint_targets.csv</code>. These are training-log tail
+      means, so the achieved column is the flattering one and the success column
+      is a training-window rate, not the terminated-episode rate in Fig 2. Watch
+      what episode length does as the constraint bites. The team takes longer
+      because it has stopped sprinting.
+    </p>
+  </div>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="inner">
+    <div class="label-caps">Haramball Hunter / constrained RL against a low block</div>
+    <div class="caption">Constraint rates from a frozen-policy probe over 150,000 attacker-ticks;
+      success rates from episodes run to termination with Wilson intervals.
+      Rollouts pre-rendered by <code>docs/binaries/recorder.py</code>.</div>
+  </div>
+</footer>
+
+<script type="module" src="js/tables.js"></script>
+</body>
+</html>

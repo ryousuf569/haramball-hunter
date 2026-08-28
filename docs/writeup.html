@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Write-up: Behaviour as a Threshold</title>
+<meta name="description" content="Why reward engineering fails for behaviour specification, what a Lagrangian CMDP layer replaces it with, and what a five-target sweep actually delivered.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400..600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/site.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="bar">
+    <div class="wordmark">Haramball Hunter</div>
+    <nav class="site-nav">
+      <a href="index.html">Simulation</a>
+      <a href="results.html">Results</a>
+      <a href="writeup.html" aria-current="page">Write-up</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<div class="column">
+<article>
+
+  <header class="article-head">
+    <h1 class="display-lg">Behaviour as a threshold, not a weight</h1>
+    <p class="standfirst">
+      Constrained PPO with a Lagrangian CMDP layer, swept over five behaviour
+      thresholds and three seeds, to answer one question. If I ask for a rate,
+      do I get it?
+    </p>
+    <hr class="rule">
+  </header>
+
+  <div class="prose">
+
+  <p>
+    The football is a substrate. Ten attackers share one policy against eleven
+    defenders sitting in a StatsBomb-calibrated low block, and the task is to get
+    the ball into a disc at (86,&nbsp;34) of radius 8&nbsp;m without letting mean
+    attacker pitch control fall below 0.40. What I am really testing is a claim
+    from Roy et&nbsp;al. (2022): that you can specify behaviour as a threshold
+    with units you understand, rather than as a reward weight you find by
+    fiddling.
+  </p>
+
+  <h2>Why reward engineering fails at this</h2>
+
+  <p>
+    The usual move is to fold each behaviour you want into the reward as a
+    weighted term, then tune the weights until it looks right. Works fine for one
+    or two terms. After that it falls apart, for two reasons that feed each
+    other.
+  </p>
+
+  <p>
+    The first is geometric. Every requirement you add shrinks the region of
+    weight space where all of them hold at once, and it shrinks multiplicatively.
+    So the hunt gets harder for reasons that have nothing to do with how hard the
+    task is. Add a fourth requirement to three that already work and you'll
+    usually end up retuning all four.
+  </p>
+
+  <p>
+    The second is that the weights don't mean anything on their own. A
+    coefficient of 0.3 on a speed penalty tells you nothing about the world. It
+    tells you something about this reward scale and this discount factor and the
+    way I happened to normalise advantages. Change any of that and it's worthless.
+    You can't look at 0.3 and say how often the agent will be slow. You run it and
+    find out.
+  </p>
+
+  <div class="pull">
+    <p>
+      A weight is a guess you validate after training. A threshold is something
+      you can check the run against.
+    </p>
+  </div>
+
+  <p>
+    The constrained version swaps weights for bounds. Instead of
+    <em>penalise slowness by 0.3</em> you write <em>be slow on at most 65% of
+    attacker-ticks</em> and let the optimiser find the multiplier that makes it
+    true. The number you type is supposed to be the number you get back. That's a
+    testable claim, so I tested it.
+  </p>
+
+  <h2>The three mechanisms</h2>
+
+  <p>
+    Three parts of the paper's design carry the weight here. Pull any one of them
+    out and it stops working. All three live in
+    <code>model/ppo_constrained.py</code>.
+  </p>
+
+  <h3>1. Indicator cost functions</h3>
+
+  <p>
+    Every cost is 0 or 1. The <code>slow</code> cost fires on an attacker-tick
+    when that attacker is moving slower than 2.0&nbsp;m/s, and it's zero the rest
+    of the time. Because it's an indicator, the batch mean <em>is</em> a rate, so
+    the threshold you set is just a probability between 0 and 1. You don't need a
+    calibration phase to work out what a sensible bound looks like. And someone
+    who has never opened the reward function can still read the constraint and
+    know what it asks for.
+  </p>
+
+  <p>
+    I count it per attacker-tick rather than per team-tick. That sounds like a
+    detail and isn't. The team-mean version, <em>the average attacker speed is
+    below 2.0&nbsp;m/s</em>, is useless here: the unconstrained baseline already
+    satisfies it on 0.999 of ticks, so there's no gradient in it and the optimiser
+    gets to give it away for free. Per attacker, the same baseline sits at 0.885.
+    That leaves the dial somewhere to go.
+  </p>
+
+  <h3>2. Softmax-normalised multipliers</h3>
+
+  <p>
+    The multipliers λ are not free non-negative scalars. They are a softmax over
+    a logit vector whose first entry is pinned to zero, so λ lives on a simplex
+    and λ₀, the weight on the main objective, drops out of the same softmax as
+    1&nbsp;−&nbsp;Σλₖ. The effect is that no single constraint can run away.
+    Without the normalisation, one constraint the agent cannot satisfy will drive
+    its own multiplier up forever. That scales the advantages it multiplies,
+    which blows up the critic, which takes the run with it. On the simplex the
+    worst it can do is eat most of the budget.
+  </p>
+
+  <h3>3. Bootstrap success constraint</h3>
+
+  <p>
+    A policy that hasn't solved the task yet has nothing to trade against the
+    constraint. λ₀ collapses, and the agent settles on whatever satisfies the
+    constraint most cheaply. Here that means standing still. Forever.
+  </p>
+
+  <p>
+    The paper's fix is a second constraint pointing the other way, a lower bound
+    on success, plus an effective
+    λ̃₀&nbsp;=&nbsp;max(λ₀,&nbsp;λ<sub>boot</sub>) that keeps a floor under the
+    main objective while the optimiser is still hunting for anything feasible. I
+    held the bootstrap at 0.40 on every run. Without it the runs converge on a
+    policy that satisfies the constraint beautifully and never goes anywhere near
+    the zone.
+  </p>
+
+  <p>
+    You can watch the handover happen in the logs. λ₀ overtakes λ<sub>boot</sub>
+    somewhere between 0.8M and 1.9M steps depending on the target, and after that
+    the task reward carries itself.
+  </p>
+
+  <h2>What was measured</h2>
+
+  <p>
+    The swept constraint is <code>slow</code>, at target rate
+    <em>d</em> ∈&nbsp;{0.45,&nbsp;0.55,&nbsp;0.65,&nbsp;0.75,&nbsp;0.85}, three
+    seeds each, 2.5M steps a run. Fifteen runs in total. The unconstrained
+    baseline sits at 0.885, so the sweep covers 39 points of behaviour underneath
+    it.
+  </p>
+
+  <figure>
+    <div class="frame"><img src="assets/constraint_tracking.png" alt="Behaviour rate against training steps for one run: an early overshoot and dip, then oscillation that settles onto the dashed target line at 0.75."></div>
+    <figcaption>
+      One run at d&nbsp;=&nbsp;0.75. The multiplier behaves like a controller
+      rather than a penalty. The rate overshoots, gets pulled back, and rings
+      down onto the target with the amplitude shrinking each time. I never set a
+      coefficient.
+    </figcaption>
+  </figure>
+
+  <p>
+    Every rate I report comes from a frozen-policy probe. Final weights, no
+    learning, 150,000 attacker-ticks per policy. That's the measurement the
+    specification claim is actually about. Reading the training logs instead makes
+    everything look better (MAE 0.0241 against 0.0442) because it averages over
+    updates where the policy was still moving, and both sit side by side on the
+    <a href="results.html">results page</a> so you can judge.
+  </p>
+
+  <p>
+    Success rates come from neither. The probe cuts episodes off at a fixed
+    window, which quietly favours the short failures over the long wins, so I
+    measure success separately on episodes that run to termination, with Wilson
+    intervals.
+  </p>
+
+  <p>
+    <b>The dial works.</b> Achieved tracks requested with slope 0.93,
+    R²&nbsp;0.86, MAE 4.4 points and bias −0.0066 across the whole 39-point span.
+    Nine of the fifteen runs finished at or below their threshold. What's left is
+    scatter rather than drift, which is the failure mode I'd have picked.
+  </p>
+
+  <h2>The constraint bought exploration</h2>
+
+  <p>
+    A behavioural constraint is supposed to cost you task performance. Here it
+    did the opposite. Constrained at 2.5M steps gets 81.0% [78.3,&nbsp;83.5]
+    success; the unconstrained baseline, trained four times longer out to 10M,
+    gets 71.0% [67.9,&nbsp;73.9], n&nbsp;=&nbsp;900 each over three seeds. Four
+    times the samples for a worse policy.
+  </p>
+
+  <p>
+    My best guess is that the constraint acts as an exploration prior. Holding
+    the speed distribution in place rules out the huge region of policy space
+    where ten attackers sprint independently at a packed defence, and that's
+    exactly where an untrained policy goes to learn nothing. The price curve backs
+    it up. Success peaks at d&nbsp;=&nbsp;0.55, not at the loosest threshold, so
+    the constraint improved the very thing it was supposed to be competing with.
+  </p>
+
+  <h2>Where it breaks: reproducibility</h2>
+
+  <p>
+    The dial is reliable on average and not always on a given run. At
+    d&nbsp;=&nbsp;0.65 the three seeds land within a standard deviation of 0.010.
+    At d&nbsp;=&nbsp;0.45 they land on 0.368, 0.577 and 0.488. That's sd&nbsp;0.105,
+    a spread wider than the gap between neighbouring targets in the sweep. Seed 2
+    overshot its threshold by more than twelve points.
+  </p>
+
+  <p>
+    This is the biggest weakness in the result and I'd rather say so here than
+    bury it in a caption. If your specification mechanism wanders by a tenth of
+    its own range depending on the seed, you're still checking every run by hand,
+    which is most of the work the mechanism was meant to save you. The tight end
+    is where the feasible set is smallest and where the multiplier's learning rate
+    is working hardest. Obvious next thing to look at. This sweep doesn't answer
+    it.
+  </p>
+
+  <h2>Where it breaks again: the side effect</h2>
+
+  <p>
+    Pushing the speed distribution down produced a behaviour nobody asked for.
+    Against the unconstrained baseline the constrained policy crowds the target
+    disc, <code>crowd_disc</code> going from 0.029 to 0.211. It also hogs the ball
+    (possession 9%&nbsp;→&nbsp;75%) and takes half again as long to finish
+    (82&nbsp;→&nbsp;125 ticks). It worked out that a slow team which keeps the ball
+    and packs bodies into the zone satisfies the constraint and the task at the
+    same time. Which it does. That's the annoying part: it's a perfectly good
+    answer to the specification I actually wrote.
+  </p>
+
+  <figure>
+    <div class="frame"><img src="assets/behaviour_probe.png" alt="Grouped bars comparing scripted, unconstrained and constrained policies across candidate indicator rates and shape statistics. The constrained policy shows a much higher crowd_disc rate and more players inside the disc; the unconstrained policy shows a much higher slow rate and far more passes."></div>
+    <figcaption>
+      <b>The specification problem, one level up.</b> Candidate indicators and
+      shape statistics over 200 episodes per policy, from
+      <code>attackers/probe/behaviour_episodes.csv</code>. Constraining
+      <code>slow</code> moved <code>crowd_disc</code> and <code>crowd_near</code>
+      too, and I had constrained neither of them.
+    </figcaption>
+  </figure>
+
+  <p>
+    This is the paper's own thesis coming back at me from the other side. Reward
+    engineering fails because a scalar objective underdetermines behaviour, and
+    constraining one behaviour doesn't fix that. It moves the slack somewhere I
+    wasn't looking. The fix is the paper's as well: name the thing you didn't
+    want, give it an indicator and a threshold, add it to the set. Cheap to do,
+    precisely because the multipliers are normalised and the thresholds carry
+    units. I haven't run it. Next experiment, not a caveat.
+  </p>
+
+  <h2>Deviations from the paper</h2>
+
+  <p>
+    The implementation follows Roy et&nbsp;al. §4 but sits on PPO instead of SAC,
+    which forces four changes. All four are deliberate, and all four are places
+    where my numbers could drift from theirs, so they're worth naming.
+  </p>
+
+  <div class="table-wrap">
+    <table class="prose-table">
+      <thead>
+        <tr>
+          <th>Paper</th>
+          <th>Here</th>
+          <th>Why</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Combine at SAC Q-values</td>
+          <td>Combine at the advantage level, each component standardised</td>
+          <td>Q-values carry their own scale; standardising makes λ a genuine relative weight</td>
+        </tr>
+        <tr>
+          <td>K+1 independent critics</td>
+          <td>Shared trunk, separate value heads</td>
+          <td>K+1 full critics over a 120-dim observation is mostly duplicated representation</td>
+        </tr>
+        <tr>
+          <td>Cost critic targets as sums</td>
+          <td>(1−γ) scale on cost-critic targets</td>
+          <td>Keeps the target a rate in [0,1] rather than a sum near 55, which would swamp the reward critic</td>
+        </tr>
+        <tr>
+          <td>Bootstrap rate from the rollout</td>
+          <td>Trailing 100-episode window</td>
+          <td>A single rollout holds too few finished episodes to estimate a success rate</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    The first one is where I'd look first if something didn't reproduce.
+    Standardising each advantage component before weighting is what makes the
+    simplex reading hold, because λ ends up comparing like with like. The cost is
+    that the multiplier stops seeing how badly a constraint is being violated and
+    only sees the direction and roughly the rank. The violation term driving λ
+    still reads the raw batch rate, so the threshold still means what it says.
+    It's the gradient reaching the policy that's been standardised.
+  </p>
+
+  <h2>What this shows</h2>
+
+  <p>
+    Over a 39-point span, on a task with real physics and an opponent that fights
+    back, a threshold in [0,&nbsp;1] delivered the behaviour rate it named to
+    within about four points. I tuned no reward weights to get there. It cost
+    nothing on the main task either, and bought a fourfold improvement in sample
+    efficiency, which is a stronger claim than the paper makes and is probably
+    specific to environments where naive exploration actively hurts you.
+  </p>
+
+  <p>
+    Set against that: the guarantee holds on average, it gets shakier exactly
+    where the constraint is tightest, and satisfying one specification handed me a
+    second behaviour that would need a threshold of its own. I think the mechanism
+    is good. It's not a way to stop thinking about what you asked for.
+  </p>
+
+  <h2>References</h2>
+
+  <div class="refs">
+    <p>Roy, J., Girgis, R., Romoff, J., Bacon, P.-L., &amp; Pal, C. (2022). <em>Direct Behavior Specification via Constrained Reinforcement Learning.</em> ICML 2022. arXiv:2112.12228</p>
+    <p>Spearman, W., Basye, A., Dick, G., Hotovy, R., &amp; Pop, P. (2017). <em>Physics-Based Modeling of Pass Probabilities in Soccer.</em> MIT Sloan Sports Analytics Conference.</p>
+    <p>Spearman, W. (2018). <em>Beyond Expected Goals.</em> MIT Sloan Sports Analytics Conference.</p>
+  </div>
+
+  </div>
+</article>
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="inner">
+    <div class="label-caps">Haramball Hunter / constrained RL against a low block</div>
+    <div class="caption">Constraint rates from a frozen-policy probe over 150,000 attacker-ticks;
+      success rates from episodes run to termination with Wilson intervals.
+      Rollouts pre-rendered by <code>docs/binaries/recorder.py</code>.</div>
+  </div>
+</footer>
+
+</body>
+</html>

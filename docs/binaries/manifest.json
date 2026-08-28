@@ -1,0 +1,379 @@
+{
+ "grid": {
+  "nx": 31,
+  "ny": 34,
+  "cell": 2.0,
+  "x0": 43.0,
+  "y0": 0.0
+ },
+ "stride": 1144,
+ "n_players": 21,
+ "n_attackers": 10,
+ "ball_state": {
+  "held": 0,
+  "in_flight": 1,
+  "loose": 2
+ },
+ "policies": [
+  {
+   "name": "unconstrained",
+   "file": "unconstrained.bin",
+   "run": "vanilla_10m_cuda_rung2",
+   "requested": null,
+   "achieved": 0.8834533095359802,
+   "success": 0.601063829787234,
+   "mean_speed": 1.1317251920700073,
+   "episodes": [
+    {
+     "offset": 0,
+     "ticks": 195,
+     "outcome": "success",
+     "seed": 7000
+    },
+    {
+     "offset": 223080,
+     "ticks": 98,
+     "outcome": "success",
+     "seed": 7001
+    },
+    {
+     "offset": 335192,
+     "ticks": 66,
+     "outcome": "success",
+     "seed": 7002
+    },
+    {
+     "offset": 410696,
+     "ticks": 112,
+     "outcome": "failure",
+     "seed": 7003
+    },
+    {
+     "offset": 538824,
+     "ticks": 76,
+     "outcome": "success",
+     "seed": 7004
+    },
+    {
+     "offset": 625768,
+     "ticks": 73,
+     "outcome": "success",
+     "seed": 7005
+    },
+    {
+     "offset": 709280,
+     "ticks": 33,
+     "outcome": "success",
+     "seed": 7006
+    },
+    {
+     "offset": 747032,
+     "ticks": 101,
+     "outcome": "success",
+     "seed": 7007
+    }
+   ]
+  },
+  {
+   "name": "d = 0.85",
+   "file": "d085.bin",
+   "run": "sweep_slow85_s1",
+   "requested": 0.85,
+   "achieved": 0.8342533111572266,
+   "success": 0.6702702702702703,
+   "mean_speed": 1.2853981256484985,
+   "episodes": [
+    {
+     "offset": 0,
+     "ticks": 43,
+     "outcome": "failure",
+     "seed": 7000
+    },
+    {
+     "offset": 49192,
+     "ticks": 176,
+     "outcome": "success",
+     "seed": 7001
+    },
+    {
+     "offset": 250536,
+     "ticks": 54,
+     "outcome": "success",
+     "seed": 7002
+    },
+    {
+     "offset": 312312,
+     "ticks": 64,
+     "outcome": "success",
+     "seed": 7003
+    },
+    {
+     "offset": 385528,
+     "ticks": 148,
+     "outcome": "failure",
+     "seed": 7004
+    },
+    {
+     "offset": 554840,
+     "ticks": 50,
+     "outcome": "success",
+     "seed": 7005
+    },
+    {
+     "offset": 612040,
+     "ticks": 63,
+     "outcome": "success",
+     "seed": 7006
+    },
+    {
+     "offset": 684112,
+     "ticks": 1,
+     "outcome": "failure",
+     "seed": 7007
+    }
+   ]
+  },
+  {
+   "name": "d = 0.75",
+   "file": "d075.bin",
+   "run": "sweep_slow75_s1",
+   "requested": 0.75,
+   "achieved": 0.7499933242797852,
+   "success": 0.7950819672131147,
+   "mean_speed": 1.4768295288085938,
+   "episodes": [
+    {
+     "offset": 0,
+     "ticks": 182,
+     "outcome": "success",
+     "seed": 7000
+    },
+    {
+     "offset": 208208,
+     "ticks": 134,
+     "outcome": "success",
+     "seed": 7001
+    },
+    {
+     "offset": 361504,
+     "ticks": 162,
+     "outcome": "success",
+     "seed": 7002
+    },
+    {
+     "offset": 546832,
+     "ticks": 138,
+     "outcome": "success",
+     "seed": 7003
+    },
+    {
+     "offset": 704704,
+     "ticks": 132,
+     "outcome": "success",
+     "seed": 7004
+    },
+    {
+     "offset": 855712,
+     "ticks": 97,
+     "outcome": "success",
+     "seed": 7005
+    },
+    {
+     "offset": 966680,
+     "ticks": 63,
+     "outcome": "success",
+     "seed": 7006
+    },
+    {
+     "offset": 1038752,
+     "ticks": 115,
+     "outcome": "failure",
+     "seed": 7007
+    }
+   ]
+  },
+  {
+   "name": "d = 0.65",
+   "file": "d065.bin",
+   "run": "sweep_slow65_s2",
+   "requested": 0.65,
+   "achieved": 0.6706333160400391,
+   "success": 0.7157360406091371,
+   "mean_speed": 1.6397864818572998,
+   "episodes": [
+    {
+     "offset": 0,
+     "ticks": 110,
+     "outcome": "success",
+     "seed": 7000
+    },
+    {
+     "offset": 125840,
+     "ticks": 42,
+     "outcome": "failure",
+     "seed": 7001
+    },
+    {
+     "offset": 173888,
+     "ticks": 44,
+     "outcome": "success",
+     "seed": 7002
+    },
+    {
+     "offset": 224224,
+     "ticks": 79,
+     "outcome": "success",
+     "seed": 7003
+    },
+    {
+     "offset": 314600,
+     "ticks": 85,
+     "outcome": "success",
+     "seed": 7004
+    },
+    {
+     "offset": 411840,
+     "ticks": 71,
+     "outcome": "success",
+     "seed": 7005
+    },
+    {
+     "offset": 493064,
+     "ticks": 21,
+     "outcome": "success",
+     "seed": 7006
+    },
+    {
+     "offset": 517088,
+     "ticks": 79,
+     "outcome": "success",
+     "seed": 7007
+    }
+   ]
+  },
+  {
+   "name": "d = 0.55",
+   "file": "d055.bin",
+   "run": "sweep_slow55_s1",
+   "requested": 0.55,
+   "achieved": 0.5196266770362854,
+   "success": 0.8493150684931506,
+   "mean_speed": 1.9750416278839111,
+   "episodes": [
+    {
+     "offset": 0,
+     "ticks": 65,
+     "outcome": "failure",
+     "seed": 7000
+    },
+    {
+     "offset": 74360,
+     "ticks": 117,
+     "outcome": "success",
+     "seed": 7001
+    },
+    {
+     "offset": 208208,
+     "ticks": 60,
+     "outcome": "failure",
+     "seed": 7002
+    },
+    {
+     "offset": 276848,
+     "ticks": 112,
+     "outcome": "success",
+     "seed": 7003
+    },
+    {
+     "offset": 404976,
+     "ticks": 91,
+     "outcome": "failure",
+     "seed": 7004
+    },
+    {
+     "offset": 509080,
+     "ticks": 200,
+     "outcome": "success",
+     "seed": 7005
+    },
+    {
+     "offset": 737880,
+     "ticks": 61,
+     "outcome": "success",
+     "seed": 7006
+    },
+    {
+     "offset": 807664,
+     "ticks": 107,
+     "outcome": "failure",
+     "seed": 7007
+    }
+   ]
+  },
+  {
+   "name": "d = 0.45",
+   "file": "d045.bin",
+   "run": "sweep_slow45_s3",
+   "requested": 0.45,
+   "achieved": 0.4875733256340027,
+   "success": 0.6666666666666666,
+   "mean_speed": 2.0307493209838867,
+   "episodes": [
+    {
+     "offset": 0,
+     "ticks": 131,
+     "outcome": "success",
+     "seed": 7000
+    },
+    {
+     "offset": 149864,
+     "ticks": 118,
+     "outcome": "success",
+     "seed": 7001
+    },
+    {
+     "offset": 284856,
+     "ticks": 80,
+     "outcome": "success",
+     "seed": 7002
+    },
+    {
+     "offset": 376376,
+     "ticks": 103,
+     "outcome": "failure",
+     "seed": 7003
+    },
+    {
+     "offset": 494208,
+     "ticks": 58,
+     "outcome": "failure",
+     "seed": 7004
+    },
+    {
+     "offset": 560560,
+     "ticks": 59,
+     "outcome": "success",
+     "seed": 7005
+    },
+    {
+     "offset": 628056,
+     "ticks": 50,
+     "outcome": "success",
+     "seed": 7006
+    },
+    {
+     "offset": 685256,
+     "ticks": 1,
+     "outcome": "failure",
+     "seed": 7007
+    }
+   ]
+  }
+ ],
+ "zone": {
+  "x": 86.0,
+  "y": 34.0,
+  "r": 8.0,
+  "pc_min": 0.4
+ }
+}

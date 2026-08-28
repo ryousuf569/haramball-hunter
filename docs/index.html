@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Simulation: Controlling Behavioural Rates</title>
+<meta name="description" content="Constrained reinforcement learning against a football low block: drag the dial to change how often the team is allowed to move slowly.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400..600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/site.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="bar">
+    <div class="wordmark">Haramball Hunter</div>
+    <nav class="site-nav">
+      <a href="index.html" aria-current="page">Simulation</a>
+      <a href="results.html">Results</a>
+      <a href="writeup.html">Write-up</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<div class="column">
+
+  <div class="page-head">
+    <h1 class="display-lg">Controlling Behavioural Rates</h1>
+    <p>Drag the dial to change how often the team is allowed to move slowly.
+       Same pitch, same opponent, same task. Only the policy changes.</p>
+  </div>
+
+  <div class="pitch-frame" id="pitch-frame">
+    <canvas id="pitch" width="720" height="491"></canvas>
+    <div class="pitch-tag mono" id="run-tag">LOADING</div>
+  </div>
+
+  <div class="controls">
+
+    <div class="dial">
+      <div class="label-caps">Requested behaviour rate</div>
+      <div class="stops" id="stops" role="radiogroup" aria-label="Requested behaviour rate" tabindex="0">
+        <div class="stops-inner"></div>
+      </div>
+    </div>
+
+    <div class="readout">
+      <span class="k">Req.</span> <span class="v" id="r-req">–</span>
+      <span class="sep">·</span>
+      <span class="k">Ach.</span> <span class="v" id="r-ach">–</span>
+      <span class="sep">·</span>
+      <span class="k">Succ.</span> <span class="v" id="r-succ">–</span>
+    </div>
+
+    <div class="playback">
+      <div class="left">
+        <button class="icon-btn" id="play" type="button" aria-label="Pause">
+          <svg viewBox="0 0 14 14" aria-hidden="true"><path id="play-icon" d="M3 2 H6 V12 H3 Z M8 2 H11 V12 H8 Z"></path></svg>
+        </button>
+        <input class="scrub" id="scrub" type="range" min="0" max="0" value="0" step="1" aria-label="Scrub through the episode">
+        <span class="tick-count" id="tick-count">tick – / –</span>
+      </div>
+      <button class="episode-btn" id="episode-btn" type="button">Episode 1 of 8 →</button>
+    </div>
+
+    <div class="legend">
+      <span class="key"><span class="swatch att"></span>Attackers &times;10</span>
+      <span class="key"><span class="swatch def"></span>Defenders &times;10</span>
+      <span class="key"><span class="swatch gk"></span>Keeper</span>
+      <span class="key"><span class="swatch ball"></span>Ball</span>
+      <span class="key"><span class="swatch heat"></span>Attacker pitch control</span>
+      <span class="key">Outcome: <span class="mono" id="outcome">–</span></span>
+    </div>
+
+  </div>
+
+  <hr class="rule">
+
+  <p class="caption muted">
+    Ten attackers share one policy. They are up against eleven defenders sitting
+    in a low block calibrated on StatsBomb tracking data. To win the episode they
+    have to get the ball inside the dashed disc at (86, 34), radius 8&nbsp;m,
+    without letting mean attacker pitch control drop below 0.40. The orange is
+    that pitch control: roughly, how much of each patch of grass the attacking
+    side owns at that moment. It only exists over the attacking half, on a
+    31&times;34 grid, so the field stops near the halfway line instead of trailing
+    off.
+  </p>
+
+  <p class="caption muted">
+    Worth saying plainly: this isn't trying to be football, and it isn't failing
+    at it. Nobody shoots and nobody scores. An episode ends when the ball reaches
+    that disc, when the defenders win it back, or when the clock runs out. All ten
+    attackers share one policy, so they aren't ten players with positions and
+    roles. The defenders are calibrated against real tracking data; the attackers
+    were never asked to look like footballers. If the movement looks strange, that
+    isn't the experiment going wrong. The only question being asked is whether the
+    agent hits the behaviour rate I typed.
+  </p>
+
+  <p class="caption muted">
+    <b>Req.</b> is the number I typed: the fraction of attacker-ticks on which an
+    attacker is allowed to be moving slower than 2.0&nbsp;m/s. <b>Ach.</b> is what
+    the trained policy actually did over 150,000 attacker-ticks, weights frozen.
+    Leave it unconstrained and you get 0.885, which looks like a team standing
+    around passing to each other.
+  </p>
+
+  <p class="caption muted">
+    <b>Succ.</b> is worth less than it looks. It comes from the same probe, which
+    cuts episodes off at a fixed window and so counts short failures more often
+    than long wins. The success numbers I actually trust are on the
+    <a href="results.html">results page</a>. Everything on this canvas is eight
+    recorded episodes played back. No physics runs in your browser.
+  </p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="inner">
+    <div class="label-caps">Haramball Hunter / constrained RL against a low block</div>
+    <div class="caption">Constraint rates measured on frozen policies over 150,000
+      attacker-ticks. Success rates measured on episodes run to termination, with
+      Wilson intervals. Rollouts recorded by <code>docs/binaries/recorder.py</code>.</div>
+  </div>
+</footer>
+
+<script type="module" src="js/sim.js"></script>
+</body>
+</html>
