@@ -50,6 +50,7 @@ class Config:
     save_every: int = 100
     run_name: str = ""
     slow_d: float = 0.75
+    crowd_d: float = 0.10
     succ_d: float = 0.40
     cost_gamma: float = 0.99 # paper §4.1: gamma_k < 1, never the reward's gamma (yours is 1.0)
     mult_lr: float = 0.03 # paper Table 1, Arena
@@ -67,16 +68,28 @@ class Constraint:
 
 OWN_VEL = 2
 SPEED_LIMIT = 2.0
-CONSTRAINTS = [Constraint("slow", 0.75), Constraint("success", 0.40, lower=True)]
+CROWD_MIN = 4 # attackers inside the disc, as in attackers/probe/behaviour_probe.py
+_POS_SCALE = torch.as_tensor(POS_SCALE)
+
+# Order is load-bearing: combine_advantages takes lam[-1] as the bootstrap, so
+# the lower-bound success constraint stays last and new costs go in front of it
+CONSTRAINTS = [Constraint("slow", 0.75), Constraint("crowd_disc", 0.10),
+               Constraint("success", 0.40, lower=True)]
 N_COSTS = len(CONSTRAINTS)
 
 def constraints_from(cfg):
     return [Constraint("slow", cfg.slow_d),
+            Constraint("crowd_disc", cfg.crowd_d),
             Constraint("success", cfg.succ_d, lower=True)]
 
 def slow_indicator(obs):
     speed = torch.linalg.norm(obs[..., OWN_VEL:OWN_VEL + 2], dim=-1) * V_MAX
     return (speed < SPEED_LIMIT).float()
+
+def crowd_indicator(obs, zone_centre, zone_radius):
+    pos = obs[..., OWN_POS:OWN_POS + 2] * _POS_SCALE
+    n_in = (torch.linalg.norm(pos - zone_centre, dim=-1) <= zone_radius).sum(dim=-1)
+    return (n_in >= CROWD_MIN).float()[:, None].expand(-1, obs.shape[-2])
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -215,7 +228,7 @@ class EpisodeTracker:
 
 
 @torch.no_grad()
-def collect_rollout(agent, venv, buf, state, tracker):
+def collect_rollout(agent, venv, buf, state, tracker, zone_centre, zone_radius):
     for t in range(buf.T):
         buf.obs[t] = state.next_obs
         buf.done[t] = state.next_done
@@ -231,14 +244,12 @@ def collect_rollout(agent, venv, buf, state, tracker):
         done_np = term | trunc
         flags = tracker.record(done_np, info, state.ep_ret, state.ep_len)
         buf.cost[t, :, :, 0] = slow_indicator(state.next_obs)
-        buf.cost[t, :, :, 1] = torch.as_tensor(flags)[:, None] # (N,) broadcast over agents
+        buf.cost[t, :, :, 1] = crowd_indicator(state.next_obs, zone_centre, zone_radius)
+        buf.cost[t, :, :, 2] = torch.as_tensor(flags)[:, None] # (N,) broadcast over agents
 
         state.next_obs = torch.as_tensor(obs)
         state.next_done = torch.as_tensor(done_np, dtype=torch.float32)
     return state
-
-_POS_SCALE = torch.as_tensor(POS_SCALE)
-
 
 def phi_from_obs(obs, zone_centre):
     own = obs[..., OWN_POS:OWN_POS + 2] * _POS_SCALE
@@ -276,10 +287,11 @@ def constraint_metrics(buf):
     speed = torch.linalg.norm(buf.obs[..., OWN_VEL:OWN_VEL + 2], dim=-1) * V_MAX
     return {
         "c_slow": float(buf.cost[..., 0].mean()),
+        "c_crowd": float(buf.cost[..., 1].mean()),
         "c_team": float((speed.mean(dim=-1) < SPEED_LIMIT).float().mean()),
         "speed": float(speed.mean()),
-        # cost channel 1 is broadcast across agents, so undo that to get episodes
-        "n_succ": float(buf.cost[..., 1].sum()) / buf.A,
+        # cost channel 2 is broadcast across agents, so undo that to get episodes
+        "n_succ": float(buf.cost[..., 2].sum()) / buf.A,
     }
 
 
@@ -335,8 +347,7 @@ class Multipliers(nn.Module):
 
 
 # max(lam0, lam_boot)*A_R + lam_boot*A_boot - sum_k lam_k*A_k, at the advantage
-# level. Components are standardised so lam is a real relative weight -- the
-# paper's SAC Q-values carry their own scale, so this is a stated deviation.
+# level
 def combine_advantages(adv, cost_adv, lam0, lam):
     lam0_tilde = torch.max(lam0, lam[-1]) # paper 4.3; bootstrap is last
     total = lam0_tilde * standardise(adv)
@@ -346,9 +357,7 @@ def combine_advantages(adv, cost_adv, lam0, lam):
     return total
 
 
-# GAE per cost channel at cost_gamma, not the reward's gamma. The (1-gamma_k)
-# scale keeps the critic target a rate in [0,1] instead of a sum near 55, which
-# would swamp the reward critic; the multiplier still reads raw buf.cost.
+# GAE per cost channel at cost_gamma
 def cost_gae(buf, next_cost_value, next_done, cfg):
     scale = 1.0 - cfg.cost_gamma
     cost_adv, cost_ret = torch.zeros_like(buf.cost), torch.zeros_like(buf.cost)
@@ -402,9 +411,9 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-HEADER = (" upd     step |    succ   len   eps | c_slow   spd |"
-           "   lam0 lam_slw lam_suc boot |"
-           "     ev ev_slw ev_suc |      kl   clip    ent |"
+HEADER = (" upd     step |    succ   len   eps | c_slow c_crwd   spd |"
+           "   lam0 lam_slw lam_crd lam_suc boot |"
+           "     ev ev_slw ev_crd ev_suc |      kl   clip    ent |"
            "  v_loss  c_loss |   sps")
 
 
@@ -466,6 +475,8 @@ def banner(cfg, n_updates, obs_d):
     print("slow fires when own speed < %.1f m/s, per attacker-tick "
           "(speed_lookup = %.1f / %.1f / %.1f m/s)"
           % (SPEED_LIMIT, 0.3 * V_MAX, 0.6 * V_MAX, V_MAX))
+    print("crowd_disc fires for the whole team on any tick with >= %d "
+          "attackers inside the disc" % CROWD_MIN)
     print("spawning workers, first line after update 1 ...", flush=True)
 
 
@@ -481,15 +492,17 @@ def log(update, global_step, metrics, stats, t0, lr=float("nan")):
     sps = (global_step - log.prev_step) / max(now - log.prev_t, 1e-9)
     log.prev_step, log.prev_t = global_step, now
     g = metrics.get
-    print("%4d %8d | %6.1f%% %5.0f %5d | %6.3f %5.2f |"
-          " %6.3f %7.3f %7.3f %4.0f |"
-          " %6.3f %6.3f %6.3f | %7.4f %6.3f %6.3f |"
+    print("%4d %8d | %6.1f%% %5.0f %5d | %6.3f %6.3f %5.2f |"
+          " %6.3f %7.3f %7.3f %7.3f %4.0f |"
+          " %6.3f %6.3f %6.3f %6.3f | %7.4f %6.3f %6.3f |"
           " %7.4f %7.4f | %5.0f"
           % (update, global_step,
              100.0 * stats["success"], stats["len"], stats["n_eps"],
-             g("c_slow", nan), g("speed", nan),
-             g("lam0", nan), g("lam_slow", nan), g("lam_succ", nan), g("boot", nan),
-             g("ev", nan), g("ev_slow", nan), g("ev_success", nan),
+             g("c_slow", nan), g("c_crowd", nan), g("speed", nan),
+             g("lam0", nan), g("lam_slow", nan), g("lam_crowd", nan),
+             g("lam_succ", nan), g("boot", nan),
+             g("ev", nan), g("ev_slow", nan), g("ev_crowd_disc", nan),
+             g("ev_success", nan),
              g("approx_kl", nan), g("clipfrac", nan), g("entropy", nan),
              g("v_loss", nan), g("c_loss", nan),
              sps), flush=True)
@@ -538,7 +551,8 @@ def train(cfg):
         if cfg.anneal_lr:
             opt.param_groups[0]["lr"] = cfg.lr * (1.0 - (update - 1) / n_updates)
 
-        state = collect_rollout(agent, venv, buf, state, tracker)
+        state = collect_rollout(agent, venv, buf, state, tracker,
+                                zone_centre, cfg.zone_radius)
 
         with torch.no_grad():
             next_value, next_cost_value = agent.value_of(state.next_obs)
@@ -555,11 +569,9 @@ def train(cfg):
         global_step = update * cfg.rollout * cfg.n_envs
         stats = tracker.stats()
 
-        # multiplier step last, per Algorithm 1. slow is an exact batch mean over
-        # every attacker-tick; success can only come off the 100-episode window,
-        # since a rollout holds ~9 episodes and may hold none at all.
         if not np.isnan(stats["success"]):
             J = torch.tensor([float(buf.cost[..., 0].mean()),
+                              float(buf.cost[..., 1].mean()),
                               float(stats["success"])])
             mopt.zero_grad()
             mult.loss(J).backward()
@@ -574,8 +586,9 @@ def train(cfg):
             l0, lk = mult()
             metrics["lam0"] = float(l0)
             metrics["lam_slow"] = float(lk[0])
-            metrics["lam_succ"] = float(lk[1])
-            metrics["boot"] = float(lk[1] > l0) # 1 while the bootstrap carries R
+            metrics["lam_crowd"] = float(lk[1])
+            metrics["lam_succ"] = float(lk[2])
+            metrics["boot"] = float(lk[2] > l0) # 1 while the bootstrap carries R
         lr = opt.param_groups[0]["lr"]
         if update == 1 or update % cfg.log_every == 0:
             sps = log(update, global_step, metrics, stats, t0, lr)
@@ -613,6 +626,7 @@ if __name__ == "__main__":
     ap.add_argument("--zone-radius", type=float, default=Config.zone_radius)
     ap.add_argument("--pc-min", type=float, default=Config.pc_min)
     ap.add_argument("--slow-d", type=float, default=Config.slow_d)
+    ap.add_argument("--crowd-d", type=float, default=Config.crowd_d)
     ap.add_argument("--succ-d", type=float, default=Config.succ_d)
     ap.add_argument("--start-holder", type=int, default=Config.start_holder,
                     help="attacker row that kicks off with the ball; "
@@ -625,5 +639,5 @@ if __name__ == "__main__":
                  zone_x=args.zone_x, zone_y=args.zone_y,
                  zone_radius=args.zone_radius, pc_min=args.pc_min,
                  start_holder=args.start_holder,
-                 slow_d=args.slow_d, succ_d=args.succ_d,
+                 slow_d=args.slow_d, crowd_d=args.crowd_d, succ_d=args.succ_d,
                  anneal_lr=not args.no_anneal))

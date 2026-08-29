@@ -8,31 +8,58 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SCRIPT = os.path.join(REPO_ROOT, "model", "ppo_constrained.py")
 RUNS_DIR = os.path.join(REPO_ROOT, "runs")
 
-THRESHOLDS = (0.85, 0.75, 0.65, 0.55, 0.45)
 SEEDS = (1, 2, 3)
 STEPS = 2_500_000
-SUCC_D = 0.40
 COOLDOWN = 150
 
+# One arm per dial
+ARMS = {
+    "slow": {"flag": "--slow-d", "prefix": "sweep_slow",
+             "thresholds": (0.85, 0.75, 0.65, 0.55, 0.45),
+             "held": (("--crowd-d", 0.10), ("--succ-d", 0.40))},
+    "crowd": {"flag": "--crowd-d", "prefix": "sweep_crowd",
+              # brackets the observed drift (0.211 on c_lagr_075_040) and the
+              # near-baseline rate (0.02-0.03 on scripted / vanilla)
+              "thresholds": (0.15, 0.10, 0.05),
+              "held": (("--slow-d", 0.75), ("--succ-d", 0.40))},}
+DEFAULT_ARM = "crowd"
 
-def run_name(slow_d, seed):
-    return "sweep_slow%02d_s%d" % (round(slow_d * 100), seed)
+
+def run_name(arm, threshold, seed):
+    return "%s%02d_s%d" % (ARMS[arm]["prefix"], round(threshold * 100), seed)
+
+
+def held_of(arm, succ_d):
+    return [(f, succ_d if f == "--succ-d" else v) for f, v in ARMS[arm]["held"]]
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", choices=sorted(ARMS), default=DEFAULT_ARM,
+                    help="which constraint threshold to sweep")
     ap.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
-    ap.add_argument("--thresholds", type=float, nargs="+", default=list(THRESHOLDS))
+    ap.add_argument("--thresholds", type=float, nargs="+", default=None,
+                    help="defaults to the arm's own grid")
     ap.add_argument("--steps", type=int, default=STEPS)
-    ap.add_argument("--succ-d", type=float, default=SUCC_D)
+    ap.add_argument("--succ-d", type=float, default=0.40)
     ap.add_argument("--cooldown", type=int, default=COOLDOWN)
     args = ap.parse_args()
 
-    jobs = [(d, s) for s in args.seeds for d in args.thresholds]
+    arm = ARMS[args.arm]
+    thresholds = args.thresholds or list(arm["thresholds"])
+    held = held_of(args.arm, args.succ_d)
+
+    jobs = [(d, s) for s in args.seeds for d in thresholds]
     t0 = time.perf_counter()
 
-    for i, (slow_d, seed) in enumerate(jobs, 1):
-        name = run_name(slow_d, seed)
+    print("arm %s: sweeping %s over %s | held %s | seeds %s | %d steps each"
+          % (args.arm, arm["flag"],
+             " ".join("%.2f" % d for d in thresholds),
+             " ".join("%s %.2f" % (f, v) for f, v in held),
+             " ".join(str(s) for s in args.seeds), args.steps), flush=True)
+
+    for i, (threshold, seed) in enumerate(jobs, 1):
+        name = run_name(args.arm, threshold, seed)
         hours = (time.perf_counter() - t0) / 3600.0
 
         if os.path.exists(os.path.join(RUNS_DIR, name, "final.pt")):
@@ -40,17 +67,20 @@ def main():
                   flush=True)
             continue
 
-        print("[%2d/%d] %s | slow_d %.2f seed %d | %.1f h elapsed"
-              % (i, len(jobs), name, slow_d, seed, hours), flush=True)
+        print("[%2d/%d] %s | %s %.2f seed %d | %.1f h elapsed"
+              % (i, len(jobs), name, arm["flag"], threshold, seed, hours),
+              flush=True)
 
-        rc = subprocess.run([sys.executable, SCRIPT,
-                             "--total-steps", str(args.steps),
-                             "--seed", str(seed),
-                             "--slow-d", str(slow_d),
-                             "--succ-d", str(args.succ_d),
-                             "--run-name", name,
-                             "--log-every", "50"],
-                            cwd=REPO_ROOT).returncode
+        cmd = [sys.executable, SCRIPT,
+               "--total-steps", str(args.steps),
+               "--seed", str(seed),
+               arm["flag"], str(threshold),
+               "--run-name", name,
+               "--log-every", "50"]
+        for flag, value in held:
+            cmd += [flag, str(value)]
+
+        rc = subprocess.run(cmd, cwd=REPO_ROOT).returncode
         if rc != 0:
             print("[%2d/%d] %s FAILED rc=%d" % (i, len(jobs), name, rc),
                   flush=True)
