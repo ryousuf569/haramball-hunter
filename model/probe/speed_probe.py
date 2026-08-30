@@ -29,6 +29,9 @@ TICKS = 2500
 BANDS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
 GRID = np.linspace(0.0, 5.0, 101)
 PCTS = (10, 25, 50, 75, 90)
+# which threshold the sweep moved, i.e. what to group and label the runs by;
+# c_slow is always the measured rate, so only the slow dial is a calibration
+DIALS = {"slow": "slow_d", "crowd": "crowd_d"}
 
 
 def resolve(path, ckpt):
@@ -94,7 +97,7 @@ def write_csv(path, rows):
     return path
 
 
-def plot(rows, out_path):
+def plot(rows, dial, out_path):
     have_target = any(r["requested"] == r["requested"] for r in rows)
     targets = sorted({r["requested"] for r in rows
                       if r["requested"] == r["requested"]})
@@ -108,9 +111,17 @@ def plot(rows, out_path):
         a = ax[0]
         x = np.array([r["requested"] for r in rows])
         y = np.array([r["c_slow"] for r in rows])
-        lo, hi = min(x.min(), y.min()) - 0.05, max(x.max(), y.max()) + 0.05
-        a.plot([lo, hi], [lo, hi], "--", color="#d62728", lw=1.4,
-               label="achieved = target")
+        if dial == "slow":
+            lo, hi = min(x.min(), y.min()) - 0.05, max(x.max(), y.max()) + 0.05
+            a.plot([lo, hi], [lo, hi], "--", color="#d62728", lw=1.4,
+                   label="achieved = target")
+        else:
+            # c_slow is the held constraint here, so the reference is its pinned
+            # target, not the swept dial
+            held = {r["d_slow"] for r in rows if r["d_slow"] == r["d_slow"]}
+            if len(held) == 1:
+                a.axhline(held.pop(), color="#d62728", ls="--", lw=1.4,
+                          label="held slow target")
         a.scatter(x, y, s=55, color="#8ab4e8", zorder=3, label="seeds")
         mu = [np.mean([r["c_slow"] for r in rows if r["requested"] == t])
               for t in targets]
@@ -118,9 +129,10 @@ def plot(rows, out_path):
               for t in targets]
         a.errorbar(targets, mu, yerr=sd, fmt="o-", color="#1f4e9c", lw=2,
                    capsize=4, zorder=4, label="mean")
-        a.set_xlabel("requested rate")
-        a.set_ylabel("achieved rate (frozen policy)")
-        a.set_title("calibration", loc="left", fontsize=10)
+        a.set_xlabel("requested %s rate" % dial)
+        a.set_ylabel("achieved slow rate (frozen policy)")
+        a.set_title("calibration" if dial == "slow" else "held slow rate vs dial",
+                    loc="left", fontsize=10)
         a.legend(fontsize=8, frameon=False)
         a.grid(alpha=0.25)
 
@@ -129,7 +141,7 @@ def plot(rows, out_path):
         for c, t in zip(colours, targets):
             curves = [r["cdf"] for r in rows if r["requested"] == t]
             b.plot(GRID, np.mean(curves, axis=0), color=c, lw=2,
-                   label="d = %.2f" % t)
+                   label="%s_d = %.2f" % (dial, t))
     else:
         for r in rows:
             b.plot(GRID, r["cdf"], lw=2, label=r["run"])
@@ -153,6 +165,8 @@ def plot(rows, out_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="+")
+    ap.add_argument("--dial", choices=sorted(DIALS), default="slow",
+                    help="threshold the sweep moved; groups and labels the runs")
     ap.add_argument("--ckpt", default="final")
     ap.add_argument("--ticks", type=int, default=TICKS)
     ap.add_argument("--seed", type=int, default=12345)
@@ -187,7 +201,10 @@ def main():
                   % g, flush=True)
 
         agent = ActorCritic(obs_dim=D, hidden=int(cfg.get("hidden", 256)))
-        agent.load_state_dict(ck["model"], strict=False)
+        # the cost head is unused here and its width tracks N_COSTS, so older
+        # checkpoints would collide on shape; drop it rather than reshape it
+        agent.load_state_dict({k: v for k, v in ck["model"].items()
+                               if not k.startswith("cost_value.")}, strict=False)
         agent.eval()
 
         r = measure(agent, venv, args.ticks, args.seed)
@@ -195,7 +212,9 @@ def main():
         r["ckpt"] = os.path.splitext(os.path.basename(ck_path))[0]
         r["step"] = int(ck.get("step", 0))
         r["seed"] = int(cfg.get("seed", -1))
-        r["requested"] = float(cfg["slow_d"]) if "slow_d" in cfg else float("nan")
+        key = DIALS[args.dial]
+        r["requested"] = float(cfg[key]) if key in cfg else float("nan")
+        r["d_slow"] = float(cfg["slow_d"]) if "slow_d" in cfg else float("nan")
         rows.append(r)
 
         p = r["pcts"]
@@ -209,8 +228,8 @@ def main():
     flat = []
     for r in rows:
         row = {k: r[k] for k in ("run", "ckpt", "seed", "step", "requested",
-                                 "c_slow", "c_team", "mean_speed", "success",
-                                 "episodes", "attacker_ticks")}
+                                 "d_slow", "c_slow", "c_team", "mean_speed",
+                                 "success", "episodes", "attacker_ticks")}
         for q, v in zip(PCTS, r["pcts"]):
             row["p%d" % q] = float(v)
         for bnd, v in zip(BANDS, r["bands"]):
@@ -218,13 +237,15 @@ def main():
         flat.append(row)
 
     csv_path = write_csv(os.path.join(args.out_dir, args.tag + ".csv"), flat)
-    png_path = plot(rows, os.path.join(args.out_dir, args.tag + ".png"))
+    png_path = plot(rows, args.dial, os.path.join(args.out_dir, args.tag + ".png"))
 
-    have = [r for r in rows if r["requested"] == r["requested"]]
+    # always scored against the slow threshold, which is the dial when --dial
+    # slow and the held target otherwise
+    have = [r for r in rows if r["d_slow"] == r["d_slow"]]
     if have:
-        err = np.array([r["c_slow"] - r["requested"] for r in have])
+        err = np.array([r["c_slow"] - r["d_slow"] for r in have])
         print()
-        print("MAE %.4f (%.2f pp) | bias %+.4f | feasible %d/%d"
+        print("c_slow vs slow_d: MAE %.4f (%.2f pp) | bias %+.4f | feasible %d/%d"
               % (np.abs(err).mean(), 100 * np.abs(err).mean(), err.mean(),
                  int((err <= 0).sum()), len(have)))
 
