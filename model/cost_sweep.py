@@ -25,8 +25,9 @@ ARMS = {
 DEFAULT_ARM = "crowd"
 
 
-def run_name(arm, threshold, seed):
-    return "%s%02d_s%d" % (ARMS[arm]["prefix"], round(threshold * 100), seed)
+def run_name(arm, threshold, seed, suffix=""):
+    return "%s%02d_s%d%s" % (ARMS[arm]["prefix"], round(threshold * 100), seed,
+                             suffix)
 
 
 def held_of(arm, succ_d):
@@ -42,6 +43,10 @@ def main():
                     help="defaults to the arm's own grid")
     ap.add_argument("--steps", type=int, default=STEPS)
     ap.add_argument("--succ-d", type=float, default=0.40)
+    ap.add_argument("--suffix", default="",
+                    help="appended to every run name, so a rerun at a different "
+                         "budget does not collide with (and get skipped by) an "
+                         "existing sweep")
     ap.add_argument("--cooldown", type=int, default=COOLDOWN)
     args = ap.parse_args()
 
@@ -59,7 +64,7 @@ def main():
              " ".join(str(s) for s in args.seeds), args.steps), flush=True)
 
     for i, (threshold, seed) in enumerate(jobs, 1):
-        name = run_name(args.arm, threshold, seed)
+        name = run_name(args.arm, threshold, seed, args.suffix)
         hours = (time.perf_counter() - t0) / 3600.0
 
         if os.path.exists(os.path.join(RUNS_DIR, name, "final.pt")):
