@@ -111,8 +111,55 @@ async function seedTable() {
   });
 }
 
+// --------------------------------------------- crowd_disc constraint sweep --
+// assets/constraint_targets_crowd{,_5m}.csv: slow held at d=0.75, crowd_disc
+// swept 0.05/0.10/0.15, training-log tail-mean aggregates per target.
+
+async function crowdTargetTable(path, id) {
+  const rows = await loadCSV(path);
+
+  fill(document.getElementById(id), rows, (tr, r) => {
+    cell(tr, f(num(r.requested), 2));
+    cell(tr, r.n, 'num');
+    cell(tr, f(num(r.crowd), 4), 'num');
+    cell(tr, f(num(r.crowd_sd), 4), 'num');
+    cell(tr, f(num(r.slow), 3), 'num');
+    cell(tr, f(num(r.success), 3), 'num');
+    cell(tr, f(num(r.ep_len), 1), 'num');
+  });
+}
+
+// assets/constraint_runs_crowd{,_5m}.csv: one row per seed x budget.
+
+async function crowdRunTable() {
+  const [r25, r5m] = await Promise.all([
+    loadCSV('assets/constraint_runs_crowd.csv'),
+    loadCSV('assets/constraint_runs_crowd_5m.csv'),
+  ]);
+  const rows = r25.map((r) => ({ ...r, budget: '2.5M' }))
+    .concat(r5m.map((r) => ({ ...r, budget: '5M' })));
+
+  fill(document.getElementById('crowd-run-rows'), rows, (tr, r) => {
+    const ok = num(r.ok_all) === 1;
+    if (!ok) tr.className = 'infeasible';
+    cell(tr, r.run);
+    cell(tr, r.budget, 'num');
+    cell(tr, f(num(r.requested), 2), 'num');
+    cell(tr, f(num(r.crowd), 4), 'num');
+    cell(tr, f(num(r.slow), 3), 'num');
+    cell(tr, f(num(r.success), 3), 'num');
+    cell(tr, f(num(r.ep_len), 1), 'num');
+    cell(tr, ok ? 'yes' : 'no', 'num ' + (ok ? 'yes' : 'no'));
+  });
+}
+
 Promise.all([
   probeTable().catch((e) => fail('probe-rows', e)),
   targetTable().catch((e) => fail('target-rows', e)),
   seedTable().catch((e) => fail('seed-rows', e)),
+  crowdTargetTable('assets/constraint_targets_crowd.csv', 'crowd-target-rows')
+    .catch((e) => fail('crowd-target-rows', e)),
+  crowdTargetTable('assets/constraint_targets_crowd_5m.csv', 'crowd-target-5m-rows')
+    .catch((e) => fail('crowd-target-5m-rows', e)),
+  crowdRunTable().catch((e) => fail('crowd-run-rows', e)),
 ]);

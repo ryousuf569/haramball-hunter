@@ -30,6 +30,12 @@ The obvious worry with bolting on a constraint is that it slows learning down or
 
 The constrained agent hits 80%+ success by 2.5M steps. An unconstrained baseline trained four times longer, 10M steps, tops out around 65-70%. Forcing the agent to stay organized turned out to be a better training signal than turning it loose, not a tax on performance.
 
+## Constraining the side effect
+
+The single-constraint result above came with a side effect nobody asked for: pushing the speed distribution down also taught the attackers to crowd the target zone rather than work the ball into it cleanly. The obvious fix is the paper's own recipe: name the behaviour, give it a threshold, add it as a second constraint. So `crowd_disc` joined `slow`, swept the same way, first at 2.5M steps and then rerun at 5M, after one run's apparent collapse turned out to be an undertrained bootstrap handover, not a broken method. The [results page](docs/results.html#second-constraint-crowd_disc) has the full sweep; the [write-up](docs/writeup.html) covers the discovery and everything since, including the run that looked broken and wasn't, and the one that isn't quite fixed.
+
+(`runs/sweep_crowd*_5m` supersedes its non-suffixed counterpart for the crowd-sweep headline numbers; see [runs/README.md](runs/README.md).)
+
 ## Physics, and making it fast
 
 The pitch control model (Spearman et al., 2017, 2018) numerically integrates, for every player at every point on a grid, the probability they get there and control the ball first. That's a lot of small arithmetic, run every tick, across every environment training runs in parallel.

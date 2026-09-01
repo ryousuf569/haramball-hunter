@@ -303,6 +303,13 @@ class LowBlockEnv(gym.Env):
         assert out.shape == (n, self.obs_dim), (out.shape, self.obs_dim)
         return out
 
+    def holder_row(self):
+        holder_id = self.ball.get("holder_id")
+        if holder_id is None:
+            return None
+        row = np.flatnonzero(self.attacker_ids == holder_id)
+        return int(row[0]) if row.size else None
+
     # much simpler reward, dense shaping on ball progress toward the zone
     def phi(self):
         d = np.linalg.norm(np.asarray(self.ball["position"], float) - self.zone_centre)

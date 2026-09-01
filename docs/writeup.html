@@ -272,6 +272,137 @@
     units. I haven't run it. Next experiment, not a caveat.
   </p>
 
+  <h2>A second constraint: crowd_disc</h2>
+
+  <p>
+    The fix I proposed above was cheap to state and I said I hadn't run it.
+    <code>crowd_disc</code> joined the constraint set as a second behavioural
+    cost, with <code>slow</code> and the success floor both held at their
+    original targets, d&nbsp;=&nbsp;0.75 and 0.40. The new dial was swept over
+    0.05, 0.10 and 0.15, three seeds each, at the same 2.5M-step budget as
+    every other sweep in this write-up.
+  </p>
+
+  <h2>It doesn't track, it suppresses</h2>
+
+  <p>
+    <code>slow</code> tracked its target with a slope of 0.93.
+    <code>crowd_disc</code> doesn't track its target at all. Achieved rate
+    comes back at 3.4%, 4.2% and 3.8% for requested 5%, 10% and 15%, barely
+    off the 2.9% unconstrained baseline no matter how much room the
+    threshold gives it. The optimiser found one answer, near-total
+    suppression, and used it for every target rather than calibrating to
+    each one.
+  </p>
+
+  <p>
+    That suppression isn't free. Success across the three targets lands at
+    59.3%, 58.6% and 61.5%, against 83.5% for the two-constraint baseline
+    (<code>slow</code> and success only, no <code>crowd_disc</code>). Roughly
+    twenty-two to twenty-five points, consistently, for a dial that then
+    doesn't even use the slack it's given.
+  </p>
+
+  <figure>
+    <div class="frame"><img src="assets/constraint_analysis_crowd.png" alt="Four panels, crowd_disc dial at 2.5M steps. Calibration: achieved crowd rate flat around 0.03-0.04 well under every requested target, far below the achieved-equals-target line. All three constraints against requested crowd rate: slow hugging its held 0.75 line, crowd near zero, success around 0.6. Multiplier at convergence falling as crowd strictness loosens. Bootstrap handover step against requested rate, wide error bars."></div>
+    <figcaption>
+      Nine runs, three targets x three seeds, 2.5M steps. Top left is the
+      tell: every point sits close to the unconstrained baseline, nowhere
+      near the achieved-equals-target line the <code>slow</code> sweep
+      produced.
+    </figcaption>
+  </figure>
+
+  <h2>sweep_crowd10_s3 looks like a collapse</h2>
+
+  <p>
+    One run in the sweep looks like the method broke outright.
+    <code>sweep_crowd10_s3</code>'s success and slow-rate both crater in its
+    final logged points, and speed reverts toward the unconstrained
+    distribution. The raw trajectory in <code>runs/sweep_crowd10_s3/metrics.csv</code>
+    explains why. Its bootstrap multiplier, <code>lam_succ</code>, sits above
+    0.99 from roughly 1.1M steps onward, which is effectively the whole
+    budget. The run spent almost all of 2.5M steps still in the "hasn't
+    solved anything yet" regime the bootstrap constraint exists to handle. It
+    only starts releasing at step 2,419,200, and <code>lam0</code>
+    doesn't overtake it until step 2,457,600, thirty-eight thousand steps
+    before the run ends.
+  </p>
+
+  <p>
+    That one log interval of actual handover is where it falls apart:
+    success drops to 0.48, speed jumps to 2.10&nbsp;m/s, slow-rate crashes to
+    0.50. By the final logged point, success is at 0.37, under its own 0.40
+    floor, and speed is at 2.38&nbsp;m/s, back in the neighbourhood of the
+    unconstrained baseline. <code>lam_succ</code> jumps straight back
+    up to 0.84, meaning the optimiser was already retreating into bootstrap
+    mode again as the clock ran out.
+  </p>
+
+  <p>
+    None of that shows up in the sweep table. The 20%-tail-mean I report
+    everywhere else averages those two disastrous points in against eleven
+    healthier ones before them, and comes out at 0.68 slow-rate and 0.54
+    success, both still inside their thresholds, so this run reads as
+    feasible on paper. It isn't a broken method. It's a run whose bootstrap
+    phase ran out the clock before the handover had time to hold, and the
+    tail-mean measurement I'd been trusting doesn't see it. Same lesson as
+    the frozen-policy probe, from a different angle: how you measure a run
+    changes what it looks like it did.
+  </p>
+
+  <h2>5M steps, and one seed that didn't get the memo</h2>
+
+  <p>
+    I reran all nine configs (three targets, three seeds) at 5M steps
+    instead of 2.5M, the same move that turned the original sweep's
+    numbers into something I'd stand behind. It mostly works.
+    <code>sweep_crowd10_s3_5m</code> hands over at step 1,574,400 of 4,992,000,
+    more than two-thirds of the budget still ahead of it, and settles into a
+    stable oscillation for the rest of the run rather than cratering at the
+    end. Across the sweep, success recovers to 66.5%, 70.2% and 69.2% for the
+    three targets, and <code>slow</code> stays centred on its 0.75 line at
+    0.752, 0.754 and 0.752.
+  </p>
+
+  <figure>
+    <div class="frame"><img src="assets/constraint_analysis_crowd_5m.png" alt="Same four panels at 5M steps. Calibration now shows the 0.15 target's mean pulled well above its siblings by one outlier seed near 0.14. Slow still tracks its held 0.75 line. Success has risen across all three targets."></div>
+    <figcaption>
+      Same nine configs, double the steps. Success is up across the board.
+      The top-left panel's 0.15 point is dragged upward by one seed, not the
+      group. See below.
+    </figcaption>
+  </figure>
+
+  <p>
+    <code>crowd_disc</code> still doesn't track cleanly, and one run says
+    exactly why not. <code>sweep_crowd15_s1_5m</code> lands at 14.2% against a
+    15% ceiling, actually using the room it was given, while its two sibling
+    seeds sit at 3.5% and 5.3%, still suppressed toward the
+    unconstrained baseline like everything else in the sweep. Averaging the
+    three into "7.7% at the loosest target" would erase the more interesting
+    fact: two of three seeds picked the suppress-everything solution and one
+    picked a completely different one. The one that didn't also handed over
+    off the bootstrap policy earliest of all nine 5M runs, at step 768,000,
+    against 1,497,600 and 1,804,800 for its own siblings. More runway after
+    an earlier handover, and it spent that runway tracking the threshold
+    instead of running from it. I don't have enough seeds to say that's the
+    mechanism rather than a coincidence, but it's the only lead I've got, and
+    it says the constrained optimiser can land in at least two qualitatively
+    different solutions here depending on how early it stops leaning on the
+    bootstrap.
+  </p>
+
+  <p>
+    One honest limitation before I move on. The 83.5% two-constraint baseline
+    above was trained at 2.5M steps; every crowd-constrained number in this
+    section past the first sweep used 5M. The roughly fifteen-to-twenty point
+    success gap that's left after adding <code>crowd_disc</code> is a real
+    cost, but it's an approximate comparison across two different budgets,
+    not a controlled one. I'd want a 5M two-constraint run before I quoted
+    the gap to two decimal places.
+  </p>
+
   <h2>Deviations from the paper</h2>
 
   <p>

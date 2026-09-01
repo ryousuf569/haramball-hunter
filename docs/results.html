@@ -251,6 +251,120 @@
     </p>
   </div>
 
+  <h2 class="headline-md" id="second-constraint-crowd_disc">Second constraint: crowd_disc</h2>
+
+  <p>
+    <code>slow</code> held fixed at d&nbsp;=&nbsp;0.75, <code>crowd_disc</code>
+    added as a second constraint and swept at 0.05, 0.10 and 0.15, three seeds
+    each. First at the same 2.5M-step budget as the sweep above, then rerun to
+    5M. The full story, including why the rerun happened, is in the
+    <a href="writeup.html">write-up</a>.
+  </p>
+
+  <figure>
+    <div class="frame"><img src="assets/constraint_analysis_crowd.png" alt="Four panels, crowd_disc dial at 2.5M steps. Calibration: achieved crowd rate flat around 0.03-0.04 well under every requested target. All three constraints against requested crowd rate: slow hugging its held 0.75 line, crowd near zero, success around 0.6. Multiplier at convergence falling as crowd strictness loosens. Bootstrap handover step against requested rate, wide error bars."></div>
+    <figcaption>
+      <b>Fig 5. 2.5M steps.</b> Achieved crowd rate stays close to the 0.029
+      unconstrained baseline at every target; <code>slow</code> keeps tracking
+      its held 0.75 line on average, though not on every seed.
+    </figcaption>
+  </figure>
+
+  <figure>
+    <div class="frame"><img src="assets/constraint_analysis_crowd_5m.png" alt="Same four panels at 5M steps. Calibration now shows the 0.15 target's mean pulled well above its siblings by one outlier seed near 0.14. Slow still tracks its held 0.75 line. Success has risen across all three targets."></div>
+    <figcaption>
+      <b>Fig 6. 5M steps.</b> Success up across all three targets. The 0.15
+      target's mean is pulled up by one seed, not the group. See the per-run
+      table below.
+    </figcaption>
+  </figure>
+
+  <figure>
+    <div class="frame"><img src="assets/speed_probe_crowd.png" alt="Left: achieved slow rate against requested crowd rate, held target 0.75 marked, one seed at 0.10 far below the line. Right: speed distribution by crowd_d target, all close together, all crossing near the 2.0 m/s limit."></div>
+    <figcaption>
+      <b>Fig 7. Frozen-policy check, 2.5M only.</b> A replay of the 2.5M
+      checkpoints confirming <code>slow</code> stayed calibrated while
+      <code>crowd_disc</code> was the dial being swept. There is no 5M
+      version of this probe. The 5M numbers everywhere on this page are
+      training-log tail means, not an independent replay.
+    </figcaption>
+  </figure>
+
+  <h2 class="headline-md">Per-target aggregates, crowd sweep</h2>
+
+  <p>2.5M steps:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Requested crowd</th>
+          <th class="num">n</th>
+          <th class="num">Achieved crowd</th>
+          <th class="num">SD</th>
+          <th class="num">Slow (held)</th>
+          <th class="num">Success</th>
+          <th class="num">Ep. len</th>
+        </tr>
+      </thead>
+      <tbody id="crowd-target-rows"></tbody>
+    </table>
+  </div>
+
+  <p>5M steps:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Requested crowd</th>
+          <th class="num">n</th>
+          <th class="num">Achieved crowd</th>
+          <th class="num">SD</th>
+          <th class="num">Slow (held)</th>
+          <th class="num">Success</th>
+          <th class="num">Ep. len</th>
+        </tr>
+      </thead>
+      <tbody id="crowd-target-5m-rows"></tbody>
+    </table>
+    <p class="table-note">
+      From <code>assets/constraint_targets_crowd.csv</code> and
+      <code>_5m.csv</code>, both training-log tail means.
+    </p>
+  </div>
+
+  <h2 class="headline-md">Every crowd-sweep run</h2>
+
+  <p>
+    Eighteen runs: three crowd targets x three seeds, at both budgets.
+    Feasible here means slow, crowd, and the success bootstrap all landed
+    inside their thresholds together.
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Run</th>
+          <th class="num">Budget</th>
+          <th class="num">Requested</th>
+          <th class="num">Crowd</th>
+          <th class="num">Slow</th>
+          <th class="num">Success</th>
+          <th class="num">Ep. len</th>
+          <th class="num">Feasible</th>
+        </tr>
+      </thead>
+      <tbody id="crowd-run-rows"></tbody>
+    </table>
+    <p class="table-note">
+      From <code>assets/constraint_runs_crowd.csv</code> and
+      <code>_5m.csv</code>. Greyed rows missed at least one of the three
+      constraints.
+    </p>
+  </div>
+
 </div>
 </main>
 

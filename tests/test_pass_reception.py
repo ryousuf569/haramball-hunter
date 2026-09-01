@@ -190,23 +190,24 @@ def test_a_pass_collected_by_a_defender_ends_the_episode():
     # step() resolves turnovers through ground_duel and intercept_pass, neither
     # of which sees a pass that simply landed nearer a defender. Without the
     # check in step() the episode would carry on with the defence in possession.
-    players, ball, attacker_ids, _rng, defender_state = make_initial_world(seed=3)
+    players, ball, attacker_ids, rng, defender_state = make_initial_world(seed=3)
     grid = make_ppcf_grid()
+    n_att = len(attacker_ids)
 
     # Aim a long ball at a teammate, then have every attacker sprint away from
-    # where it is going to land.
+    # where it is going to land (direction 1 == west, speed 2 == full V_MAX).
     holder_row = int(np.flatnonzero(attacker_ids == ball["holder_id"])[0])
-    ball_idx = np.zeros(len(attacker_ids), dtype=int)
-    ball_idx[holder_row] = 9
-    vel = np.zeros((len(attacker_ids), 2), dtype="f4")
-    vel[:, 0] = -V_MAX
+    ball_idx = np.zeros(n_att, dtype=np.int64)
+    ball_idx[holder_row] = n_att - 1
+    direction_idx = np.full(n_att, 1, dtype=np.int64)
+    speed_idx = np.full(n_att, 2, dtype=np.int64)
 
     outcome = None
     for tick in range(80):
-        players, ball, _pc, _own, outcome = world_step(
-            players, ball, attacker_ids, defender_state, tick, ppcf_grid=grid,
-            attacker_velocities=vel, attacker_ball_idx=ball_idx, verbose=False)
-        ball_idx = np.zeros(len(attacker_ids), dtype=int)
+        players, ball, _pc, outcome = world_step(
+            players, ball, attacker_ids, defender_state, tick, rng,
+            ppcf_grid=grid, actions=(direction_idx, speed_idx, ball_idx))
+        ball_idx = np.zeros(n_att, dtype=np.int64)
         if outcome is not None:
             break
 
@@ -231,7 +232,7 @@ def test_the_carrier_is_slower_than_a_free_runner():
     assert DRIBBLE_V_MAX < V_MAX
     # Not seed 5: that one starts with an attacker already inside the shot gate
     # and ends in success on tick 0, so there is no carry to measure.
-    env = LowBlockEnv(max_ticks=120, scripted_attackers=False)
+    env = LowBlockEnv(max_tick=120)
     env.reset(seed=3)
 
     # Short enough that nobody has reached the goal line -- a player held
@@ -261,7 +262,7 @@ def test_the_carrier_is_slower_than_a_free_runner():
 def test_the_cap_lifts_when_the_ball_leaves_his_feet():
     from physics.engine import DRIBBLE_SPEED
     assert 0.0 < DRIBBLE_SPEED < 1.0
-    env = LowBlockEnv(max_ticks=120, scripted_attackers=False)
+    env = LowBlockEnv(max_tick=120)
     env.reset(seed=3)
     row = env.holder_row()
 
