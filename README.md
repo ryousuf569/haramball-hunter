@@ -1,6 +1,6 @@
 # haramball-hunter
 
-An RL agent learning to break a "low block": the defensive wall a team packs in front of its own goal when it's up against a better opponent. Ten attackers, eleven defenders, real physics underneath. The attacking side gets no scripted help — it has to find its own way through.
+An RL agent learning to break a "low block": the defensive wall a team packs in front of its own goal when it's up against a better opponent. Ten attackers, eleven defenders, real physics underneath. The attacking side gets no scripted help, it has to find its own way through.
 
 ![One frame of the environment](assets/pitch_snapshot.png)
 
