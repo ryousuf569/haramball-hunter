@@ -13,16 +13,10 @@ SEEDS = (1, 2, 3)
 STEPS = 2_500_000
 COOLDOWN = 150
 
-# Every threshold ppo_constrained.py exposes, and its Config default. Switch an
-# upper bound off with 1.0 and the success floor off with 0.0: the constraint is
-# then satisfied by construction and its multiplier decays to ~1e-4, which is a
-# real off switch rather than a nominal one.
 DIALS = ("slow-d", "crowd-d", "succ-d")
 DEFAULTS = {"slow-d": 0.75, "crowd-d": 0.10, "succ-d": 0.40}
 OFF = {"slow-d": 1.0, "crowd-d": 1.0, "succ-d": 0.0}
 
-# Named presets. These only supply defaults for --sweep / --hold / --prefix, so
-# any of them can still be overridden on the command line.
 ARMS = {
     "slow": {"sweep": ("slow-d", (0.85, 0.75, 0.65, 0.55, 0.45)),
              "hold": {"crowd-d": 0.10, "succ-d": 0.40},
